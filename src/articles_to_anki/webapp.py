@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import csv
 import functools
 import html
@@ -10,8 +11,10 @@ import math
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import tempfile
+import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,7 +39,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Highlight
 from pypdf.generic import ArrayObject, FloatObject, NameObject, TextStringObject
 from .enrich import DEFAULT_MODEL, enrich_targets, load_env_file
-from .extract import RECALL_PLACEHOLDER
+from .extract import RECALL_PLACEHOLDER, extract_highlights
 from .models import TargetContext
 
 USERNAME_RE = re.compile(r"^[\w.\-]{3,32}$", re.UNICODE)
@@ -52,14 +55,38 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         DATA_DIR=data_dir,
         DATABASE=data_dir / "app.sqlite3",
         MAX_CONTENT_LENGTH=85 * 1024 * 1024,
+        AUTO_PROCESS_UPLOADS=True,
+        PROCESS_DOCUMENTS_INLINE=False,
     )
     if test_config:
         app.config.update(test_config)
     Path(app.config["DATA_DIR"]).mkdir(parents=True, exist_ok=True)
     init_database(app)
+    app.extensions["highlight_executor"] = ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="pdf-highlights",
+    )
+    app.extensions["highlight_jobs"] = set()
+    app.extensions["highlight_jobs_lock"] = threading.Lock()
+    app.extensions["highlight_resume_done"] = False
 
     app.teardown_appcontext(close_database)
     app.context_processor(lambda: {"csrf_token": csrf_token})
+
+    @app.before_request
+    def resume_interrupted_highlight_jobs() -> None:
+        if not app.config["AUTO_PROCESS_UPLOADS"] or app.extensions["highlight_resume_done"]:
+            return
+        with app.extensions["highlight_jobs_lock"]:
+            if app.extensions["highlight_resume_done"]:
+                return
+            app.extensions["highlight_resume_done"] = True
+        rows = get_database().execute(
+            """SELECT id, user_id FROM documents
+               WHERE kind = 'pdf' AND highlight_status IN ('queued', 'processing')"""
+        ).fetchall()
+        for row in rows:
+            enqueue_document_processing(app, row["id"], row["user_id"])
 
     @app.get("/health")
     def health() -> Response:
@@ -148,11 +175,15 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         require_csrf()
         upload = request.files.get("file")
         try:
-            save_document(upload, "pdf")
+            document_id = save_document(upload, "pdf")
         except (ValueError, OSError) as exc:
             flash(str(exc), "error")
         else:
-            flash("Статья загружена.", "success")
+            if app.config["AUTO_PROCESS_UPLOADS"]:
+                enqueue_document_processing(app, document_id, session["user_id"])
+                flash("Статья загружена. Хайлайты обрабатываются в фоне.", "success")
+            else:
+                flash("Статья загружена.", "success")
         return redirect(url_for("dashboard"))
 
     @app.post("/upload/apkg")
@@ -194,6 +225,22 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         )
         get_database().commit()
         flash("Статья отмечена прочитанной." if read_at else "Статья снова в непрочитанных.", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/article/<document_id>/process-highlights")
+    @login_required
+    def process_article_highlights(document_id: str) -> Response:
+        require_csrf()
+        document = owned_document(document_id, "pdf")
+        get_database().execute(
+            """UPDATE documents
+               SET highlight_status = 'queued', highlight_error = NULL
+               WHERE id = ? AND user_id = ?""",
+            (document["id"], session["user_id"]),
+        )
+        get_database().commit()
+        enqueue_document_processing(app, document["id"], session["user_id"])
+        flash("Обработка хайлайтов запущена.", "success")
         return redirect(url_for("dashboard"))
 
     @app.get("/file/pdf/<document_id>")
@@ -253,7 +300,15 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                    ORDER BY created_at""",
                 (document_id, session["user_id"]),
             ).fetchall()
-            return jsonify(highlights=[highlight_json(row) for row in rows])
+            current = database.execute(
+                "SELECT highlight_status, highlight_error FROM documents WHERE id = ?",
+                (document_id,),
+            ).fetchone()
+            return jsonify(
+                highlights=[highlight_json(row) for row in rows],
+                processing_status=current["highlight_status"],
+                processing_error=current["highlight_error"],
+            )
 
         require_csrf(header=True)
         payload = request.get_json(silent=True) or {}
@@ -282,8 +337,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             """INSERT OR IGNORE INTO highlights
                (id, user_id, document_id, target, sentence, page, rects_json,
                 translations_json, replacement, alternatives_json, status,
-                error, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, '[]', '', '[]', 'pending', NULL, ?, ?)""",
+                error, source, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, '[]', '', '[]', 'pending', NULL, 'reader', ?, ?)""",
             (
                 highlight_id,
                 session["user_id"],
@@ -313,67 +368,19 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if row["status"] == "ready":
             return jsonify(highlight=highlight_json(row))
 
-        target = row["target"]
-        sentence = row["sentence"]
-        page_number = row["page"]
-        api_key = os.environ.get("OPENROUTER_API_KEY", "")
-        if not api_key:
-            return fail_highlight(row["id"], "OPENROUTER_API_KEY не настроен.", 503)
-        context = make_target_context(target, sentence, context_id=row["id"], page=page_number)
         try:
-            enriched = enrich_targets(
-                [context],
-                api_key=api_key,
-                model=os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL),
-                cache_path=Path(app.config["DATA_DIR"])
-                / "highlight_cache"
-                / f"{row['id']}.json",
-            )[0]
+            ready = enrich_highlight_row(
+                app,
+                database,
+                row,
+                user_id=session["user_id"],
+                document_id=document_id,
+            )
+        except MissingApiKeyError:
+            return fail_highlight(row["id"], "OPENROUTER_API_KEY не настроен.", 503)
         except Exception:
             app.logger.exception("Automatic highlight enrichment failed")
             return fail_highlight(row["id"], "Автоперевод временно недоступен.", 502)
-
-        translations = json.dumps(enriched.translations_ru, ensure_ascii=False)
-        alternatives = json.dumps(enriched.forbidden_alternatives_en, ensure_ascii=False)
-        timestamp = now()
-        database.execute(
-            """UPDATE highlights
-               SET translations_json = ?, replacement = ?, alternatives_json = ?,
-                   status = 'ready', error = NULL, updated_at = ?
-               WHERE id = ? AND user_id = ?""",
-            (
-                translations,
-                enriched.replacement_ru,
-                alternatives,
-                timestamp,
-                row["id"],
-                session["user_id"],
-            ),
-        )
-        database.execute(
-            """INSERT OR IGNORE INTO cards
-               (id, user_id, document_id, target, target_normalized, sentence, page,
-                translations_json, replacement, alternatives_json, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                str(uuid.uuid4()),
-                session["user_id"],
-                document_id,
-                target,
-                normalize_target(target),
-                sentence,
-                page_number,
-                translations,
-                enriched.replacement_ru,
-                alternatives,
-                timestamp,
-            ),
-        )
-        database.commit()
-        ready = database.execute(
-            "SELECT * FROM highlights WHERE id = ? AND user_id = ?",
-            (row["id"], session["user_id"]),
-        ).fetchone()
         return jsonify(highlight=highlight_json(ready))
 
     @app.post("/cards/<card_id>/delete")
@@ -431,7 +438,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             headers={"Content-Disposition": f'attachment; filename="{safe_download_name(stem)}-updated.apkg"'},
         )
 
-    def save_document(upload: Any, kind: str) -> None:
+    def save_document(upload: Any, kind: str) -> str:
         if upload is None or not getattr(upload, "filename", ""):
             raise ValueError("Выберите файл.")
         extension = ".pdf" if kind == "pdf" else ".apkg"
@@ -447,30 +454,36 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         user_dir = Path(app.config["DATA_DIR"]) / "uploads" / str(session["user_id"])
         user_dir.mkdir(parents=True, exist_ok=True)
         stored_path = user_dir / f"{document_id}{extension}"
-        upload.save(stored_path)
+        source_path = user_dir / f"{document_id}.source.pdf" if kind == "pdf" else None
+        upload_path = source_path or stored_path
+        upload.save(upload_path)
         size_limit = 50 * 1024 * 1024 if kind == "pdf" else 80 * 1024 * 1024
-        if stored_path.stat().st_size > size_limit:
-            stored_path.unlink(missing_ok=True)
+        if upload_path.stat().st_size > size_limit:
+            upload_path.unlink(missing_ok=True)
             raise ValueError(f"Файл больше {size_limit // 1024 // 1024} МБ.")
         page_count = 0
         text_path: Path | None = None
         try:
             if kind == "pdf":
-                reader = PdfReader(stored_path)
+                reader = PdfReader(upload_path)
                 page_count = len(reader.pages)
+                write_pdf_without_native_highlights(upload_path, stored_path)
             get_database().execute(
                 """INSERT INTO documents
-                   (id, user_id, kind, name, stored_path, text_path, page_count, size, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (id, user_id, kind, name, stored_path, source_path, text_path,
+                    page_count, size, highlight_status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     document_id,
                     session["user_id"],
                     kind,
                     Path(upload.filename).name,
                     str(stored_path),
+                    str(source_path) if source_path else None,
                     str(text_path) if text_path else None,
                     page_count,
-                    stored_path.stat().st_size,
+                    upload_path.stat().st_size,
+                    "queued" if kind == "pdf" and app.config["AUTO_PROCESS_UPLOADS"] else "idle",
                     now(),
                 ),
             )
@@ -479,7 +492,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             stored_path.unlink(missing_ok=True)
             if text_path:
                 text_path.unlink(missing_ok=True)
+            if source_path:
+                source_path.unlink(missing_ok=True)
             raise
+        return document_id
 
     def owned_document(document_id: str, kind: str) -> sqlite3.Row:
         row = get_database().execute(
@@ -561,6 +577,12 @@ def init_database(app: Flask) -> None:
                 page_count INTEGER NOT NULL DEFAULT 0,
                 size INTEGER NOT NULL,
                 read_at TEXT,
+                source_path TEXT,
+                highlight_status TEXT NOT NULL DEFAULT 'idle'
+                    CHECK(highlight_status IN ('idle', 'queued', 'processing', 'ready', 'failed')),
+                highlight_error TEXT,
+                highlight_processed_at TEXT,
+                imported_highlight_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_documents_user_kind
@@ -579,6 +601,8 @@ def init_database(app: Flask) -> None:
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK(status IN ('pending', 'ready', 'failed')),
                 error TEXT,
+                source TEXT NOT NULL DEFAULT 'reader'
+                    CHECK(source IN ('reader', 'pdf_import')),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(user_id, document_id, page, rects_json)
@@ -610,6 +634,25 @@ def init_database(app: Flask) -> None:
         }
         if "read_at" not in document_columns:
             connection.execute("ALTER TABLE documents ADD COLUMN read_at TEXT")
+        document_migrations = {
+            "source_path": "TEXT",
+            "highlight_status": "TEXT NOT NULL DEFAULT 'idle'",
+            "highlight_error": "TEXT",
+            "highlight_processed_at": "TEXT",
+            "imported_highlight_count": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, declaration in document_migrations.items():
+            if column not in document_columns:
+                connection.execute(
+                    f"ALTER TABLE documents ADD COLUMN {column} {declaration}"
+                )
+        highlight_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(highlights)")
+        }
+        if "source" not in highlight_columns:
+            connection.execute(
+                "ALTER TABLE highlights ADD COLUMN source TEXT NOT NULL DEFAULT 'reader'"
+            )
         user_columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")}
         if "password_hash" in user_columns:
             connection.execute("ALTER TABLE users DROP COLUMN password_hash")
@@ -670,7 +713,290 @@ def highlight_json(row: sqlite3.Row) -> dict[str, Any]:
         "alternatives": json.loads(row["alternatives_json"]),
         "status": row["status"],
         "error": row["error"],
+        "source": row["source"],
     }
+
+
+class MissingApiKeyError(RuntimeError):
+    pass
+
+
+def enrich_highlight_row(
+    app: Flask,
+    database: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    user_id: int,
+    document_id: str,
+) -> sqlite3.Row:
+    existing = database.execute(
+        """SELECT translations_json, replacement, alternatives_json
+           FROM cards WHERE user_id = ? AND target_normalized = ?""",
+        (user_id, normalize_target(row["target"])),
+    ).fetchone()
+    timestamp = now()
+    if existing is None:
+        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        if not api_key:
+            raise MissingApiKeyError
+        context = make_target_context(
+            row["target"],
+            row["sentence"],
+            context_id=row["id"],
+            page=row["page"],
+        )
+        enriched = enrich_targets(
+            [context],
+            api_key=api_key,
+            model=os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL),
+            cache_path=Path(app.config["DATA_DIR"])
+            / "highlight_cache"
+            / f"{row['id']}.json",
+        )[0]
+        translations = json.dumps(enriched.translations_ru, ensure_ascii=False)
+        replacement = enriched.replacement_ru
+        alternatives = json.dumps(
+            enriched.forbidden_alternatives_en,
+            ensure_ascii=False,
+        )
+        database.execute(
+            """INSERT OR IGNORE INTO cards
+               (id, user_id, document_id, target, target_normalized, sentence, page,
+                translations_json, replacement, alternatives_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(uuid.uuid4()),
+                user_id,
+                document_id,
+                row["target"],
+                normalize_target(row["target"]),
+                row["sentence"],
+                row["page"],
+                translations,
+                replacement,
+                alternatives,
+                timestamp,
+            ),
+        )
+    else:
+        translations = existing["translations_json"]
+        replacement = existing["replacement"]
+        alternatives = existing["alternatives_json"]
+
+    database.execute(
+        """UPDATE highlights
+           SET translations_json = ?, replacement = ?, alternatives_json = ?,
+               status = 'ready', error = NULL, updated_at = ?
+           WHERE id = ? AND user_id = ?""",
+        (translations, replacement, alternatives, timestamp, row["id"], user_id),
+    )
+    database.commit()
+    ready = database.execute(
+        "SELECT * FROM highlights WHERE id = ? AND user_id = ?",
+        (row["id"], user_id),
+    ).fetchone()
+    if ready is None:
+        raise RuntimeError("Highlight disappeared during enrichment")
+    return ready
+
+
+def write_pdf_without_native_highlights(source: Path, destination: Path) -> None:
+    reader = PdfReader(source)
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+    for page in writer.pages:
+        annotations = page.get("/Annots")
+        if annotations is None:
+            continue
+        kept = ArrayObject()
+        for reference in annotations:
+            annotation = reference.get_object()
+            if annotation.get("/Subtype") != "/Highlight":
+                kept.append(reference)
+        if kept:
+            page[NameObject("/Annots")] = kept
+        elif NameObject("/Annots") in page:
+            del page[NameObject("/Annots")]
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_handle = tempfile.NamedTemporaryFile(
+        prefix=f".{destination.stem}-",
+        suffix=".pdf",
+        dir=destination.parent,
+        delete=False,
+    )
+    temporary = Path(temporary_handle.name)
+    try:
+        with temporary_handle:
+            writer.write(temporary_handle)
+        PdfReader(temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def enqueue_document_processing(app: Flask, document_id: str, user_id: int) -> None:
+    jobs: set[str] = app.extensions["highlight_jobs"]
+    lock: threading.Lock = app.extensions["highlight_jobs_lock"]
+    with lock:
+        if document_id in jobs:
+            return
+        jobs.add(document_id)
+
+    def run() -> None:
+        try:
+            process_document_highlights(app, document_id, user_id)
+        finally:
+            with lock:
+                jobs.discard(document_id)
+
+    if app.config["PROCESS_DOCUMENTS_INLINE"]:
+        run()
+    else:
+        executor: ThreadPoolExecutor = app.extensions["highlight_executor"]
+        executor.submit(run)
+
+
+def process_document_highlights(app: Flask, document_id: str, user_id: int) -> None:
+    database = sqlite3.connect(app.config["DATABASE"], timeout=30)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA foreign_keys = ON")
+    try:
+        document = database.execute(
+            """SELECT * FROM documents
+               WHERE id = ? AND user_id = ? AND kind = 'pdf'""",
+            (document_id, user_id),
+        ).fetchone()
+        if document is None:
+            return
+        database.execute(
+            """UPDATE documents
+               SET highlight_status = 'processing', highlight_error = NULL
+               WHERE id = ? AND user_id = ?""",
+            (document_id, user_id),
+        )
+        database.commit()
+
+        stored_path = Path(document["stored_path"])
+        if document["source_path"]:
+            source_path = Path(document["source_path"])
+        else:
+            source_path = stored_path.with_name(f"{document_id}.source.pdf")
+            shutil.copy2(stored_path, source_path)
+            database.execute(
+                "UPDATE documents SET source_path = ? WHERE id = ? AND user_id = ?",
+                (str(source_path), document_id, user_id),
+            )
+            database.commit()
+
+        extracted = extract_highlights(source_path)
+        write_pdf_without_native_highlights(source_path, stored_path)
+        database.execute(
+            "DELETE FROM highlights WHERE document_id = ? AND user_id = ? AND source = 'pdf_import'",
+            (document_id, user_id),
+        )
+        timestamp = now()
+        imported_ids: list[str] = []
+        for item in extracted:
+            rects = clean_highlight_rects(item.rects)
+            rects_json = json.dumps(rects, separators=(",", ":"))
+            identity = f"{item.context.source_page}:{rects_json}:{normalize_target(item.context.target)}"
+            try:
+                namespace = uuid.UUID(document_id)
+            except ValueError:
+                namespace = uuid.NAMESPACE_URL
+                identity = f"{document_id}:{identity}"
+            highlight_id = str(uuid.uuid5(namespace, identity))
+            database.execute(
+                """INSERT OR IGNORE INTO highlights
+                   (id, user_id, document_id, target, sentence, page, rects_json,
+                    translations_json, replacement, alternatives_json, status,
+                    error, source, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, '[]', '', '[]', 'pending',
+                           NULL, 'pdf_import', ?, ?)""",
+                (
+                    highlight_id,
+                    user_id,
+                    document_id,
+                    item.context.target,
+                    item.context.sentence,
+                    item.context.source_page,
+                    rects_json,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = database.execute(
+                "SELECT id, source FROM highlights WHERE user_id = ? AND document_id = ? AND page = ? AND rects_json = ?",
+                (user_id, document_id, item.context.source_page, rects_json),
+            ).fetchone()
+            if row is not None and row["source"] == "pdf_import":
+                imported_ids.append(row["id"])
+        database.commit()
+
+        failed = 0
+        for highlight_id in imported_ids:
+            row = database.execute(
+                "SELECT * FROM highlights WHERE id = ? AND user_id = ?",
+                (highlight_id, user_id),
+            ).fetchone()
+            if row is None:
+                continue
+            try:
+                enrich_highlight_row(
+                    app,
+                    database,
+                    row,
+                    user_id=user_id,
+                    document_id=document_id,
+                )
+            except MissingApiKeyError:
+                failed += 1
+                mark_highlight_failed(database, highlight_id, user_id, "OPENROUTER_API_KEY не настроен.")
+            except Exception:
+                failed += 1
+                app.logger.exception("Imported highlight enrichment failed")
+                mark_highlight_failed(database, highlight_id, user_id, "Автоперевод временно недоступен.")
+
+        processing_error = (
+            f"Не удалось подготовить переводов: {failed}. Можно обработать статью повторно."
+            if failed
+            else None
+        )
+        database.execute(
+            """UPDATE documents
+               SET highlight_status = 'ready', highlight_error = ?,
+                   highlight_processed_at = ?, imported_highlight_count = ?
+               WHERE id = ? AND user_id = ?""",
+            (processing_error, now(), len(imported_ids), document_id, user_id),
+        )
+        database.commit()
+    except Exception:
+        app.logger.exception("PDF highlight processing failed")
+        database.rollback()
+        database.execute(
+            """UPDATE documents
+               SET highlight_status = 'failed', highlight_error = ?
+               WHERE id = ? AND user_id = ?""",
+            ("Не удалось обработать хайлайты в PDF.", document_id, user_id),
+        )
+        database.commit()
+    finally:
+        database.close()
+
+
+def mark_highlight_failed(
+    database: sqlite3.Connection,
+    highlight_id: str,
+    user_id: int,
+    message: str,
+) -> None:
+    database.execute(
+        """UPDATE highlights SET status = 'failed', error = ?, updated_at = ?
+           WHERE id = ? AND user_id = ?""",
+        (message, now(), highlight_id, user_id),
+    )
+    database.commit()
 
 
 def add_pdf_highlights(source: Path, rows: list[sqlite3.Row]) -> bytes:

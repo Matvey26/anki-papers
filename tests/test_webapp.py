@@ -7,10 +7,13 @@ import uuid
 from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
+from pypdf.annotations import Highlight, Text
+from pypdf.generic import ArrayObject, FloatObject
 
 import articles_to_anki.webapp as webapp_module
+from articles_to_anki.extract import ExtractedHighlight
 from articles_to_anki.models import EnrichedItem
-from articles_to_anki.webapp import create_app
+from articles_to_anki.webapp import create_app, make_target_context
 
 
 def csrf(response) -> str:
@@ -30,13 +33,16 @@ def pdf_bytes() -> io.BytesIO:
     return stream
 
 
-def make_app(tmp_path: Path):
+def make_app(tmp_path: Path, **config):
     return create_app(
         {
             "TESTING": True,
             "SECRET_KEY": "test-secret",
             "DATA_DIR": tmp_path,
             "DATABASE": tmp_path / "app.sqlite3",
+            "AUTO_PROCESS_UPLOADS": False,
+            "PROCESS_DOCUMENTS_INLINE": True,
+            **config,
         }
     )
 
@@ -97,7 +103,8 @@ def test_register_upload_add_and_export_only_new_cards(
     assert "Оригинал PDF" not in reader.text
     assert ">Текст<" not in reader.text
     assert 'id="card-dialog"' not in reader.text
-    assert 'id="selection-action"' not in reader.text
+    assert 'id="selection-action"' in reader.text
+    assert "Добавить «${target}»" in (Path(webapp_module.__file__).parent / "static" / "reader.js").read_text()
 
     response = client.post(
         f"/article/{document_id}/read",
@@ -303,3 +310,121 @@ def test_existing_database_gets_read_at_migration(tmp_path: Path) -> None:
     with sqlite3.connect(tmp_path / "app.sqlite3") as database:
         columns = {row[1] for row in database.execute("PRAGMA table_info(documents)")}
     assert "read_at" in columns
+
+
+def test_uploaded_pdf_highlights_are_imported_automatically(
+    tmp_path: Path, monkeypatch
+) -> None:
+    install_fake_enrichment(monkeypatch)
+    extracted = ExtractedHighlight(
+        context=make_target_context(
+            "robust",
+            "This is a robust result.",
+            context_id="source-highlight",
+            page=1,
+        ),
+        rects=[{"x1": 80, "y1": 190, "x2": 120, "y2": 205}],
+    )
+    monkeypatch.setattr(webapp_module, "extract_highlights", lambda _path: [extracted])
+    app = make_app(tmp_path, AUTO_PROCESS_UPLOADS=True)
+    client = app.test_client()
+    dashboard = identify(client)
+    response = client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(dashboard), "file": (pdf_bytes(), "marked.pdf")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert "Хайлайты обрабатываются" in response.text
+
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        database.row_factory = sqlite3.Row
+        document = database.execute("SELECT * FROM documents").fetchone()
+        highlight = database.execute("SELECT * FROM highlights").fetchone()
+        assert document["highlight_status"] == "ready"
+        assert document["imported_highlight_count"] == 1
+        assert Path(document["source_path"]).is_file()
+        assert Path(document["stored_path"]).is_file()
+        assert highlight["source"] == "pdf_import"
+        assert highlight["status"] == "ready"
+        assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 1
+
+
+def test_existing_pdf_can_be_processed_without_reupload(
+    tmp_path: Path, monkeypatch
+) -> None:
+    install_fake_enrichment(monkeypatch)
+    extracted = ExtractedHighlight(
+        context=make_target_context(
+            "robust",
+            "This is a robust result.",
+            context_id="legacy-highlight",
+            page=1,
+        ),
+        rects=[{"x1": 80, "y1": 190, "x2": 120, "y2": 205}],
+    )
+    monkeypatch.setattr(webapp_module, "extract_highlights", lambda _path: [extracted])
+    app = make_app(tmp_path)
+    client = app.test_client()
+    dashboard = identify(client)
+    client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(dashboard), "file": (pdf_bytes(), "legacy.pdf")},
+        content_type="multipart/form-data",
+    )
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        document_id, source_path = database.execute(
+            "SELECT id, source_path FROM documents"
+        ).fetchone()
+        Path(source_path).unlink()
+        database.execute(
+            "UPDATE documents SET source_path = NULL, highlight_status = 'idle' WHERE id = ?",
+            (document_id,),
+        )
+        database.commit()
+
+    response = client.post(
+        f"/article/{document_id}/process-highlights",
+        data={"csrf_token": csrf(client.get("/dashboard"))},
+        follow_redirects=True,
+    )
+    assert "Обработка хайлайтов запущена" in response.text
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        document = database.execute(
+            "SELECT source_path, highlight_status FROM documents WHERE id = ?",
+            (document_id,),
+        ).fetchone()
+        assert document[1] == "ready"
+        assert Path(document[0]).is_file()
+        assert database.execute("SELECT COUNT(*) FROM highlights").fetchone()[0] == 1
+
+
+def test_clean_pdf_removes_only_native_highlight_annotations(tmp_path: Path) -> None:
+    source = tmp_path / "source.pdf"
+    destination = tmp_path / "working.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=300, height=400)
+    writer.add_annotation(
+        page_number=0,
+        annotation=Highlight(
+            rect=(70, 180, 130, 210),
+            quad_points=ArrayObject(
+                FloatObject(value)
+                for value in (70, 210, 130, 210, 70, 180, 130, 180)
+            ),
+        ),
+    )
+    writer.add_annotation(
+        page_number=0,
+        annotation=Text(rect=(10, 10, 30, 30), text="keep me"),
+    )
+    with source.open("wb") as stream:
+        writer.write(stream)
+
+    webapp_module.write_pdf_without_native_highlights(source, destination)
+
+    annotations = [
+        reference.get_object()["/Subtype"]
+        for reference in PdfReader(destination).pages[0]["/Annots"]
+    ]
+    assert annotations == ["/Text"]

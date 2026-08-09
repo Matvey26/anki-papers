@@ -6,14 +6,18 @@ const status = document.querySelector("#pdf-status");
 const popover = document.querySelector("#highlight-popover");
 const popoverWord = document.querySelector("#highlight-word");
 const popoverTranslation = document.querySelector("#highlight-translation");
+const selectionAction = document.querySelector("#selection-action");
 const pageStates = new Map();
 const highlights = new Map();
 const highlightSignatures = new Set();
+const savingHighlights = new Set();
 const visiblePages = new Set();
 let pdfDocument = null;
 let selectionTimer = null;
 let qualityTimer = null;
+let processingTimer = null;
 let openHighlightId = null;
+let chosenSelection = null;
 
 pdfjs.GlobalWorkerOptions.workerSrc = workspace.dataset.workerUrl;
 
@@ -90,11 +94,7 @@ async function openPdf() {
   }
 
   const stored = await highlightsRequest;
-  for (const highlight of stored.highlights) rememberHighlight(highlight);
-  for (const pageNumber of pageStates.keys()) drawPageHighlights(pageNumber);
-  for (const highlight of highlights.values()) {
-    if (highlight.status === "pending") void saveHighlight(highlight);
-  }
+  syncStoredHighlights(stored);
 
   status.hidden = true;
   const targetPage = viewer.querySelector(`[data-page="${initialPage}"]`);
@@ -236,12 +236,49 @@ function captureSelection() {
     error: null,
   };
   const signature = highlightSignature(provisional);
-  selection.removeAllRanges();
-  if (highlightSignatures.has(signature)) return;
-  rememberHighlight(provisional);
-  drawPageHighlights(pageNumber);
-  void saveHighlight(provisional);
+  if (highlightSignatures.has(signature)) {
+    hideSelectionAction();
+    return;
+  }
+  chosenSelection = provisional;
+  selectionAction.textContent = `Добавить «${target}»`;
+  selectionAction.hidden = false;
+  positionSelectionAction(range);
 }
+
+function positionSelectionAction(range) {
+  const anchor = range.getBoundingClientRect();
+  const left = Math.min(
+    window.innerWidth - selectionAction.offsetWidth - 10,
+    Math.max(10, anchor.left + anchor.width / 2 - selectionAction.offsetWidth / 2),
+  );
+  const top = anchor.top > selectionAction.offsetHeight + 14
+    ? anchor.top - selectionAction.offsetHeight - 7
+    : anchor.bottom + 7;
+  selectionAction.style.left = `${left}px`;
+  selectionAction.style.top = `${Math.max(10, top)}px`;
+}
+
+function hideSelectionAction() {
+  selectionAction.hidden = true;
+  chosenSelection = null;
+}
+
+selectionAction.addEventListener("pointerdown", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+});
+
+selectionAction.addEventListener("click", (event) => {
+  event.stopPropagation();
+  const highlight = chosenSelection;
+  hideSelectionAction();
+  window.getSelection()?.removeAllRanges();
+  if (!highlight || highlightSignatures.has(highlightSignature(highlight))) return;
+  rememberHighlight(highlight);
+  drawPageHighlights(highlight.page);
+  void saveHighlight(highlight);
+});
 
 function selectionPdfRects(range, state) {
   const pageBounds = state.shell.getBoundingClientRect();
@@ -314,6 +351,8 @@ function findSentence(text, target, hint = 0) {
 }
 
 async function saveHighlight(highlight) {
+  if (savingHighlights.has(highlight.id)) return;
+  savingHighlights.add(highlight.id);
   let activeHighlight = highlight;
   highlight.status = "pending";
   highlight.error = null;
@@ -352,8 +391,46 @@ async function saveHighlight(highlight) {
       rememberHighlight(current);
     }
   } finally {
+    savingHighlights.delete(highlight.id);
     drawPageHighlights(highlight.page);
   }
+}
+
+function syncStoredHighlights(payload) {
+  const importedIds = new Set(
+    payload.highlights
+      .filter((highlight) => highlight.source === "pdf_import")
+      .map((highlight) => highlight.id),
+  );
+  for (const [id, highlight] of highlights) {
+    if (highlight.source === "pdf_import" && !importedIds.has(id)) {
+      highlights.delete(id);
+      highlightSignatures.delete(highlightSignature(highlight));
+    }
+  }
+  for (const highlight of payload.highlights) rememberHighlight(highlight);
+  for (const pageNumber of pageStates.keys()) drawPageHighlights(pageNumber);
+  for (const highlight of highlights.values()) {
+    if (highlight.status === "pending" && highlight.source !== "pdf_import") {
+      void saveHighlight(highlight);
+    }
+  }
+  scheduleProcessingPoll(payload.processing_status);
+}
+
+function scheduleProcessingPoll(processingStatus) {
+  window.clearTimeout(processingTimer);
+  if (!["queued", "processing"].includes(processingStatus)) return;
+  processingTimer = window.setTimeout(async () => {
+    try {
+      const response = await fetch(workspace.dataset.highlightsUrl);
+      if (!response.ok) throw new Error("Не удалось обновить хайлайты.");
+      syncStoredHighlights(await response.json());
+    } catch (error) {
+      console.error(error);
+      scheduleProcessingPoll("processing");
+    }
+  }, 2500);
 }
 
 function rememberHighlight(highlight) {
@@ -418,7 +495,9 @@ function pdfRectToViewport(rectangle, viewport) {
 
 function showTranslation(event, highlight) {
   event.stopPropagation();
-  if (highlight.status === "failed") void saveHighlight(highlight);
+  if (highlight.status === "failed" && highlight.source !== "pdf_import") {
+    void saveHighlight(highlight);
+  }
   openHighlightId = highlight.id;
   popoverWord.textContent = highlight.target;
   renderPopoverText(highlight);
@@ -467,4 +546,10 @@ function makeUuid() {
 }
 
 document.addEventListener("pointerdown", hideTranslation);
-window.addEventListener("scroll", () => hideTranslation(), {passive: true});
+document.addEventListener("pointerdown", (event) => {
+  if (!event.target.closest?.(".selection-action")) hideSelectionAction();
+});
+window.addEventListener("scroll", () => {
+  hideTranslation();
+  hideSelectionAction();
+}, {passive: true});

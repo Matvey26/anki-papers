@@ -15,6 +15,7 @@
   <a class="viewer-back" href="{{ url_for('dashboard') }}" aria-label="Вернуться в библиотеку">← Библиотека</a>
   <div id="pdf-status" class="pdf-status">Открываем PDF…</div>
   <div id="pdf-viewer" class="pdf-viewer" aria-label="{{ document['name'] }}"></div>
+  <button id="selection-action" class="selection-action" type="button" hidden></button>
   <div id="highlight-popover" class="highlight-popover" role="status" hidden>
     <strong id="highlight-word"></strong>
     <span id="highlight-translation"></span>

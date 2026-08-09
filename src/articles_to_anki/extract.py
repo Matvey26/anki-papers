@@ -114,6 +114,12 @@ class DocumentText:
     hard_page_starts: list[bool]
 
 
+@dataclass(slots=True)
+class ExtractedHighlight:
+    context: TargetContext
+    rects: list[dict[str, float]]
+
+
 def yellow_mask(image: Image.Image) -> np.ndarray:
     """Return a permissive mask for translucent warm-yellow marker ink."""
     pixels = np.asarray(image.convert("RGB"))
@@ -135,6 +141,22 @@ def extract_targets(
     config: ExtractionConfig | None = None,
     debug_dir: str | Path | None = None,
 ) -> list[TargetContext]:
+    return [
+        highlight.context
+        for highlight in extract_highlights(
+            pdf_path,
+            config=config,
+            debug_dir=debug_dir,
+        )
+    ]
+
+
+def extract_highlights(
+    pdf_path: str | Path,
+    *,
+    config: ExtractionConfig | None = None,
+    debug_dir: str | Path | None = None,
+) -> list[ExtractedHighlight]:
     config = config or ExtractionConfig()
     pdf_path = Path(pdf_path).expanduser().resolve()
     if not pdf_path.is_file():
@@ -194,23 +216,73 @@ def extract_targets(
 
     document_text = _extract_document_text(pdf_path)
     occurrence_counts: dict[tuple[int, str], int] = {}
-    contexts: list[TargetContext] = []
+    reader = PdfReader(pdf_path)
+    page_boxes = [
+        (
+            float(page.cropbox.left),
+            float(page.cropbox.bottom),
+            float(page.cropbox.height),
+        )
+        for page in reader.pages
+    ]
+    highlights: list[ExtractedHighlight] = []
     for group in local_groups:
         if not group.tokens or not group.target:
             continue
         occurrence_key = (group.page_index, group.target.casefold())
         occurrence = occurrence_counts.get(occurrence_key, 0)
-        contexts.append(
-            _context_for_group(
-                flat_tokens,
-                group,
-                pdf_path.name,
-                document_text=document_text,
-                occurrence=occurrence,
+        context = _context_for_group(
+            flat_tokens,
+            group,
+            pdf_path.name,
+            document_text=document_text,
+            occurrence=occurrence,
+        )
+        highlights.append(
+            ExtractedHighlight(
+                context=context,
+                rects=_standard_rects_for_group(group, page_boxes[group.page_index]),
             )
         )
         occurrence_counts[occurrence_key] = occurrence + 1
-    return contexts
+    return highlights
+
+
+def _standard_rects_for_group(
+    group: TargetGroup,
+    page_box: tuple[float, float, float],
+) -> list[dict[str, float]]:
+    crop_left, crop_bottom, page_height = page_box
+    lines: list[list[Token]] = []
+    for token in group.tokens:
+        if not lines:
+            lines.append([token])
+            continue
+        previous = lines[-1][-1]
+        same_line = abs(token.top - previous.top) <= max(
+            2.0,
+            0.25 * max(token.height, previous.height),
+        )
+        if same_line:
+            lines[-1].append(token)
+        else:
+            lines.append([token])
+
+    rectangles: list[dict[str, float]] = []
+    for line in lines:
+        left = min(token.x0 for token in line)
+        right = max(token.x1 for token in line)
+        top = min(token.top for token in line)
+        bottom = max(token.bottom for token in line)
+        rectangles.append(
+            {
+                "x1": round(crop_left + left, 3),
+                "y1": round(crop_bottom + page_height - bottom, 3),
+                "x2": round(crop_left + right, 3),
+                "y2": round(crop_bottom + page_height - top, 3),
+            }
+        )
+    return rectangles
 
 
 def _extract_page_tokens(page, page_index: int, config: ExtractionConfig) -> list[Token]:
