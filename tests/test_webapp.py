@@ -36,11 +36,11 @@ def make_app(tmp_path: Path):
     )
 
 
-def register(client, username: str = "reader"):
-    token = csrf(client.get("/register"))
+def identify(client, username: str = "reader"):
+    token = csrf(client.get("/login"))
     return client.post(
-        "/register",
-        data={"csrf_token": token, "username": username, "password": "secret12"},
+        "/login",
+        data={"csrf_token": token, "username": username},
         follow_redirects=True,
     )
 
@@ -48,7 +48,7 @@ def register(client, username: str = "reader"):
 def test_register_upload_add_and_export_only_new_cards(tmp_path: Path) -> None:
     app = make_app(tmp_path)
     client = app.test_client()
-    response = register(client)
+    response = identify(client)
     assert response.status_code == 200
     assert "Библиотека" in response.text
 
@@ -111,7 +111,7 @@ def test_register_upload_add_and_export_only_new_cards(tmp_path: Path) -> None:
 def test_users_cannot_open_each_others_documents(tmp_path: Path) -> None:
     app = make_app(tmp_path)
     first = app.test_client()
-    response = register(first, "first-user")
+    response = identify(first, "first-user")
     first.post(
         "/upload/pdf",
         data={"csrf_token": csrf(response), "file": (pdf_bytes(), "private.pdf")},
@@ -121,13 +121,49 @@ def test_users_cannot_open_each_others_documents(tmp_path: Path) -> None:
         document_id = database.execute("SELECT id FROM documents").fetchone()[0]
 
     second = app.test_client()
-    second_dashboard = register(second, "second-user")
+    second_dashboard = identify(second, "second-user")
     assert second.get(f"/article/{document_id}").status_code == 404
     assert second.get(f"/file/pdf/{document_id}").status_code == 404
     assert second.post(
         f"/article/{document_id}/read",
         data={"csrf_token": csrf(second_dashboard), "read": "1"},
     ).status_code == 404
+
+
+def test_existing_username_logs_into_same_profile_without_password(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    first = app.test_client()
+    auth_page = first.get("/register")
+    assert 'name="password"' not in auth_page.text
+    assert "профиль создастся автоматически" in auth_page.text
+    response = identify(first, "same-user")
+    first.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(response), "file": (pdf_bytes(), "saved.pdf")},
+        content_type="multipart/form-data",
+    )
+
+    second = app.test_client()
+    response = identify(second, "SAME-user")
+    assert "saved.pdf" in response.text
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        assert database.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
+
+
+def test_existing_database_drops_obsolete_password_hash(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    identify(app.test_client(), "old-user")
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        database.execute(
+            "ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT 'old-hash'"
+        )
+
+    make_app(tmp_path)
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        columns = {row[1] for row in database.execute("PRAGMA table_info(users)")}
+        username = database.execute("SELECT username FROM users").fetchone()[0]
+    assert "password_hash" not in columns
+    assert username == "old-user"
 
 
 def test_existing_database_gets_read_at_migration(tmp_path: Path) -> None:

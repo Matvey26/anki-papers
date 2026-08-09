@@ -32,8 +32,6 @@ from flask import (
     url_for,
 )
 from pypdf import PdfReader
-from werkzeug.security import check_password_hash, generate_password_hash
-
 from .enrich import DEFAULT_MODEL, enrich_targets, load_env_file
 from .extract import RECALL_PLACEHOLDER
 from .models import TargetContext
@@ -69,50 +67,35 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             return redirect(url_for("login"))
         return redirect(url_for("dashboard"))
 
-    @app.route("/register", methods=["GET", "POST"])
-    def register() -> Response:
-        if request.method == "POST":
-            require_csrf()
-            username = request.form.get("username", "").strip()
-            password = request.form.get("password", "")
-            if not USERNAME_RE.fullmatch(username):
-                flash("Логин: 3–32 символа; буквы, цифры, точка, дефис или подчёркивание.", "error")
-            elif len(password) < 6 or len(password) > 128:
-                flash("Пароль: от 6 до 128 символов.", "error")
-            else:
-                try:
-                    cursor = get_database().execute(
-                        "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-                        (username, generate_password_hash(password), now()),
-                    )
-                    get_database().commit()
-                except sqlite3.IntegrityError:
-                    flash("Этот логин уже занят.", "error")
-                else:
-                    session.clear()
-                    session["user_id"] = cursor.lastrowid
-                    session["username"] = username
-                    return redirect(url_for("dashboard"))
-        return render_template("auth.html", register=True)
-
     @app.route("/login", methods=["GET", "POST"])
     def login() -> Response:
         if request.method == "POST":
             require_csrf()
             username = request.form.get("username", "").strip()
-            password = request.form.get("password", "")
-            user = get_database().execute(
-                "SELECT id, username, password_hash FROM users WHERE username = ? COLLATE NOCASE",
-                (username,),
-            ).fetchone()
-            if user is None or not check_password_hash(user["password_hash"], password):
-                flash("Неверный логин или пароль.", "error")
+            if not USERNAME_RE.fullmatch(username):
+                flash("Логин: 3–32 символа; буквы, цифры, точка, дефис или подчёркивание.", "error")
             else:
+                database = get_database()
+                database.execute(
+                    "INSERT OR IGNORE INTO users (username, created_at) VALUES (?, ?)",
+                    (username, now()),
+                )
+                database.commit()
+                user = database.execute(
+                    "SELECT id, username FROM users WHERE username = ? COLLATE NOCASE",
+                    (username,),
+                ).fetchone()
+                if user is None:
+                    abort(500, "Не удалось создать профиль")
                 session.clear()
                 session["user_id"] = user["id"]
                 session["username"] = user["username"]
                 return redirect(url_for("dashboard"))
-        return render_template("auth.html", register=False)
+        return render_template("auth.html")
+
+    @app.route("/register", methods=["GET", "POST"])
+    def register() -> Response:
+        return login()
 
     @app.post("/logout")
     @login_required
@@ -459,7 +442,6 @@ def init_database(app: Flask) -> None:
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT NOT NULL COLLATE NOCASE UNIQUE,
-                password_hash TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS documents (
@@ -501,6 +483,9 @@ def init_database(app: Flask) -> None:
         }
         if "read_at" not in document_columns:
             connection.execute("ALTER TABLE documents ADD COLUMN read_at TEXT")
+        user_columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")}
+        if "password_hash" in user_columns:
+            connection.execute("ALTER TABLE users DROP COLUMN password_hash")
         connection.execute("PRAGMA optimize")
         connection.commit()
     finally:

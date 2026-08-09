@@ -70,28 +70,28 @@ jobs:
           sshpass -e ssh "$SERVER_USER@$SERVER_IP" \
             "DEPLOY_PASSWORD_B64=$encoded_password bash -se" <<'REMOTE'
           cd "$HOME/anki-papers"
+          app_dir="$HOME/anki-papers"
+          data_dir="$app_dir/data"
+          current_user="$(id -un)"
+          run_root() {
+            if test "$(id -u)" -eq 0; then
+              "$@"
+            else
+              printf '%s' "$DEPLOY_PASSWORD_B64" | base64 -d | sudo -S -p '' "$@"
+            fi
+          }
+
           if ! python3 -m venv .venv; then
             venv_package="python$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')-venv"
-            if test "$(id -u)" -eq 0; then
-              apt-get update
-              apt-get install -y "$venv_package"
-            else
-              printf '%s' "$DEPLOY_PASSWORD_B64" | base64 -d | \
-                sudo -S -p '' apt-get update
-              printf '%s' "$DEPLOY_PASSWORD_B64" | base64 -d | \
-                sudo -S -p '' apt-get install -y "$venv_package"
-            fi
+            run_root apt-get update
+            run_root apt-get install -y "$venv_package"
             python3 -m venv --clear .venv
           fi
           if command -v ufw >/dev/null 2>&1; then
-            if test "$(id -u)" -eq 0; then
-              ufw allow 8000/tcp
-            else
-              printf '%s' "$DEPLOY_PASSWORD_B64" | base64 -d | \
-                sudo -S -p '' ufw allow 8000/tcp
-            fi
+            run_root ufw allow 8000/tcp
           fi
-          unset DEPLOY_PASSWORD_B64
+          mkdir -p "$data_dir"
+          chmod 700 "$data_dir"
           .venv/bin/python -m pip install --upgrade pip
           .venv/bin/python -m pip install .
           .venv/bin/python -c 'from articles_to_anki.webapp import create_app; create_app()'
@@ -108,12 +108,33 @@ jobs:
             fi
           fi
 
-          nohup .venv/bin/python -m articles_to_anki.webapp \
-            --host 0.0.0.0 --port 8000 > app.log 2>&1 < /dev/null &
-          new_pid=$!
-          printf '%s\n' "$new_pid" > app.pid
+          service_file="$app_dir/.anki-papers.service"
+          {
+            printf '%s\n' '[Unit]'
+            printf '%s\n' 'Description=Anki Papers web application'
+            printf '%s\n' 'After=network.target'
+            printf '\n'
+            printf '%s\n' '[Service]'
+            printf '%s\n' 'Type=simple'
+            printf 'User=%s\n' "$current_user"
+            printf 'WorkingDirectory=%s\n' "$app_dir"
+            printf 'Environment=ANKI_PAPERS_DATA_DIR=%s\n' "$data_dir"
+            printf 'ExecStart=%s/.venv/bin/python -m articles_to_anki.webapp --host 0.0.0.0 --port 8000\n' "$app_dir"
+            printf '%s\n' 'Restart=always'
+            printf '%s\n' 'RestartSec=3'
+            printf '%s\n' 'UMask=0077'
+            printf '\n'
+            printf '%s\n' '[Install]'
+            printf '%s\n' 'WantedBy=multi-user.target'
+          } > "$service_file"
+          run_root install -m 0644 "$service_file" /etc/systemd/system/anki-papers.service
+          run_root systemctl daemon-reload
+          run_root systemctl enable anki-papers.service
+          run_root systemctl restart anki-papers.service
+          run_root systemctl is-active --quiet anki-papers.service
+          unset DEPLOY_PASSWORD_B64
+
           sleep 3
-          kill -0 "$new_pid"
           .venv/bin/python - <<'PY'
           from urllib.request import urlopen
 
