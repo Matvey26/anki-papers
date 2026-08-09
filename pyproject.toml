@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "articles-to-anki"
+version = "0.1.0"
+description = "Extract hand-highlighted vocabulary from PDFs and create Anki cards."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26,<3",
+  "pdfplumber>=0.11,<1",
+  "Pillow>=10,<13",
+  "pydantic>=2.7,<3",
+  "pypdf>=5,<7",
+  "pypdfium2>=4.30,<5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+]
+
+[project.scripts]
+articles-to-anki = "articles_to_anki.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
