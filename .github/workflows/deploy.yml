@@ -66,9 +66,24 @@ jobs:
         run: |
           set -euo pipefail
           export SSHPASS="$SERVER_PASSWORD"
-          sshpass -e ssh "$SERVER_USER@$SERVER_IP" 'bash -se' <<'REMOTE'
+          encoded_password="$(printf '%s' "$SERVER_PASSWORD" | base64 -w 0)"
+          sshpass -e ssh "$SERVER_USER@$SERVER_IP" \
+            "DEPLOY_PASSWORD_B64=$encoded_password bash -se" <<'REMOTE'
           cd "$HOME/anki-papers"
-          python3 -m venv .venv
+          if ! python3 -m venv .venv; then
+            venv_package="python$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')-venv"
+            if test "$(id -u)" -eq 0; then
+              apt-get update
+              apt-get install -y "$venv_package"
+            else
+              printf '%s' "$DEPLOY_PASSWORD_B64" | base64 -d | \
+                sudo -S -p '' apt-get update
+              printf '%s' "$DEPLOY_PASSWORD_B64" | base64 -d | \
+                sudo -S -p '' apt-get install -y "$venv_package"
+            fi
+            python3 -m venv --clear .venv
+          fi
+          unset DEPLOY_PASSWORD_B64
           .venv/bin/python -m pip install --upgrade pip
           .venv/bin/python -m pip install .
           .venv/bin/python -c 'from articles_to_anki.webapp import create_app; create_app()'
