@@ -6,7 +6,8 @@
   <title>{% block title %}Anki Papers{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
 </head>
-<body>
+<body class="{% block body_class %}{% endblock %}">
+  {% block chrome %}
   {% if session.get('user_id') %}
     <header class="topbar">
       <a class="brand" href="{{ url_for('dashboard') }}">Anki Papers</a>
@@ -20,6 +21,7 @@
       </nav>
     </header>
   {% endif %}
+  {% endblock %}
   <main class="page {% block page_class %}{% endblock %}">
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% for category, message in messages %}

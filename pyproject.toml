@@ -33,7 +33,13 @@ anki-papers-web = "articles_to_anki.webapp:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-articles_to_anki = ["templates/*.html", "static/*.css", "static/*.js"]
+articles_to_anki = [
+  "templates/*.html",
+  "static/*.css",
+  "static/*.js",
+  "static/vendor/pdfjs/*.mjs",
+  "static/vendor/pdfjs/LICENSE",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

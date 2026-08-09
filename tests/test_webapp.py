@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-import json
 import re
 import sqlite3
 from pathlib import Path
@@ -62,13 +61,24 @@ def test_register_upload_add_and_export_only_new_cards(tmp_path: Path) -> None:
     assert "Статья загружена" in response.text
 
     with sqlite3.connect(tmp_path / "app.sqlite3") as database:
-        document_id, text_path = database.execute(
-            "SELECT id, text_path FROM documents WHERE kind = 'pdf'"
-        ).fetchone()
-    Path(text_path).write_text(json.dumps(["This is a robust result."]), encoding="utf-8")
+        document_id = database.execute(
+            "SELECT id FROM documents WHERE kind = 'pdf'"
+        ).fetchone()[0]
     reader = client.get(f"/article/{document_id}")
-    assert 'class="word ' in reader.text
-    assert 'data-word="robust"' in reader.text
+    assert 'id="pdf-workspace"' in reader.text
+    assert f'/file/pdf/{document_id}' in reader.text
+    assert "Оригинал PDF" not in reader.text
+    assert ">Текст<" not in reader.text
+
+    response = client.post(
+        f"/article/{document_id}/read",
+        data={"csrf_token": csrf(response), "read": "1"},
+        follow_redirects=True,
+    )
+    assert "Статья отмечена прочитанной" in response.text
+    assert "· Прочитано" in response.text
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        assert database.execute("SELECT read_at FROM documents WHERE id = ?", (document_id,)).fetchone()[0]
 
     response = client.post(
         "/cards",
@@ -111,6 +121,20 @@ def test_users_cannot_open_each_others_documents(tmp_path: Path) -> None:
         document_id = database.execute("SELECT id FROM documents").fetchone()[0]
 
     second = app.test_client()
-    register(second, "second-user")
+    second_dashboard = register(second, "second-user")
     assert second.get(f"/article/{document_id}").status_code == 404
     assert second.get(f"/file/pdf/{document_id}").status_code == 404
+    assert second.post(
+        f"/article/{document_id}/read",
+        data={"csrf_token": csrf(second_dashboard), "read": "1"},
+    ).status_code == 404
+
+
+def test_existing_database_gets_read_at_migration(tmp_path: Path) -> None:
+    make_app(tmp_path)
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        database.execute("ALTER TABLE documents DROP COLUMN read_at")
+    make_app(tmp_path)
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        columns = {row[1] for row in database.execute("PRAGMA table_info(documents)")}
+    assert "read_at" in columns

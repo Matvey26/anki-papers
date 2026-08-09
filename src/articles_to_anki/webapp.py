@@ -38,7 +38,6 @@ from .enrich import DEFAULT_MODEL, enrich_targets, load_env_file
 from .extract import RECALL_PLACEHOLDER
 from .models import TargetContext
 
-WORD_RE = re.compile(r"[\w]+(?:['’\-][\w]+)*", re.UNICODE)
 USERNAME_RE = re.compile(r"^[\w.\-]{3,32}$", re.UNICODE)
 
 
@@ -180,27 +179,29 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @login_required
     def article(document_id: str) -> Response:
         document = owned_document(document_id, "pdf")
-        text_path = Path(document["text_path"])
-        try:
-            pages = json.loads(text_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            pages = [""]
-        page_number = min(max(request.args.get("page", 1, type=int), 1), max(1, len(pages)))
-        mode = request.args.get("mode", "text")
-        saved_rows = get_database().execute(
-            "SELECT target_normalized FROM cards WHERE user_id = ?",
-            (session["user_id"],),
-        ).fetchall()
-        saved = {row["target_normalized"] for row in saved_rows}
-        sentences = tokenize_page(pages[page_number - 1] if pages else "", saved)
+        page_number = min(
+            max(request.args.get("page", 1, type=int), 1),
+            max(1, document["page_count"]),
+        )
         return render_template(
             "reader.html",
             document=document,
             page_number=page_number,
-            page_count=max(1, len(pages)),
-            mode=mode,
-            sentences=sentences,
         )
+
+    @app.post("/article/<document_id>/read")
+    @login_required
+    def mark_article_read(document_id: str) -> Response:
+        require_csrf()
+        document = owned_document(document_id, "pdf")
+        read_at = now() if request.form.get("read") == "1" else None
+        get_database().execute(
+            "UPDATE documents SET read_at = ? WHERE id = ? AND user_id = ?",
+            (read_at, document["id"], session["user_id"]),
+        )
+        get_database().commit()
+        flash("Статья отмечена прочитанной." if read_at else "Статья снова в непрочитанных.", "success")
+        return redirect(url_for("dashboard"))
 
     @app.get("/file/pdf/<document_id>")
     @login_required
@@ -254,7 +255,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 flash("Это слово уже было добавлено.", "error")
             else:
                 flash("Добавлены две карточки.", "success")
-        return redirect(url_for("article", document_id=document_id, page=page_number, mode="text"))
+        return redirect(url_for("article", document_id=document_id, page=page_number))
 
     @app.post("/cards/<card_id>/delete")
     @login_required
@@ -366,10 +367,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         try:
             if kind == "pdf":
                 reader = PdfReader(stored_path)
-                pages = [page.extract_text() or "" for page in reader.pages]
-                page_count = len(pages)
-                text_path = user_dir / f"{document_id}.json"
-                text_path.write_text(json.dumps(pages, ensure_ascii=False), encoding="utf-8")
+                page_count = len(reader.pages)
             get_database().execute(
                 """INSERT INTO documents
                    (id, user_id, kind, name, stored_path, text_path, page_count, size, created_at)
@@ -473,6 +471,7 @@ def init_database(app: Flask) -> None:
                 text_path TEXT,
                 page_count INTEGER NOT NULL DEFAULT 0,
                 size INTEGER NOT NULL,
+                read_at TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_documents_user_kind
@@ -497,6 +496,11 @@ def init_database(app: Flask) -> None:
                 ON cards(user_id, created_at);
             """
         )
+        document_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(documents)")
+        }
+        if "read_at" not in document_columns:
+            connection.execute("ALTER TABLE documents ADD COLUMN read_at TEXT")
         connection.execute("PRAGMA optimize")
         connection.commit()
     finally:
@@ -516,38 +520,6 @@ def require_csrf(*, header: bool = False) -> None:
     expected = session.get("_csrf", "")
     if not expected or not secrets.compare_digest(supplied, expected):
         abort(400, "Invalid CSRF token")
-
-
-def tokenize_page(text: str, saved: set[str]) -> list[list[dict[str, Any]]]:
-    normalized_text = re.sub(r"[ \t]+", " ", text.replace("\r", "\n"))
-    normalized_text = re.sub(r"\n+", " ", normalized_text).strip()
-    if not normalized_text:
-        return []
-    raw_sentences = re.split(r"(?<=[.!?])\s+", normalized_text)
-    result: list[list[dict[str, Any]]] = []
-    for sentence in raw_sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-        parts: list[dict[str, Any]] = []
-        cursor = 0
-        for match in WORD_RE.finditer(sentence):
-            if match.start() > cursor:
-                parts.append({"text": sentence[cursor : match.start()], "word": False})
-            value = match.group(0)
-            parts.append(
-                {
-                    "text": value,
-                    "word": True,
-                    "saved": normalize_target(value) in saved,
-                    "sentence": sentence,
-                }
-            )
-            cursor = match.end()
-        if cursor < len(sentence):
-            parts.append({"text": sentence[cursor:], "word": False})
-        result.append(parts)
-    return result
 
 
 def normalize_target(value: str) -> str:

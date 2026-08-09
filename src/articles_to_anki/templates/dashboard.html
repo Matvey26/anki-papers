@@ -2,7 +2,7 @@
 {% block title %}Библиотека — Anki Papers{% endblock %}
 {% block content %}
 <header class="page-heading">
-  <div><h1>Библиотека</h1><p>Загрузите PDF, читайте и нажимайте на незнакомые слова.</p></div>
+  <div><h1>Библиотека</h1><p>Загрузите PDF, читайте и выделяйте незнакомые слова.</p></div>
   <form class="upload-inline" action="{{ url_for('upload_pdf') }}" method="post" enctype="multipart/form-data">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <label class="file-button">Добавить PDF<input name="file" type="file" accept=".pdf,application/pdf" required onchange="this.form.submit()"></label>
@@ -20,10 +20,17 @@
   {% if documents %}
     <div class="article-list">
       {% for document in documents %}
-        <a class="article-row" href="{{ url_for('article', document_id=document['id']) }}">
-          <div><strong>{{ document['name'] }}</strong><span>{{ document['page_count'] }} стр. · {{ (document['size'] / 1024 / 1024)|round(1) }} МБ</span></div>
-          <span>Открыть</span>
-        </a>
+        <div class="article-row {{ 'is-read' if document['read_at'] else '' }}">
+          <a class="article-open" href="{{ url_for('article', document_id=document['id']) }}">
+            <span class="article-title"><strong>{{ document['name'] }}</strong><small>{{ document['page_count'] }} стр. · {{ (document['size'] / 1024 / 1024)|round(1) }} МБ{% if document['read_at'] %} · Прочитано{% endif %}</small></span>
+            <span>Открыть</span>
+          </a>
+          <form action="{{ url_for('mark_article_read', document_id=document['id']) }}" method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="read" value="{{ '0' if document['read_at'] else '1' }}">
+            <button class="read-button">{{ 'Вернуть' if document['read_at'] else 'Отметить' }}</button>
+          </form>
+        </div>
       {% endfor %}
     </div>
   {% else %}
@@ -82,7 +89,7 @@
       {% endfor %}
     </div>
   {% else %}
-    <div class="empty">Нажмите на слово в текстовом режиме чтения.</div>
+    <div class="empty">Выделите слово прямо в PDF.</div>
   {% endif %}
 </section>
 {% endblock %}

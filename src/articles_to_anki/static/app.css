@@ -41,10 +41,16 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .summary strong { font-size: 23px; }
 .summary span { color: var(--muted); font-size: 12px; }
 .article-list, .card-list { border: 1px solid var(--border); border-radius: 9px; overflow: hidden; background: var(--surface); }
-.article-row { padding: 15px 17px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--border); color: var(--text); }
+.article-row { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); color: var(--text); }
 .article-row:last-child { border-bottom: 0; }
-.article-row div { display: grid; gap: 3px; }
-.article-row div span, .article-row > span { color: var(--muted); font-size: 12px; }
+.article-row.is-read { background: #f8f8f6; }
+.article-open { min-width: 0; padding: 15px 8px 15px 17px; display: flex; flex: 1; align-items: center; justify-content: space-between; gap: 16px; color: var(--text); }
+.article-title { min-width: 0; display: grid; gap: 3px; }
+.article-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.article-title small, .article-open > span { color: var(--muted); font-size: 12px; }
+.article-row.is-read .article-title strong { color: var(--muted); }
+.article-row form { padding-right: 14px; }
+.read-button { min-height: 34px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: white; color: var(--text); font-size: 12px; }
 .empty { padding: 28px; border: 1px dashed #c8cac3; border-radius: 9px; color: var(--muted); text-align: center; }
 .exports { margin-top: 40px; }
 .export-box { min-height: 68px; margin-bottom: 10px; padding: 13px 15px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
@@ -68,21 +74,29 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .auth-card input, dialog input { width: 100%; height: 42px; padding: 0 11px; border: 1px solid var(--border); border-radius: 7px; background: white; }
 .auth-card > a { display: block; margin-top: 18px; text-align: center; }
 
-.reader-page { width: min(1100px, calc(100% - 24px)); margin-top: 22px; }
-.reader-heading { display: flex; gap: 24px; align-items: start; }
-.reader-heading h1 { max-width: 780px; overflow: hidden; font-size: 22px; text-overflow: ellipsis; white-space: nowrap; }
-.reader-toolbar { margin: 20px 0 14px; display: flex; align-items: center; justify-content: space-between; }
-.tabs { display: flex; gap: 4px; }
-.tabs a { padding: 8px 12px; border-radius: 6px; color: var(--muted); }
-.tabs a.active { background: var(--text); color: white; }
-.pagination { display: flex; align-items: center; gap: 12px; }
-.text-reader { min-height: 70vh; padding: clamp(22px, 6vw, 70px); border: 1px solid var(--border); background: white; box-shadow: 0 8px 30px rgba(0,0,0,.04); }
-.text-reader p { margin: 0 0 1.1em; font: 18px/1.85 Georgia, serif; }
-.word { display: inline; margin: 0; padding: 1px 0; border: 0; border-radius: 2px; background: transparent; font: inherit; }
-.word:hover, .word:focus { background: #fff3a8; outline: 0; }
-.word.saved { background: #e6ecd8; }
-.pdf-frame { width: 100%; height: calc(100vh - 180px); min-height: 560px; border: 1px solid var(--border); background: white; }
-.pdf-fallback { text-align: center; }
+.pdf-body { background: #252525; }
+.reader-page { width: 100%; margin: 0; }
+.pdf-workspace { min-height: 100dvh; background: #252525; }
+.pdf-viewer { min-height: 100dvh; padding: 12px; display: grid; justify-items: center; gap: 18px; }
+.pdf-page { position: relative; overflow: hidden; background: white; box-shadow: 0 2px 12px rgba(0,0,0,.38); }
+.pdf-page canvas { position: absolute; inset: 0; display: block; }
+.pdf-page.loading::after { content: ""; position: absolute; inset: 0; background: linear-gradient(110deg, #fff 25%, #f1f1f1 40%, #fff 55%); background-size: 220% 100%; animation: loading 1.2s linear infinite; }
+.pdf-page.ready::after { display: none; }
+.pdf-page.failed::after { content: "Страница не загрузилась"; position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); }
+@keyframes loading { to { background-position-x: -220%; } }
+.viewer-back { position: fixed; top: 11px; left: 11px; z-index: 20; padding: 8px 11px; border: 1px solid rgba(255,255,255,.25); border-radius: 7px; background: rgba(25,25,25,.86); color: white; font-size: 13px; backdrop-filter: blur(8px); }
+.pdf-status { position: fixed; top: 50%; left: 50%; z-index: 20; padding: 10px 13px; border-radius: 7px; background: #171717; color: white; transform: translate(-50%, -50%); }
+.page-number { position: absolute; right: 8px; bottom: 5px; z-index: 3; color: #777; font-size: 10px; pointer-events: none; user-select: none; }
+.selection-action { position: fixed; z-index: 30; max-width: calc(100vw - 20px); padding: 8px 11px; overflow: hidden; border: 0; border-radius: 7px; background: #1f2229; color: white; box-shadow: 0 5px 20px rgba(0,0,0,.3); font-size: 13px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+
+.textLayer { color-scheme: only light; position: absolute; inset: 0; z-index: 2; overflow: clip; opacity: 1; line-height: 1; letter-spacing: normal; word-spacing: normal; text-align: initial; text-size-adjust: none; forced-color-adjust: none; transform-origin: 0 0; caret-color: CanvasText; }
+.textLayer :is(span, br) { position: absolute; color: transparent; white-space: pre; cursor: text; transform-origin: 0% 0%; user-select: text; }
+.textLayer { --min-font-size: 1; --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size)); --min-font-size-inv: calc(1 / var(--min-font-size)); }
+.textLayer > :not(.markedContent), .textLayer .markedContent span:not(.markedContent) { z-index: 1; --font-height: 0; --scale-x: 1; --rotate: 0deg; font-size: calc(var(--text-scale-factor) * var(--font-height)); transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv)); }
+.textLayer .markedContent { display: contents; }
+.textLayer span[role="img"] { cursor: default; user-select: none; }
+.textLayer ::selection { background: rgba(45, 98, 235, .3); color: transparent; }
+.textLayer br::selection { background: transparent; }
 dialog { width: min(500px, calc(100% - 24px)); padding: 25px; border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 20px 70px rgba(0,0,0,.25); }
 dialog::backdrop { background: rgba(0,0,0,.4); }
 dialog h2 { margin: 0 35px 8px 0; font-size: 26px; }
@@ -105,9 +119,12 @@ dialog .secondary { margin-bottom: 16px; }
   .saved-card { grid-template-columns: 1fr auto; }
   .saved-card p { grid-column: 1 / -1; }
   .status { grid-column: 1; }
-  .reader-heading { gap: 12px; }
-  .reader-heading h1 { font-size: 18px; }
-  .text-reader { padding: 22px 18px; }
-  .text-reader p { font-size: 17px; line-height: 1.9; }
-  .pdf-frame { height: calc(100vh - 165px); min-height: 460px; }
+  .article-row { align-items: stretch; }
+  .article-open { padding-left: 12px; }
+  .article-open > span:last-child { display: none; }
+  .article-row form { padding-right: 8px; display: grid; align-items: center; }
+  .read-button { width: 82px; }
+  .reader-page { width: 100%; margin: 0; }
+  .pdf-viewer { padding: 8px 0; gap: 10px; }
+  .viewer-back { top: 7px; left: 7px; }
 }
