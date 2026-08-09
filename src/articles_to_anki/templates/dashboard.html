@@ -29,18 +29,6 @@
             </span>
           </a>
           <div class="article-actions">
-            <form action="{{ url_for('process_article_highlights', document_id=document['id']) }}" method="post">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-              {% if document['highlight_status'] in ('queued', 'processing') %}
-                <button class="read-button" disabled>Обработка…</button>
-              {% elif document['highlight_status'] == 'ready' %}
-                <button class="read-button">Обработать заново</button>
-              {% elif document['highlight_status'] == 'failed' %}
-                <button class="read-button">Повторить обработку</button>
-              {% else %}
-                <button class="read-button">Обработать хайлайты</button>
-              {% endif %}
-            </form>
             <form action="{{ url_for('mark_article_read', document_id=document['id']) }}" method="post">
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <input type="hidden" name="read" value="{{ '0' if document['read_at'] else '1' }}">

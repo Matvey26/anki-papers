@@ -365,7 +365,7 @@ def test_uploaded_pdf_highlights_are_imported_automatically(
         assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 1
 
 
-def test_existing_pdf_can_be_processed_without_reupload(
+def test_existing_pdf_can_be_processed_directly_without_reupload(
     tmp_path: Path, monkeypatch
 ) -> None:
     install_fake_enrichment(monkeypatch)
@@ -388,8 +388,8 @@ def test_existing_pdf_can_be_processed_without_reupload(
         content_type="multipart/form-data",
     )
     with sqlite3.connect(tmp_path / "app.sqlite3") as database:
-        document_id, source_path = database.execute(
-            "SELECT id, source_path FROM documents"
+        document_id, user_id, source_path = database.execute(
+            "SELECT id, user_id, source_path FROM documents"
         ).fetchone()
         Path(source_path).unlink()
         database.execute(
@@ -398,12 +398,7 @@ def test_existing_pdf_can_be_processed_without_reupload(
         )
         database.commit()
 
-    response = client.post(
-        f"/article/{document_id}/process-highlights",
-        data={"csrf_token": csrf(client.get("/dashboard"))},
-        follow_redirects=True,
-    )
-    assert "Обработка хайлайтов запущена" in response.text
+    webapp_module.process_document_highlights(app, document_id, user_id)
     with sqlite3.connect(tmp_path / "app.sqlite3") as database:
         document = database.execute(
             "SELECT source_path, highlight_status FROM documents WHERE id = ?",
@@ -412,6 +407,10 @@ def test_existing_pdf_can_be_processed_without_reupload(
         assert document[1] == "ready"
         assert Path(document[0]).is_file()
         assert database.execute("SELECT COUNT(*) FROM highlights").fetchone()[0] == 1
+
+    dashboard = client.get("/dashboard")
+    assert "Обработать хайлайты" not in dashboard.text
+    assert "Обработать заново" not in dashboard.text
 
 
 def test_clean_pdf_removes_only_native_highlight_annotations(tmp_path: Path) -> None:

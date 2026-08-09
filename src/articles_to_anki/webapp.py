@@ -262,22 +262,6 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         remove_managed_files(Path(app.config["DATA_DIR"]), paths)
         return redirect(url_for("dashboard"))
 
-    @app.post("/article/<document_id>/process-highlights")
-    @login_required
-    def process_article_highlights(document_id: str) -> Response:
-        require_csrf()
-        document = owned_document(document_id, "pdf")
-        get_database().execute(
-            """UPDATE documents
-               SET highlight_status = 'queued', highlight_error = NULL
-               WHERE id = ? AND user_id = ?""",
-            (document["id"], session["user_id"]),
-        )
-        get_database().commit()
-        enqueue_document_processing(app, document["id"], session["user_id"])
-        flash("Обработка хайлайтов запущена.", "success")
-        return redirect(url_for("dashboard"))
-
     @app.get("/file/pdf/<document_id>")
     @login_required
     def pdf_file(document_id: str) -> Response:
