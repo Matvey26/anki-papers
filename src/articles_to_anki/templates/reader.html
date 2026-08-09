@@ -8,33 +8,18 @@
   id="pdf-workspace"
   class="pdf-workspace"
   data-pdf-url="{{ url_for('pdf_file', document_id=document['id']) }}"
+  data-highlights-url="{{ url_for('article_highlights', document_id=document['id']) }}"
   data-worker-url="{{ url_for('static', filename='vendor/pdfjs/pdf.worker.min.mjs') }}"
   data-initial-page="{{ page_number }}"
 >
   <a class="viewer-back" href="{{ url_for('dashboard') }}" aria-label="Вернуться в библиотеку">← Библиотека</a>
   <div id="pdf-status" class="pdf-status">Открываем PDF…</div>
   <div id="pdf-viewer" class="pdf-viewer" aria-label="{{ document['name'] }}"></div>
-  <button id="selection-action" class="selection-action" type="button" hidden></button>
+  <div id="highlight-popover" class="highlight-popover" role="status" hidden>
+    <strong id="highlight-word"></strong>
+    <span id="highlight-translation"></span>
+  </div>
 </div>
-
-<dialog id="card-dialog">
-  <form action="{{ url_for('add_card') }}" method="post">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <input type="hidden" name="document_id" value="{{ document['id'] }}">
-    <input id="page" type="hidden" name="page" value="{{ page_number }}">
-    <input id="target" type="hidden" name="target">
-    <input id="sentence" type="hidden" name="sentence">
-    <button class="dialog-close" type="button" data-close aria-label="Закрыть">×</button>
-    <h2 id="dialog-word"></h2>
-    <p id="dialog-sentence" class="context"></p>
-    <button id="enrich" class="secondary full" type="button">Заполнить автоматически</button>
-    <label>Переводы<input id="translations" name="translations" required placeholder="мешать, препятствовать"></label>
-    <label>Замена в предложении<input id="replacement" name="replacement" placeholder="препятствует"></label>
-    <label>Английские синонимы<input id="alternatives" name="alternatives" placeholder="hinder, block"></label>
-    <div id="enrich-error" class="field-error"></div>
-    <button class="primary full">Добавить две карточки</button>
-  </form>
-</dialog>
 {% endblock %}
 {% block scripts %}
 <script>window.ANKI_PAPERS_CSRF = {{ csrf_token()|tojson }};</script>

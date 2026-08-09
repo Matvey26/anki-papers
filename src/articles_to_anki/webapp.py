@@ -6,6 +6,7 @@ import functools
 import html
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -31,12 +32,15 @@ from flask import (
     session,
     url_for,
 )
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
+from pypdf.annotations import Highlight
+from pypdf.generic import ArrayObject, FloatObject, NameObject, TextStringObject
 from .enrich import DEFAULT_MODEL, enrich_targets, load_env_file
 from .extract import RECALL_PLACEHOLDER
 from .models import TargetContext
 
 USERNAME_RE = re.compile(r"^[\w.\-]{3,32}$", re.UNICODE)
+WORD_RE = re.compile(r"^[\w]+(?:['’\-][\w]+)*$", re.UNICODE)
 
 
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
@@ -110,7 +114,13 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         user_id = session["user_id"]
         db = get_database()
         documents = db.execute(
-            "SELECT * FROM documents WHERE user_id = ? AND kind = 'pdf' ORDER BY created_at DESC",
+            """SELECT documents.*,
+                      (SELECT COUNT(*) FROM highlights
+                       WHERE highlights.document_id = documents.id
+                         AND highlights.user_id = documents.user_id) AS highlight_count
+               FROM documents
+               WHERE documents.user_id = ? AND documents.kind = 'pdf'
+               ORDER BY documents.created_at DESC""",
             (user_id,),
         ).fetchall()
         decks = db.execute(
@@ -197,48 +207,174 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             download_name=document["name"],
         )
 
-    @app.post("/cards")
+    @app.get("/article/<document_id>/highlighted.pdf")
     @login_required
-    def add_card() -> Response:
-        require_csrf()
-        document_id = request.form.get("document_id", "")
-        owned_document(document_id, "pdf")
-        target = request.form.get("target", "").strip()
-        sentence = request.form.get("sentence", "").strip()
-        translations = clean_list(request.form.get("translations", ""), 5)
-        replacement = request.form.get("replacement", "").strip()
-        alternatives = clean_list(request.form.get("alternatives", ""), 6)
-        page_number = max(request.form.get("page", 1, type=int), 1)
-        normalized = normalize_target(target)
-        if not normalized or not sentence or not translations:
-            flash("Нужно слово, предложение и хотя бы один перевод.", "error")
-        else:
-            try:
-                get_database().execute(
-                    """INSERT INTO cards
-                       (id, user_id, document_id, target, target_normalized, sentence, page,
-                        translations_json, replacement, alternatives_json, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        str(uuid.uuid4()),
-                        session["user_id"],
-                        document_id,
-                        target,
-                        normalized,
-                        sentence,
-                        page_number,
-                        json.dumps(translations, ensure_ascii=False),
-                        replacement or translations[0],
-                        json.dumps(alternatives, ensure_ascii=False),
-                        now(),
-                    ),
-                )
-                get_database().commit()
-            except sqlite3.IntegrityError:
-                flash("Это слово уже было добавлено.", "error")
-            else:
-                flash("Добавлены две карточки.", "success")
-        return redirect(url_for("article", document_id=document_id, page=page_number))
+    def highlighted_pdf(document_id: str) -> Response:
+        document = owned_document(document_id, "pdf")
+        highlights = get_database().execute(
+            """SELECT page, target, rects_json, translations_json
+               FROM highlights
+               WHERE document_id = ? AND user_id = ?
+               ORDER BY page, created_at""",
+            (document_id, session["user_id"]),
+        ).fetchall()
+        content = add_pdf_highlights(Path(document["stored_path"]), highlights)
+        return send_file(
+            io.BytesIO(content),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=f"{safe_download_name(Path(document['name']).stem)}-highlighted.pdf",
+        )
+
+    @app.route("/api/article/<document_id>/highlights", methods=["GET", "POST"])
+    @login_required
+    def article_highlights(document_id: str) -> Response:
+        document = owned_document(document_id, "pdf")
+        database = get_database()
+
+        def fail_highlight(highlight_id: str, message: str, status_code: int) -> tuple[Response, int]:
+            timestamp = now()
+            database.execute(
+                """UPDATE highlights SET status = 'failed', error = ?, updated_at = ?
+                   WHERE id = ? AND user_id = ?""",
+                (message, timestamp, highlight_id, session["user_id"]),
+            )
+            database.commit()
+            failed = database.execute(
+                "SELECT * FROM highlights WHERE id = ? AND user_id = ?",
+                (highlight_id, session["user_id"]),
+            ).fetchone()
+            return jsonify(error=message, highlight=highlight_json(failed)), status_code
+
+        if request.method == "GET":
+            rows = database.execute(
+                """SELECT * FROM highlights
+                   WHERE document_id = ? AND user_id = ?
+                   ORDER BY created_at""",
+                (document_id, session["user_id"]),
+            ).fetchall()
+            return jsonify(highlights=[highlight_json(row) for row in rows])
+
+        require_csrf(header=True)
+        payload = request.get_json(silent=True) or {}
+        highlight_id = str(payload.get("id", ""))
+        try:
+            if str(uuid.UUID(highlight_id)) != highlight_id:
+                raise ValueError
+        except ValueError:
+            return jsonify(error="Некорректный ID выделения."), 400
+        target = str(payload.get("target", "")).strip()
+        sentence = str(payload.get("sentence", "")).strip()
+        page_number = payload.get("page")
+        try:
+            page_number = int(page_number)
+            rects = clean_highlight_rects(payload.get("rects"))
+        except (KeyError, OverflowError, TypeError, ValueError):
+            return jsonify(error="Некорректные координаты выделения."), 400
+        if not is_single_word(target) or not sentence or len(sentence) > 1200:
+            return jsonify(error="Нужно выделить одно слово."), 400
+        if page_number < 1 or page_number > document["page_count"]:
+            return jsonify(error="Некорректная страница."), 400
+
+        rects_json = json.dumps(rects, separators=(",", ":"))
+        timestamp = now()
+        database.execute(
+            """INSERT OR IGNORE INTO highlights
+               (id, user_id, document_id, target, sentence, page, rects_json,
+                translations_json, replacement, alternatives_json, status,
+                error, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, '[]', '', '[]', 'pending', NULL, ?, ?)""",
+            (
+                highlight_id,
+                session["user_id"],
+                document_id,
+                target,
+                sentence,
+                page_number,
+                rects_json,
+                timestamp,
+                timestamp,
+            ),
+        )
+        database.commit()
+        row = database.execute(
+            """SELECT * FROM highlights
+               WHERE id = ? AND user_id = ? AND document_id = ?""",
+            (highlight_id, session["user_id"], document_id),
+        ).fetchone()
+        if row is None:
+            row = database.execute(
+                """SELECT * FROM highlights
+                   WHERE user_id = ? AND document_id = ? AND page = ? AND rects_json = ?""",
+                (session["user_id"], document_id, page_number, rects_json),
+            ).fetchone()
+        if row is None:
+            abort(500, "Не удалось сохранить выделение")
+        if row["status"] == "ready":
+            return jsonify(highlight=highlight_json(row))
+
+        target = row["target"]
+        sentence = row["sentence"]
+        page_number = row["page"]
+        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        if not api_key:
+            return fail_highlight(row["id"], "OPENROUTER_API_KEY не настроен.", 503)
+        context = make_target_context(target, sentence, context_id=row["id"], page=page_number)
+        try:
+            enriched = enrich_targets(
+                [context],
+                api_key=api_key,
+                model=os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL),
+                cache_path=Path(app.config["DATA_DIR"])
+                / "highlight_cache"
+                / f"{row['id']}.json",
+            )[0]
+        except Exception:
+            app.logger.exception("Automatic highlight enrichment failed")
+            return fail_highlight(row["id"], "Автоперевод временно недоступен.", 502)
+
+        translations = json.dumps(enriched.translations_ru, ensure_ascii=False)
+        alternatives = json.dumps(enriched.forbidden_alternatives_en, ensure_ascii=False)
+        timestamp = now()
+        database.execute(
+            """UPDATE highlights
+               SET translations_json = ?, replacement = ?, alternatives_json = ?,
+                   status = 'ready', error = NULL, updated_at = ?
+               WHERE id = ? AND user_id = ?""",
+            (
+                translations,
+                enriched.replacement_ru,
+                alternatives,
+                timestamp,
+                row["id"],
+                session["user_id"],
+            ),
+        )
+        database.execute(
+            """INSERT OR IGNORE INTO cards
+               (id, user_id, document_id, target, target_normalized, sentence, page,
+                translations_json, replacement, alternatives_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(uuid.uuid4()),
+                session["user_id"],
+                document_id,
+                target,
+                normalize_target(target),
+                sentence,
+                page_number,
+                translations,
+                enriched.replacement_ru,
+                alternatives,
+                timestamp,
+            ),
+        )
+        database.commit()
+        ready = database.execute(
+            "SELECT * FROM highlights WHERE id = ? AND user_id = ?",
+            (row["id"], session["user_id"]),
+        ).fetchone()
+        return jsonify(highlight=highlight_json(ready))
 
     @app.post("/cards/<card_id>/delete")
     @login_required
@@ -251,35 +387,6 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         get_database().commit()
         flash("Карточка удалена.", "success")
         return redirect(url_for("dashboard"))
-
-    @app.post("/api/enrich")
-    @login_required
-    def api_enrich() -> Response:
-        require_csrf(header=True)
-        payload = request.get_json(silent=True) or {}
-        target = str(payload.get("target", "")).strip()
-        sentence = str(payload.get("sentence", "")).strip()
-        if not target or not sentence:
-            return jsonify(error="Не хватает слова или предложения."), 400
-        api_key = os.environ.get("OPENROUTER_API_KEY", "")
-        if not api_key:
-            return jsonify(error="OPENROUTER_API_KEY не настроен."), 503
-        context = make_target_context(target, sentence)
-        try:
-            enriched = enrich_targets(
-                [context],
-                api_key=api_key,
-                model=os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL),
-                cache_path=Path(app.config["DATA_DIR"]) / "enrichment_cache.json",
-            )[0]
-        except Exception:
-            app.logger.exception("Card enrichment failed")
-            return jsonify(error="Автоперевод временно недоступен."), 502
-        return jsonify(
-            translations=enriched.translations_ru,
-            replacement=enriched.replacement_ru,
-            alternatives=enriched.forbidden_alternatives_en,
-        )
 
     @app.post("/export/csv")
     @login_required
@@ -458,6 +565,26 @@ def init_database(app: Flask) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_documents_user_kind
                 ON documents(user_id, kind, created_at);
+            CREATE TABLE IF NOT EXISTS highlights (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                target TEXT NOT NULL,
+                sentence TEXT NOT NULL,
+                page INTEGER NOT NULL,
+                rects_json TEXT NOT NULL,
+                translations_json TEXT NOT NULL DEFAULT '[]',
+                replacement TEXT NOT NULL DEFAULT '',
+                alternatives_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'ready', 'failed')),
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, document_id, page, rects_json)
+            );
+            CREATE INDEX IF NOT EXISTS idx_highlights_document
+                ON highlights(user_id, document_id, page, created_at);
             CREATE TABLE IF NOT EXISTS cards (
                 id TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -511,18 +638,100 @@ def normalize_target(value: str) -> str:
     return " ".join(value.casefold().strip().split())
 
 
-def clean_list(value: str, limit: int) -> list[str]:
-    result: list[str] = []
-    for item in re.split(r"[,;\n]", value):
-        cleaned = item.strip()
-        if cleaned and cleaned.casefold() not in {existing.casefold() for existing in result}:
-            result.append(cleaned)
-        if len(result) == limit:
-            break
-    return result
+def is_single_word(value: str) -> bool:
+    return bool(WORD_RE.fullmatch(value)) and len(value) <= 100
 
 
-def make_target_context(target: str, sentence: str) -> TargetContext:
+def clean_highlight_rects(value: Any) -> list[dict[str, float]]:
+    if not isinstance(value, list) or not value or len(value) > 16:
+        raise ValueError("Expected 1-16 rectangles")
+    cleaned: list[dict[str, float]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("Rectangle must be an object")
+        rectangle = {name: round(float(item[name]), 3) for name in ("x1", "y1", "x2", "y2")}
+        if not all(math.isfinite(number) and abs(number) <= 100_000 for number in rectangle.values()):
+            raise ValueError("Rectangle coordinate is out of range")
+        if rectangle["x2"] <= rectangle["x1"] or rectangle["y2"] <= rectangle["y1"]:
+            raise ValueError("Rectangle is empty")
+        cleaned.append(rectangle)
+    return cleaned
+
+
+def highlight_json(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "target": row["target"],
+        "sentence": row["sentence"],
+        "page": row["page"],
+        "rects": json.loads(row["rects_json"]),
+        "translations": json.loads(row["translations_json"]),
+        "replacement": row["replacement"],
+        "alternatives": json.loads(row["alternatives_json"]),
+        "status": row["status"],
+        "error": row["error"],
+    }
+
+
+def add_pdf_highlights(source: Path, rows: list[sqlite3.Row]) -> bytes:
+    reader = PdfReader(source)
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+    for row in rows:
+        page_index = int(row["page"]) - 1
+        if page_index < 0 or page_index >= len(writer.pages):
+            continue
+        try:
+            rectangles = clean_highlight_rects(json.loads(row["rects_json"]))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        quad_points = ArrayObject()
+        for rectangle in rectangles:
+            quad_points.extend(
+                FloatObject(value)
+                for value in (
+                    rectangle["x1"],
+                    rectangle["y2"],
+                    rectangle["x2"],
+                    rectangle["y2"],
+                    rectangle["x1"],
+                    rectangle["y1"],
+                    rectangle["x2"],
+                    rectangle["y1"],
+                )
+            )
+        bounds = (
+            min(rectangle["x1"] for rectangle in rectangles),
+            min(rectangle["y1"] for rectangle in rectangles),
+            max(rectangle["x2"] for rectangle in rectangles),
+            max(rectangle["y2"] for rectangle in rectangles),
+        )
+        annotation = Highlight(
+            rect=bounds,
+            quad_points=quad_points,
+            highlight_color="ffe066",
+            printing=True,
+        )
+        translations = json.loads(row["translations_json"])
+        note = row["target"]
+        if translations:
+            note = f"{note}: {', '.join(translations)}"
+        annotation[NameObject("/Contents")] = TextStringObject(note)
+        writer.add_annotation(page_number=page_index, annotation=annotation)
+    stream = io.BytesIO()
+    writer.write(stream)
+    content = stream.getvalue()
+    PdfReader(io.BytesIO(content))
+    return content
+
+
+def make_target_context(
+    target: str,
+    sentence: str,
+    *,
+    context_id: str | None = None,
+    page: int = 1,
+) -> TargetContext:
     match = re.search(re.escape(target), sentence, flags=re.IGNORECASE)
     if match:
         before = html.escape(sentence[: match.start()])
@@ -534,12 +743,12 @@ def make_target_context(target: str, sentence: str) -> TargetContext:
         sentence_html = html.escape(sentence)
         recall_html = sentence_html
     return TargetContext(
-        id=str(uuid.uuid4()),
+        id=context_id or str(uuid.uuid4()),
         target=target,
         sentence=sentence,
         sentence_html=sentence_html,
         recall_template_html=recall_html,
-        source_page=1,
+        source_page=page,
         highlight_coverage=1,
     )
 

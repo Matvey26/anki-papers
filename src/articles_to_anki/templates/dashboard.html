@@ -25,11 +25,14 @@
             <span class="article-title"><strong>{{ document['name'] }}</strong><small>{{ document['page_count'] }} стр. · {{ (document['size'] / 1024 / 1024)|round(1) }} МБ{% if document['read_at'] %} · Прочитано{% endif %}</small></span>
             <span>Открыть</span>
           </a>
-          <form action="{{ url_for('mark_article_read', document_id=document['id']) }}" method="post">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <input type="hidden" name="read" value="{{ '0' if document['read_at'] else '1' }}">
-            <button class="read-button">{{ 'Вернуть' if document['read_at'] else 'Отметить' }}</button>
-          </form>
+          <div class="article-actions">
+            <a class="read-button download-button" href="{{ url_for('highlighted_pdf', document_id=document['id']) }}">Скачать PDF · {{ document['highlight_count'] }}</a>
+            <form action="{{ url_for('mark_article_read', document_id=document['id']) }}" method="post">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="read" value="{{ '0' if document['read_at'] else '1' }}">
+              <button class="read-button">{{ 'Вернуть' if document['read_at'] else 'Отметить' }}</button>
+            </form>
+          </div>
         </div>
       {% endfor %}
     </div>
