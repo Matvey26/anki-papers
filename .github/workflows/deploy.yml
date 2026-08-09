@@ -38,7 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Install SSH tools
-        run: sudo apt-get update && sudo apt-get install -y sshpass rsync
+        run: sudo apt-get update && sudo apt-get install -y sshpass
       - name: Copy application
         run: |
           set -euo pipefail
@@ -50,28 +50,18 @@ jobs:
           chmod 700 "$HOME/.ssh"
           ssh-keyscan -H "$SERVER_IP" >> "$HOME/.ssh/known_hosts"
           sshpass -e ssh "$SERVER_USER@$SERVER_IP" 'mkdir -p "$HOME/anki-papers"'
-          sshpass -e rsync -az \
-            --exclude '.git/' \
-            --exclude '.env' \
-            --exclude '.venv/' \
-            --exclude 'data/' \
-            --exclude 'output/' \
-            --exclude 'tmp/' \
-            --exclude 'app.log' \
-            --exclude 'app.pid' \
-            ./ "$SERVER_USER@$SERVER_IP:anki-papers/"
+          git archive --format=tar.gz HEAD | \
+            sshpass -e ssh "$SERVER_USER@$SERVER_IP" 'tar -xzf - -C "$HOME/anki-papers"'
       - name: Copy runtime configuration
         run: |
           set -euo pipefail
           export SSHPASS="$SERVER_PASSWORD"
-          umask 077
           {
             printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY"
             printf 'OPENROUTER_MODEL=%s\n' "$OPENROUTER_MODEL"
             printf 'APP_SECRET=%s\n' "$APP_SECRET"
-          } > .deploy.env
-          sshpass -e rsync -az .deploy.env "$SERVER_USER@$SERVER_IP:anki-papers/.env"
-          rm -f .deploy.env
+          } | sshpass -e ssh "$SERVER_USER@$SERVER_IP" \
+            'umask 077; cat > "$HOME/anki-papers/.env"'
       - name: Install and restart Python process
         run: |
           set -euo pipefail
