@@ -140,6 +140,13 @@ def test_register_upload_add_and_export_only_new_cards(
     assert "Новых карточек для CSV нет" in no_new.text
     with sqlite3.connect(tmp_path / "app.sqlite3") as database:
         assert database.execute("SELECT csv_exported_at FROM cards").fetchone()[0]
+        card_id = database.execute("SELECT id FROM cards").fetchone()[0]
+    deleted = client.post(
+        f"/cards/{card_id}/delete",
+        data={"csrf_token": csrf(client.get("/dashboard"))},
+        follow_redirects=True,
+    )
+    assert "Карточка удалена" not in deleted.text
 
 
 def test_users_cannot_open_each_others_documents(tmp_path: Path) -> None:
@@ -163,6 +170,10 @@ def test_users_cannot_open_each_others_documents(tmp_path: Path) -> None:
     assert second.post(
         f"/article/{document_id}/read",
         data={"csrf_token": csrf(second_dashboard), "read": "1"},
+    ).status_code == 404
+    assert second.post(
+        f"/article/{document_id}/delete",
+        data={"csrf_token": csrf(second_dashboard)},
     ).status_code == 404
 
 
@@ -219,7 +230,11 @@ def test_highlight_is_enriched_saved_and_downloaded_in_pdf(
         assert database.execute("SELECT COUNT(*) FROM highlights").fetchone()[0] == 1
 
     dashboard = client.get("/dashboard")
-    assert "Скачать PDF · 1" in dashboard.text
+    assert "1 слово" in dashboard.text
+    assert 'aria-label="Скачать PDF с хайлайтами"' in dashboard.text
+    assert ">Открыть<" not in dashboard.text
+    assert ">Отметить<" not in dashboard.text
+    assert ">Прочитано<" in dashboard.text
     download = client.get(f"/article/{document_id}/highlighted.pdf")
     assert download.status_code == 200
     assert download.headers["Content-Disposition"].startswith("attachment;")
@@ -428,3 +443,91 @@ def test_clean_pdf_removes_only_native_highlight_annotations(tmp_path: Path) -> 
         for reference in PdfReader(destination).pages[0]["/Annots"]
     ]
     assert annotations == ["/Text"]
+
+
+def test_article_delete_removes_database_rows_and_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    install_fake_enrichment(monkeypatch)
+    app = make_app(tmp_path)
+    client = app.test_client()
+    dashboard = identify(client)
+    client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(dashboard), "file": (pdf_bytes(), "delete-me.pdf")},
+        content_type="multipart/form-data",
+    )
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        document_id, stored_path, source_path = database.execute(
+            "SELECT id, stored_path, source_path FROM documents"
+        ).fetchone()
+    reader = client.get(f"/article/{document_id}")
+    client.post(
+        f"/api/article/{document_id}/highlights",
+        json={
+            "id": str(uuid.uuid4()),
+            "target": "robust",
+            "sentence": "This is a robust result.",
+            "page": 1,
+            "rects": [{"x1": 80, "y1": 190, "x2": 120, "y2": 205}],
+        },
+        headers={"X-CSRF-Token": csrf(reader)},
+    )
+
+    dashboard = client.get("/dashboard")
+    assert 'id="delete-article-dialog"' in dashboard.text
+    assert 'class="round-icon-button danger delete-article-trigger"' in dashboard.text
+    assert "Удалить через 3" in dashboard.text
+    deleted = client.post(
+        f"/article/{document_id}/delete",
+        data={"csrf_token": csrf(dashboard)},
+        follow_redirects=True,
+    )
+    assert "delete-me.pdf" not in deleted.text
+    assert not Path(stored_path).exists()
+    assert not Path(source_path).exists()
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        assert database.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+        assert database.execute("SELECT COUNT(*) FROM highlights").fetchone()[0] == 0
+        assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 0
+
+
+def test_recent_cards_are_collapsed_after_five(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+    dashboard = identify(client)
+    client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(dashboard), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+    )
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        user_id = database.execute("SELECT id FROM users").fetchone()[0]
+        document_id = database.execute("SELECT id FROM documents").fetchone()[0]
+        database.executemany(
+            """INSERT INTO cards
+               (id, user_id, document_id, target, target_normalized, sentence, page,
+                translations_json, replacement, alternatives_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 1, '[\"слово\", \"вариант\"]',
+                       'слово', '[\"plain\", \"simple\"]', ?)""",
+            [
+                (
+                    str(uuid.uuid4()),
+                    user_id,
+                    document_id,
+                    f"word-{index}",
+                    f"word-{index}",
+                    f"Sentence {index}.",
+                    f"2026-08-09T00:00:0{index}+00:00",
+                )
+                for index in range(6)
+            ],
+        )
+        database.commit()
+
+    response = client.get("/dashboard")
+    assert "Недавние сохранённые карточки" in response.text
+    assert response.text.count('class="saved-card"') == 6
+    assert 'class="card-list is-collapsed"' in response.text
+    assert "Показать все · 6" in response.text
+    assert ">новое<" not in response.text

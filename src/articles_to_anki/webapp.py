@@ -68,10 +68,16 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     )
     app.extensions["highlight_jobs"] = set()
     app.extensions["highlight_jobs_lock"] = threading.Lock()
+    app.extensions["deleted_document_paths"] = {}
     app.extensions["highlight_resume_done"] = False
 
     app.teardown_appcontext(close_database)
-    app.context_processor(lambda: {"csrf_token": csrf_token})
+    app.context_processor(
+        lambda: {
+            "csrf_token": csrf_token,
+            "word_count_label": word_count_label,
+        }
+    )
 
     @app.before_request
     def resume_interrupted_highlight_jobs() -> None:
@@ -225,6 +231,35 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         )
         get_database().commit()
         flash("Статья отмечена прочитанной." if read_at else "Статья снова в непрочитанных.", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/article/<document_id>/delete")
+    @login_required
+    def delete_article(document_id: str) -> Response:
+        require_csrf()
+        document = owned_document(document_id, "pdf")
+        highlight_ids = [
+            row["id"]
+            for row in get_database().execute(
+                "SELECT id FROM highlights WHERE document_id = ? AND user_id = ?",
+                (document_id, session["user_id"]),
+            ).fetchall()
+        ]
+        paths = [document["stored_path"], document["source_path"], document["text_path"]]
+        paths.extend(
+            str(Path(app.config["DATA_DIR"]) / "highlight_cache" / f"{highlight_id}.json")
+            for highlight_id in highlight_ids
+        )
+        get_database().execute(
+            "DELETE FROM documents WHERE id = ? AND user_id = ?",
+            (document_id, session["user_id"]),
+        )
+        get_database().commit()
+
+        with app.extensions["highlight_jobs_lock"]:
+            if document_id in app.extensions["highlight_jobs"]:
+                app.extensions["deleted_document_paths"][document_id] = paths
+        remove_managed_files(Path(app.config["DATA_DIR"]), paths)
         return redirect(url_for("dashboard"))
 
     @app.post("/article/<document_id>/process-highlights")
@@ -392,7 +427,6 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             (card_id, session["user_id"]),
         )
         get_database().commit()
-        flash("Карточка удалена.", "success")
         return redirect(url_for("dashboard"))
 
     @app.post("/export/csv")
@@ -681,6 +715,20 @@ def normalize_target(value: str) -> str:
     return " ".join(value.casefold().strip().split())
 
 
+def word_count_label(value: int) -> str:
+    value = int(value)
+    remainder = value % 100
+    if 11 <= remainder <= 14:
+        noun = "слов"
+    elif value % 10 == 1:
+        noun = "слово"
+    elif 2 <= value % 10 <= 4:
+        noun = "слова"
+    else:
+        noun = "слов"
+    return f"{value} {noun}"
+
+
 def is_single_word(value: str) -> bool:
     return bool(WORD_RE.fullmatch(value)) and len(value) <= 100
 
@@ -849,6 +897,12 @@ def enqueue_document_processing(app: Flask, document_id: str, user_id: int) -> N
         finally:
             with lock:
                 jobs.discard(document_id)
+                deleted_paths = app.extensions["deleted_document_paths"].pop(
+                    document_id,
+                    None,
+                )
+            if deleted_paths:
+                remove_managed_files(Path(app.config["DATA_DIR"]), deleted_paths)
 
     if app.config["PROCESS_DOCUMENTS_INLINE"]:
         run()
@@ -997,6 +1051,24 @@ def mark_highlight_failed(
         (message, now(), highlight_id, user_id),
     )
     database.commit()
+
+
+def remove_managed_files(data_dir: Path, paths: list[str | None]) -> None:
+    root = data_dir.resolve()
+    for raw_path in paths:
+        if not raw_path:
+            continue
+        path = Path(raw_path).resolve()
+        if path == root or root not in path.parents:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            continue
+        try:
+            path.parent.rmdir()
+        except OSError:
+            pass
 
 
 def add_pdf_highlights(source: Path, rows: list[sqlite3.Row]) -> bytes:

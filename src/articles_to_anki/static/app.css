@@ -41,19 +41,24 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .summary strong { font-size: 23px; }
 .summary span { color: var(--muted); font-size: 12px; }
 .article-list, .card-list { border: 1px solid var(--border); border-radius: 9px; overflow: hidden; background: var(--surface); }
-.article-row { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); color: var(--text); }
+.article-row { position: relative; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); color: var(--text); }
 .article-row:last-child { border-bottom: 0; }
 .article-row.is-read { background: #f8f8f6; }
-.article-open { min-width: 0; padding: 15px 8px 15px 17px; display: flex; flex: 1; align-items: center; justify-content: space-between; gap: 16px; color: var(--text); }
+.article-open { min-width: 0; padding: 15px 8px 15px 17px; display: flex; flex: 1; align-items: center; color: var(--text); }
+.article-open::after { content: ""; position: absolute; inset: 0; }
 .article-title { min-width: 0; display: grid; gap: 3px; }
 .article-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.article-title small, .article-open > span { color: var(--muted); font-size: 12px; }
+.article-title small { color: var(--muted); font-size: 12px; }
 .article-row.is-read .article-title strong { color: var(--muted); }
-.article-actions { padding-right: 14px; display: flex; align-items: center; gap: 7px; }
+.article-actions { position: relative; z-index: 1; display: flex; align-items: center; gap: 7px; }
 .article-actions form { margin: 0; }
 .article-title .article-error { overflow: hidden; max-width: 480px; color: var(--danger); text-overflow: ellipsis; white-space: nowrap; }
 .read-button { min-height: 34px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: white; color: var(--text); font-size: 12px; }
-.download-button { display: inline-flex; align-items: center; white-space: nowrap; }
+.article-icon-actions { position: relative; z-index: 1; padding-right: 13px; display: flex; gap: 7px; }
+.round-icon-button { width: 36px; height: 36px; padding: 0; display: inline-grid; flex: 0 0 36px; place-items: center; border: 1px solid var(--border); border-radius: 50%; background: white; color: var(--text); }
+.round-icon-button:hover { border-color: #bfc1ba; background: #f5f5f2; }
+.round-icon-button.danger { color: var(--danger); }
+.round-icon-button svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 .empty { padding: 28px; border: 1px dashed #c8cac3; border-radius: 9px; color: var(--muted); text-align: center; }
 .exports { margin-top: 40px; }
 .export-box { min-height: 68px; margin-bottom: 10px; padding: 13px 15px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
@@ -63,11 +68,23 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .apkg-form select { max-width: 220px; padding: 8px; border: 1px solid var(--border); border-radius: 7px; background: white; }
 .small-upload { margin-top: 8px; color: var(--muted); font-size: 12px; }
 .small-upload input { margin-left: 8px; }
-.saved-card { padding: 14px 16px; display: grid; grid-template-columns: 160px 1fr auto auto; align-items: center; gap: 14px; border-bottom: 1px solid var(--border); }
+.saved-card { padding: 14px 16px; display: grid; grid-template-columns: 160px 1fr auto; align-items: center; gap: 14px; border-bottom: 1px solid var(--border); }
 .saved-card:last-child { border-bottom: 0; }
 .saved-card > div { display: grid; gap: 2px; }
-.saved-card > div span, .status { color: var(--muted); font-size: 11px; }
+.saved-card > div span { color: var(--muted); font-size: 11px; }
 .saved-card p { margin: 0; color: #555850; font-size: 13px; }
+.card-list.is-collapsed .saved-card:nth-child(n+6) { display: none; }
+.cards-toggle { margin: 10px auto 0; padding: 5px 10px; display: block; border: 0; background: none; color: var(--accent); font-size: 13px; }
+
+.confirm-dialog { width: min(430px, calc(100% - 28px)); padding: 0; border: 1px solid var(--border); border-radius: 11px; background: var(--surface); color: var(--text); box-shadow: 0 18px 70px rgba(0,0,0,.28); }
+.confirm-dialog::backdrop { background: rgba(20,20,20,.48); backdrop-filter: blur(2px); }
+.confirm-dialog-content { padding: 22px; }
+.confirm-dialog h2 { margin: 0 0 12px; font-size: 21px; }
+.confirm-dialog p { margin: 7px 0; color: var(--muted); }
+.confirm-dialog p strong { display: block; overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
+.confirm-dialog-actions { margin-top: 22px; display: flex; justify-content: flex-end; gap: 9px; }
+.confirm-dialog-actions form { margin: 0; }
+.danger-button { background: var(--danger); }
 
 .auth-page { min-height: calc(100vh - 72px); display: grid; place-items: center; }
 .auth-card { width: min(380px, 100%); padding: 28px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
@@ -123,13 +140,11 @@ button:disabled { cursor: not-allowed; opacity: .5; }
   .apkg-form select { max-width: none; }
   .saved-card { grid-template-columns: 1fr auto; }
   .saved-card p { grid-column: 1 / -1; }
-  .status { grid-column: 1; }
-  .article-row { align-items: stretch; }
-  .article-open { padding-left: 12px; }
-  .article-open > span:last-child { display: none; }
-  .article-actions { padding: 7px 8px 7px 0; flex-direction: column; justify-content: center; gap: 4px; }
+  .article-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: stretch; gap: 0; }
+  .article-open { grid-column: 1; grid-row: 1; padding: 12px 8px 7px 12px; }
+  .article-actions { grid-column: 1; grid-row: 2; padding: 0 0 10px 12px; gap: 5px; }
   .read-button { width: 118px; }
-  .download-button { width: auto; justify-content: center; }
+  .article-icon-actions { grid-column: 2; grid-row: 1 / 3; padding: 8px; flex-direction: column; justify-content: center; }
   .reader-page { width: 100%; margin: 0; }
   .pdf-viewer { padding: 8px 0; gap: 10px; }
   .viewer-back { top: 7px; left: 7px; }
