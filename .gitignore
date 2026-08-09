@@ -9,3 +9,7 @@ dist/
 *.egg-info/
 output/
 tmp/
+data/
+app.pid
+app.log
+.deploy.env

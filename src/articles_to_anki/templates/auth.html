@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}{{ "Регистрация" if register else "Вход" }} — Anki Papers{% endblock %}
+{% block page_class %}auth-page{% endblock %}
+{% block content %}
+<section class="auth-card">
+  <h1>Anki Papers</h1>
+  <p>{{ "Создайте профиль по логину и паролю." if register else "Войдите в свой профиль." }}</p>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Логин<input name="username" autocomplete="username" minlength="3" maxlength="32" required autofocus></label>
+    <label>Пароль<input name="password" type="password" autocomplete="{{ 'new-password' if register else 'current-password' }}" minlength="6" required></label>
+    <button class="primary full">{{ "Зарегистрироваться" if register else "Войти" }}</button>
+  </form>
+  {% if register %}
+    <a href="{{ url_for('login') }}">Уже есть профиль</a>
+  {% else %}
+    <a href="{{ url_for('register') }}">Создать профиль</a>
+  {% endif %}
+</section>
+{% endblock %}

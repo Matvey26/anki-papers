@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}{{ document['name'] }} — Anki Papers{% endblock %}
+{% block page_class %}reader-page{% endblock %}
+{% block content %}
+<header class="reader-heading">
+  <a href="{{ url_for('dashboard') }}">← Библиотека</a>
+  <div><h1>{{ document['name'] }}</h1><p>Нажмите на слово в текстовом режиме.</p></div>
+</header>
+
+<div class="reader-toolbar">
+  <nav class="tabs">
+    <a class="{{ 'active' if mode == 'text' else '' }}" href="{{ url_for('article', document_id=document['id'], page=page_number, mode='text') }}">Текст</a>
+    <a class="{{ 'active' if mode == 'pdf' else '' }}" href="{{ url_for('article', document_id=document['id'], page=page_number, mode='pdf') }}">Оригинал PDF</a>
+  </nav>
+  <nav class="pagination">
+    {% if page_number > 1 %}<a href="{{ url_for('article', document_id=document['id'], page=page_number-1, mode=mode) }}">←</a>{% endif %}
+    <span>{{ page_number }} / {{ page_count }}</span>
+    {% if page_number < page_count %}<a href="{{ url_for('article', document_id=document['id'], page=page_number+1, mode=mode) }}">→</a>{% endif %}
+  </nav>
+</div>
+
+{% if mode == 'pdf' %}
+  <iframe class="pdf-frame" title="{{ document['name'] }}" src="{{ url_for('pdf_file', document_id=document['id']) }}#page={{ page_number }}"></iframe>
+  <p class="pdf-fallback"><a href="{{ url_for('pdf_file', document_id=document['id']) }}" target="_blank">Открыть PDF отдельно</a></p>
+{% else %}
+  <article class="text-reader">
+    {% if sentences %}
+      {% for sentence in sentences %}
+        <p>{% for part in sentence %}{% if part.word %}<button type="button" class="word {{ 'saved' if part.saved else '' }}" data-word="{{ part.text }}" data-sentence="{{ part.sentence }}">{{ part.text }}</button>{% else %}{{ part.text }}{% endif %}{% endfor %}</p>
+      {% endfor %}
+    {% else %}
+      <div class="empty">На этой странице не удалось извлечь текст. Используйте оригинал PDF.</div>
+    {% endif %}
+  </article>
+{% endif %}
+
+<dialog id="card-dialog">
+  <form action="{{ url_for('add_card') }}" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="document_id" value="{{ document['id'] }}">
+    <input type="hidden" name="page" value="{{ page_number }}">
+    <input id="target" type="hidden" name="target">
+    <input id="sentence" type="hidden" name="sentence">
+    <button class="dialog-close" type="button" data-close aria-label="Закрыть">×</button>
+    <h2 id="dialog-word"></h2>
+    <p id="dialog-sentence" class="context"></p>
+    <button id="enrich" class="secondary full" type="button">Заполнить автоматически</button>
+    <label>Переводы<input id="translations" name="translations" required placeholder="мешать, препятствовать"></label>
+    <label>Замена в предложении<input id="replacement" name="replacement" placeholder="препятствует"></label>
+    <label>Английские синонимы<input id="alternatives" name="alternatives" placeholder="hinder, block"></label>
+    <div id="enrich-error" class="field-error"></div>
+    <button class="primary full">Добавить две карточки</button>
+  </form>
+</dialog>
+{% endblock %}
+{% block scripts %}
+<script>window.ANKI_PAPERS_CSRF = {{ csrf_token()|tojson }};</script>
+<script src="{{ url_for('static', filename='reader.js') }}"></script>
+{% endblock %}

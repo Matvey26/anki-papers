@@ -9,12 +9,15 @@ description = "Extract hand-highlighted vocabulary from PDFs and create Anki car
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "Flask>=3.1,<4",
   "numpy>=1.26,<3",
   "pdfplumber>=0.11,<1",
   "Pillow>=10,<13",
   "pydantic>=2.7,<3",
   "pypdf>=5,<7",
   "pypdfium2>=4.30,<5",
+  "waitress>=3,<4",
+  "zstandard>=0.23,<1",
 ]
 
 [project.optional-dependencies]
@@ -24,9 +27,13 @@ dev = [
 
 [project.scripts]
 articles-to-anki = "articles_to_anki.cli:main"
+anki-papers-web = "articles_to_anki.webapp:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+articles_to_anki = ["templates/*.html", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

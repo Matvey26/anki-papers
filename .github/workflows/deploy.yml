@@ -1,0 +1,111 @@
+name: Test and deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e '.[dev]'
+      - run: pytest -q
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: test
+    environment: production
+    env:
+      SERVER_IP: ${{ secrets.SERVER_IP }}
+      SERVER_USER: ${{ secrets.SERVER_USER }}
+      SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+      APP_SECRET: ${{ secrets.APP_SECRET }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install SSH tools
+        run: sudo apt-get update && sudo apt-get install -y sshpass rsync
+      - name: Copy application
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_IP"
+          test -n "$SERVER_USER"
+          test -n "$SERVER_PASSWORD"
+          export SSHPASS="$SERVER_PASSWORD"
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          ssh-keyscan -H "$SERVER_IP" >> "$HOME/.ssh/known_hosts"
+          sshpass -e ssh "$SERVER_USER@$SERVER_IP" 'mkdir -p "$HOME/anki-papers"'
+          sshpass -e rsync -az \
+            --exclude '.git/' \
+            --exclude '.env' \
+            --exclude '.venv/' \
+            --exclude 'data/' \
+            --exclude 'output/' \
+            --exclude 'tmp/' \
+            --exclude 'app.log' \
+            --exclude 'app.pid' \
+            ./ "$SERVER_USER@$SERVER_IP:anki-papers/"
+      - name: Copy runtime configuration
+        run: |
+          set -euo pipefail
+          export SSHPASS="$SERVER_PASSWORD"
+          umask 077
+          {
+            printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY"
+            printf 'OPENROUTER_MODEL=%s\n' "$OPENROUTER_MODEL"
+            printf 'APP_SECRET=%s\n' "$APP_SECRET"
+          } > .deploy.env
+          sshpass -e rsync -az .deploy.env "$SERVER_USER@$SERVER_IP:anki-papers/.env"
+          rm -f .deploy.env
+      - name: Install and restart Python process
+        run: |
+          set -euo pipefail
+          export SSHPASS="$SERVER_PASSWORD"
+          sshpass -e ssh "$SERVER_USER@$SERVER_IP" 'bash -se' <<'REMOTE'
+          cd "$HOME/anki-papers"
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install .
+          .venv/bin/python -c 'from articles_to_anki.webapp import create_app; create_app()'
+
+          if test -f app.pid; then
+            old_pid="$(cat app.pid)"
+            if kill -0 "$old_pid" 2>/dev/null && \
+               ps -p "$old_pid" -o command= | grep -q 'articles_to_anki.webapp'; then
+              kill "$old_pid"
+              for _ in 1 2 3 4 5; do
+                kill -0 "$old_pid" 2>/dev/null || break
+                sleep 1
+              done
+            fi
+          fi
+
+          nohup .venv/bin/python -m articles_to_anki.webapp \
+            --host 0.0.0.0 --port 8000 > app.log 2>&1 < /dev/null &
+          new_pid=$!
+          printf '%s\n' "$new_pid" > app.pid
+          sleep 3
+          kill -0 "$new_pid"
+          .venv/bin/python - <<'PY'
+          from urllib.request import urlopen
+
+          with urlopen("http://127.0.0.1:8000/health", timeout=5) as response:
+              if response.status != 200:
+                  raise SystemExit(f"health check failed: {response.status}")
+          PY
+          REMOTE

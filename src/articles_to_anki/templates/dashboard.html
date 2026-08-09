@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Библиотека — Anki Papers{% endblock %}
+{% block content %}
+<header class="page-heading">
+  <div><h1>Библиотека</h1><p>Загрузите PDF, читайте и нажимайте на незнакомые слова.</p></div>
+  <form class="upload-inline" action="{{ url_for('upload_pdf') }}" method="post" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label class="file-button">Добавить PDF<input name="file" type="file" accept=".pdf,application/pdf" required onchange="this.form.submit()"></label>
+  </form>
+</header>
+
+<section class="summary">
+  <div><strong>{{ documents|length }}</strong><span>статей</span></div>
+  <div><strong>{{ cards|length }}</strong><span>слов</span></div>
+  <div><strong>{{ new_csv }}</strong><span>новых карточек</span></div>
+</section>
+
+<section>
+  <h2>Статьи</h2>
+  {% if documents %}
+    <div class="article-list">
+      {% for document in documents %}
+        <a class="article-row" href="{{ url_for('article', document_id=document['id']) }}">
+          <div><strong>{{ document['name'] }}</strong><span>{{ document['page_count'] }} стр. · {{ (document['size'] / 1024 / 1024)|round(1) }} МБ</span></div>
+          <span>Открыть</span>
+        </a>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="empty">Пока нет статей.</div>
+  {% endif %}
+</section>
+
+<section class="exports">
+  <h2>Выгрузка</h2>
+  <div class="export-box">
+    <div><strong>CSV</strong><span>{{ new_csv }} новых карточек</span></div>
+    <form action="{{ url_for('export_csv') }}" method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="primary" {% if not new_csv %}disabled{% endif %}>Скачать новые</button>
+    </form>
+  </div>
+  <div class="export-box">
+    <div><strong>APKG</strong><span>{{ new_apkg }} новых карточек; старое расписание сохраняется</span></div>
+    {% if decks %}
+      <form class="apkg-form" action="{{ url_for('export_apkg') }}" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <select name="deck_id" aria-label="Исходная колода">
+          {% for deck in decks %}<option value="{{ deck['id'] }}">{{ deck['name'] }}</option>{% endfor %}
+        </select>
+        <button class="primary" {% if not new_apkg %}disabled{% endif %}>Скачать обновлённую</button>
+      </form>
+    {% else %}
+      <form action="{{ url_for('upload_apkg') }}" method="post" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label class="file-button secondary">Добавить APKG<input name="file" type="file" accept=".apkg" required onchange="this.form.submit()"></label>
+      </form>
+    {% endif %}
+  </div>
+  {% if decks %}
+    <form class="small-upload" action="{{ url_for('upload_apkg') }}" method="post" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>Заменить или добавить исходную колоду <input name="file" type="file" accept=".apkg" required><button>Загрузить</button></label>
+    </form>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Сохранённые слова</h2>
+  {% if cards %}
+    <div class="card-list">
+      {% for card in cards %}
+        <article class="saved-card">
+          <div><strong>{{ card['target'] }}</strong><span>{{ card['document_name'] }} · стр. {{ card['page'] }}</span></div>
+          <p>{{ card['sentence'] }}</p>
+          <span class="status">{{ "выгружено" if card['csv_exported_at'] else "новое" }}</span>
+          <form action="{{ url_for('delete_card', card_id=card['id']) }}" method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="link-button danger">Удалить</button>
+          </form>
+        </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="empty">Нажмите на слово в текстовом режиме чтения.</div>
+  {% endif %}
+</section>
+{% endblock %}
