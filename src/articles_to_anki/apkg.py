@@ -75,7 +75,12 @@ def merge(source: Path, destination: Path, csv_paths: list[Path], combined_csv: 
         is_compressed = collection_name.endswith("21b")
         if is_compressed:
             database = temporary / "collection.sqlite"
-            database.write_bytes(zstandard.ZstdDecompressor().decompress(collection_path.read_bytes()))
+            with collection_path.open("rb") as source_stream, database.open(
+                "wb"
+            ) as database_stream:
+                zstandard.ZstdDecompressor().copy_stream(
+                    source_stream, database_stream
+                )
         else:
             database = collection_path
 
@@ -146,7 +151,12 @@ def merge(source: Path, destination: Path, csv_paths: list[Path], combined_csv: 
             connection.close()
 
         if is_compressed:
-            collection_path.write_bytes(zstandard.ZstdCompressor(level=10).compress(database.read_bytes()))
+            with database.open("rb") as database_stream, collection_path.open(
+                "wb"
+            ) as collection_stream:
+                zstandard.ZstdCompressor(level=10).copy_stream(
+                    database_stream, collection_stream
+                )
             database.unlink()
         with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_STORED) as archive:
             for path in sorted(temporary.iterdir()):

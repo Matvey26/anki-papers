@@ -480,13 +480,28 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             return redirect(url_for("dashboard"))
         from .apkg import merge
 
-        with tempfile.TemporaryDirectory(prefix="anki-papers-export-") as temporary_name:
-            temporary = Path(temporary_name)
-            csv_path = temporary / "new.csv"
-            csv_path.write_bytes(cards_to_csv(cards))
-            destination = temporary / "updated.apkg"
-            merge(Path(deck["stored_path"]), destination, [csv_path], temporary / "combined.csv")
-            content = destination.read_bytes()
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="anki-papers-export-"
+            ) as temporary_name:
+                temporary = Path(temporary_name)
+                csv_path = temporary / "new.csv"
+                csv_path.write_bytes(cards_to_csv(cards))
+                destination = temporary / "updated.apkg"
+                merge(
+                    Path(deck["stored_path"]),
+                    destination,
+                    [csv_path],
+                    temporary / "combined.csv",
+                )
+                content = destination.read_bytes()
+        except Exception:
+            app.logger.exception("APKG export failed")
+            flash(
+                "Не удалось обновить эту колоду. Загрузите APKG, экспортированный Anki.",
+                "error",
+            )
+            return redirect(url_for("dashboard"))
         mark_exported(cards, "apkg_exported_at")
         stem = Path(deck["name"]).stem
         return Response(

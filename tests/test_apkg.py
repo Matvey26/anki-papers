@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import sqlite3
 import zipfile
@@ -47,9 +48,17 @@ def collection_bytes(path: Path) -> bytes:
     return content
 
 
-def write_apkg(path: Path, collection_name: str, content: bytes) -> None:
+def write_apkg(
+    path: Path,
+    collection_name: str,
+    content: bytes,
+    *,
+    write_content_size: bool = True,
+) -> None:
     if collection_name.endswith("21b"):
-        content = zstandard.ZstdCompressor().compress(content)
+        content = zstandard.ZstdCompressor(
+            write_content_size=write_content_size
+        ).compress(content)
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr(collection_name, content)
         archive.writestr("media", "{}")
@@ -59,7 +68,8 @@ def read_collection(path: Path, collection_name: str, tmp_path: Path) -> sqlite3
     with zipfile.ZipFile(path) as archive:
         content = archive.read(collection_name)
     if collection_name.endswith("21b"):
-        content = zstandard.ZstdDecompressor().decompress(content)
+        with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(content)) as stream:
+            content = stream.read()
     database_path = tmp_path / f"read-{collection_name}.sqlite"
     database_path.write_bytes(content)
     return sqlite3.connect(database_path)
@@ -84,4 +94,27 @@ def test_merge_preserves_schedule_and_skips_duplicate_fronts(tmp_path: Path, col
     assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 2
     assert database.execute("SELECT due FROM cards WHERE id = 1").fetchone()[0] == 42
     assert database.execute("SELECT type, queue FROM cards WHERE id != 1").fetchone() == (0, 0)
+    database.close()
+
+
+def test_merge_supports_zstd_without_content_size(tmp_path: Path) -> None:
+    source = tmp_path / "source.apkg"
+    write_apkg(
+        source,
+        "collection.anki21b",
+        collection_bytes(tmp_path / "source.sqlite"),
+        write_content_size=False,
+    )
+    cards = tmp_path / "new.csv"
+    with cards.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["Front", "Back", "Tags"])
+        writer.writeheader()
+        writer.writerow({"Front": "New front", "Back": "new back", "Tags": "new"})
+
+    destination = tmp_path / "destination.apkg"
+    merge(source, destination, [cards], tmp_path / "combined.csv")
+
+    database = read_collection(destination, "collection.anki21b", tmp_path)
+    assert database.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 2
+    assert database.execute("SELECT due FROM cards WHERE id = 1").fetchone()[0] == 42
     database.close()
