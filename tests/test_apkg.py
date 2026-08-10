@@ -135,14 +135,14 @@ def test_merge_deduplicates_generated_cards_by_type_and_target(tmp_path: Path) -
             {
                 "Front": "A <b>robust</b> result.",
                 "Back": "• надёжный",
-                "Tags": "card::meaning",
+                "Tags": "article::paper card::meaning",
             }
         )
         writer.writerow(
             {
                 "Front": "A <b>надёжный</b> result.",
                 "Back": "<b>robust</b>",
-                "Tags": "card::recall",
+                "Tags": "article::paper card::recall",
             }
         )
     first = tmp_path / "first.apkg"
@@ -156,28 +156,28 @@ def test_merge_deduplicates_generated_cards_by_type_and_target(tmp_path: Path) -
             {
                 "Front": "A different <b>robust</b> example.",
                 "Back": "• устойчивый",
-                "Tags": "card::meaning",
+                "Tags": "article::paper card::meaning",
             }
         )
         writer.writerow(
             {
                 "Front": "A different <b>устойчивый</b> example.",
                 "Back": "<b>robust</b>",
-                "Tags": "card::recall",
+                "Tags": "article::paper card::recall",
             }
         )
         writer.writerow(
             {
                 "Front": "A <b>precise</b> result.",
                 "Back": "• точный",
-                "Tags": "card::meaning",
+                "Tags": "article::paper card::meaning",
             }
         )
         writer.writerow(
             {
                 "Front": "A <b>точный</b> result.",
                 "Back": "<b>precise</b>",
-                "Tags": "card::recall",
+                "Tags": "article::paper card::recall",
             }
         )
     destination = tmp_path / "destination.apkg"
@@ -190,3 +190,49 @@ def test_merge_deduplicates_generated_cards_by_type_and_target(tmp_path: Path) -
     assert sum("precise" in value for value in fields) == 2
     assert all("different" not in value.casefold() for value in fields)
     database.close()
+
+
+def test_merge_removes_existing_duplicates_and_keeps_latest_scheduled_card(
+    tmp_path: Path,
+) -> None:
+    raw_path = tmp_path / "duplicates.sqlite"
+    raw_path.write_bytes(collection_bytes(tmp_path / "base.sqlite"))
+    database = sqlite3.connect(raw_path)
+    for note_id, due, reps, translation in (
+        (2, 12, 2, "старый перевод"),
+        (3, 30, 1, "нужный перевод"),
+        (4, 200, 0, "новый дубль без расписания"),
+    ):
+        database.execute(
+            "INSERT INTO notes VALUES (?, ?, 100, 1, 0, ' article::paper card::meaning ', ?, ?, 1, 0, '')",
+            (
+                note_id,
+                f"guid-{note_id}",
+                f"A <b>robust</b> result.\x1f{translation}",
+                "A robust result.",
+            ),
+        )
+        database.execute(
+            "INSERT INTO cards VALUES (?, ?, 200, 0, 1, 0, ?, ?, ?, 5, 2500, ?, 0, 0, 0, 0, 0, '{}')",
+            (note_id, note_id, 2 if reps else 0, 2 if reps else 0, due, reps),
+        )
+    database.commit()
+    database.close()
+    source = tmp_path / "duplicates.apkg"
+    write_apkg(source, "collection.anki21b", raw_path.read_bytes())
+    empty_csv = tmp_path / "empty.csv"
+    with empty_csv.open("w", encoding="utf-8", newline="") as stream:
+        csv.DictWriter(stream, fieldnames=["Front", "Back", "Tags"]).writeheader()
+
+    destination = tmp_path / "clean.apkg"
+    merge(source, destination, [empty_csv], tmp_path / "combined.csv")
+
+    cleaned = read_collection(destination, "collection.anki21b", tmp_path)
+    matching = cleaned.execute(
+        """SELECT cards.id, cards.due, cards.reps, notes.flds
+           FROM cards JOIN notes ON notes.id = cards.nid
+           WHERE notes.tags LIKE '%card::meaning%'"""
+    ).fetchall()
+    assert matching == [(3, 30, 1, "A <b>robust</b> result.\x1fнужный перевод")]
+    assert cleaned.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 2
+    cleaned.close()

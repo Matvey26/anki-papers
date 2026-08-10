@@ -204,10 +204,16 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         require_csrf()
         upload = request.files.get("file")
         try:
-            save_document(upload, "apkg")
+            document_id = save_document(upload, "apkg")
         except (ValueError, OSError) as exc:
             flash(str(exc), "error")
         else:
+            try:
+                reconcile_apkg_exports(owned_document(document_id, "apkg"))
+            except Exception:
+                # The exporter will surface a useful error if this is not a real
+                # Anki package. Keeping the upload preserves the old behaviour.
+                app.logger.warning("Could not inspect uploaded APKG", exc_info=True)
             flash("Колода загружена.", "success")
         return redirect(url_for("dashboard"))
 
@@ -474,15 +480,21 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         require_csrf()
         deck_id = request.form.get("deck_id", "")
         deck = owned_document(deck_id, "apkg")
-        cards = pending_cards("apkg_exported_at")
+        pending = pending_cards("apkg_exported_at")
         stem = Path(deck["name"]).stem
-        if not cards:
+        if not pending:
             return send_file(
                 deck["stored_path"],
                 mimetype="application/octet-stream",
                 as_attachment=True,
                 download_name=f"{safe_download_name(stem)}-updated.apkg",
             )
+        cards = get_database().execute(
+            """SELECT cards.*, documents.name AS document_name
+               FROM cards JOIN documents ON documents.id = cards.document_id
+               WHERE cards.user_id = ? ORDER BY cards.created_at""",
+            (session["user_id"],),
+        ).fetchall()
         from .apkg import merge
 
         try:
@@ -606,6 +618,44 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         get_database().executemany(
             f"UPDATE cards SET {column} = ? WHERE id = ? AND user_id = ?",
             [(timestamp, card["id"], session["user_id"]) for card in cards],
+        )
+        get_database().commit()
+
+    def reconcile_apkg_exports(deck: sqlite3.Row) -> None:
+        """Make the uploaded APKG, rather than an old flag, the source of truth."""
+        from .apkg import managed_identities, merge
+
+        stored_path = Path(deck["stored_path"])
+        with tempfile.TemporaryDirectory(prefix="anki-papers-upload-") as temporary_name:
+            temporary = Path(temporary_name)
+            empty_csv = temporary / "empty.csv"
+            empty_csv.write_bytes(cards_to_csv([]))
+            normalized = temporary / "normalized.apkg"
+            merge(stored_path, normalized, [empty_csv], temporary / "combined.csv")
+            content = normalized.read_bytes()
+            replace_managed_file(stored_path, content)
+            get_database().execute(
+                "UPDATE documents SET size = ? WHERE id = ? AND user_id = ?",
+                (len(content), deck["id"], session["user_id"]),
+            )
+        identities = managed_identities(stored_path)
+        timestamp = now()
+        cards = get_database().execute(
+            "SELECT id, target_normalized, apkg_exported_at FROM cards WHERE user_id = ?",
+            (session["user_id"],),
+        ).fetchall()
+        updates = []
+        for card in cards:
+            target = normalize_target(card["target_normalized"])
+            complete = {
+                ("meaning", target),
+                ("recall", target),
+            }.issubset(identities)
+            exported_at = (card["apkg_exported_at"] or timestamp) if complete else None
+            updates.append((exported_at, card["id"], session["user_id"]))
+        get_database().executemany(
+            "UPDATE cards SET apkg_exported_at = ? WHERE id = ? AND user_id = ?",
+            updates,
         )
         get_database().commit()
 
