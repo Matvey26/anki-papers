@@ -52,7 +52,6 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .article-row.is-read .article-title strong { color: var(--muted); }
 .article-actions { position: relative; z-index: 1; display: flex; align-items: center; gap: 7px; }
 .article-actions form { margin: 0; }
-.article-title .article-error { overflow: hidden; max-width: 480px; color: var(--danger); text-overflow: ellipsis; white-space: nowrap; }
 .read-button { min-height: 34px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: white; color: var(--text); font-size: 12px; }
 .article-icon-actions { position: relative; z-index: 1; padding-right: 13px; display: flex; gap: 7px; }
 .round-icon-button { width: 36px; height: 36px; padding: 0; display: inline-grid; flex: 0 0 36px; place-items: center; border: 1px solid var(--border); border-radius: 50%; background: white; color: var(--text); }

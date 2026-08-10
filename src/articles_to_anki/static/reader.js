@@ -376,6 +376,13 @@ async function saveHighlight(highlight) {
     });
     const result = await response.json();
     if (deletedHighlightIds.has(highlight.id)) return;
+    if (result.discarded_highlight_id) {
+      deletedHighlightIds.add(highlight.id);
+      highlights.delete(highlight.id);
+      highlightSignatures.delete(highlightSignature(highlight));
+      if (openHighlightId === highlight.id) closePopover();
+      return;
+    }
     if (result.highlight) {
       if (result.highlight.id !== highlight.id) {
         highlights.delete(highlight.id);

@@ -254,7 +254,9 @@ def test_highlight_is_enriched_saved_and_downloaded_in_pdf(
     assert "robust: надёжный, устойчивый" == annotation["/Contents"]
 
 
-def test_highlight_stays_saved_when_translation_fails(tmp_path: Path, monkeypatch) -> None:
+def test_highlight_is_silently_discarded_when_translation_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
 
     def failed_enrich(*_args, **_kwargs):
@@ -284,11 +286,57 @@ def test_highlight_stays_saved_when_translation_fails(tmp_path: Path, monkeypatc
         },
         headers={"X-CSRF-Token": csrf(reader_page)},
     )
-    assert response.status_code == 502
-    assert response.json["highlight"]["status"] == "failed"
+    assert response.status_code == 200
+    assert response.json["discarded_highlight_id"]
     stored = client.get(f"/api/article/{document_id}/highlights").json["highlights"]
-    assert len(stored) == 1
-    assert stored[0]["target"] == "robust"
+    assert stored == []
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        assert database.execute("SELECT COUNT(*) FROM highlights").fetchone()[0] == 0
+        assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 0
+        assert database.execute("SELECT COUNT(*) FROM deleted_highlights").fetchone()[0] == 1
+
+
+def test_import_failure_is_silent_and_does_not_leave_dead_highlight(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    extracted = ExtractedHighlight(
+        context=make_target_context(
+            "robust",
+            "This is a robust result.",
+            context_id="source-highlight",
+            page=1,
+        ),
+        rects=[{"x1": 80, "y1": 190, "x2": 120, "y2": 205}],
+    )
+    monkeypatch.setattr(webapp_module, "extract_highlights", lambda _path: [extracted])
+    monkeypatch.setattr(
+        webapp_module,
+        "enrich_targets",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("provider unavailable")
+        ),
+    )
+    app = make_app(tmp_path, AUTO_PROCESS_UPLOADS=True)
+    client = app.test_client()
+    dashboard = identify(client)
+    response = client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(dashboard), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+
+    assert "Не удалось подготовить переводов" not in response.text
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        document = database.execute(
+            """SELECT highlight_status, highlight_error, imported_highlight_count
+               FROM documents"""
+        ).fetchone()
+        assert document == ("ready", None, 0)
+        assert database.execute("SELECT COUNT(*) FROM highlights").fetchone()[0] == 0
+        assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 0
+        assert database.execute("SELECT COUNT(*) FROM deleted_highlights").fetchone()[0] == 1
 
 
 def test_existing_username_logs_into_same_profile_without_password(tmp_path: Path) -> None:

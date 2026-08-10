@@ -307,20 +307,6 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         document = owned_document(document_id, "pdf")
         database = get_database()
 
-        def fail_highlight(highlight_id: str, message: str, status_code: int) -> tuple[Response, int]:
-            timestamp = now()
-            database.execute(
-                """UPDATE highlights SET status = 'failed', error = ?, updated_at = ?
-                   WHERE id = ? AND user_id = ?""",
-                (message, timestamp, highlight_id, session["user_id"]),
-            )
-            database.commit()
-            failed = database.execute(
-                "SELECT * FROM highlights WHERE id = ? AND user_id = ?",
-                (highlight_id, session["user_id"]),
-            ).fetchone()
-            return jsonify(error=message, highlight=highlight_json(failed)), status_code
-
         if request.method == "GET":
             rows = database.execute(
                 """SELECT * FROM highlights
@@ -329,13 +315,12 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 (document_id, session["user_id"]),
             ).fetchall()
             current = database.execute(
-                "SELECT highlight_status, highlight_error FROM documents WHERE id = ?",
+                "SELECT highlight_status FROM documents WHERE id = ?",
                 (document_id,),
             ).fetchone()
             return jsonify(
                 highlights=[highlight_json(row) for row in rows],
                 processing_status=current["highlight_status"],
-                processing_error=current["highlight_error"],
             )
 
         require_csrf(header=True)
@@ -405,10 +390,13 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 document_id=document_id,
             )
         except MissingApiKeyError:
-            return fail_highlight(row["id"], "OPENROUTER_API_KEY не настроен.", 503)
+            app.logger.error("OPENROUTER_API_KEY is missing; discarding highlight")
+            delete_highlight_rows(database, [row], user_id=session["user_id"])
+            return jsonify(discarded_highlight_id=row["id"])
         except Exception:
             app.logger.exception("Automatic highlight enrichment failed")
-            return fail_highlight(row["id"], "Автоперевод временно недоступен.", 502)
+            delete_highlight_rows(database, [row], user_id=session["user_id"])
+            return jsonify(discarded_highlight_id=row["id"])
         return jsonify(highlight=highlight_json(ready))
 
     @app.delete("/api/article/<document_id>/highlights/<highlight_id>")
@@ -741,6 +729,14 @@ def init_database(app: Flask) -> None:
         user_columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")}
         if "password_hash" in user_columns:
             connection.execute("ALTER TABLE users DROP COLUMN password_hash")
+        connection.execute(
+            """INSERT OR IGNORE INTO deleted_highlights
+               (highlight_id, user_id, document_id, created_at)
+               SELECT id, user_id, document_id, ? FROM highlights
+               WHERE status = 'failed'""",
+            (now(),),
+        )
+        connection.execute("DELETE FROM highlights WHERE status = 'failed'")
         cards_by_target = {
             (row["user_id"], row["target_normalized"]): row["id"]
             for row in connection.execute(
@@ -1231,7 +1227,7 @@ def process_document_highlights(app: Flask, document_id: str, user_id: int) -> N
                 imported_ids.append(row["id"])
         database.commit()
 
-        failed = 0
+        discarded = 0
         for highlight_id in imported_ids:
             row = database.execute(
                 "SELECT * FROM highlights WHERE id = ? AND user_id = ?",
@@ -1248,25 +1244,32 @@ def process_document_highlights(app: Flask, document_id: str, user_id: int) -> N
                     document_id=document_id,
                 )
             except MissingApiKeyError:
-                failed += 1
-                mark_highlight_failed(database, highlight_id, user_id, "OPENROUTER_API_KEY не настроен.")
+                discarded += 1
+                app.logger.error(
+                    "OPENROUTER_API_KEY is missing; discarding imported highlight"
+                )
+                delete_highlight_rows(database, [row], user_id=user_id)
             except Exception:
-                failed += 1
+                discarded += 1
                 app.logger.exception("Imported highlight enrichment failed")
-                mark_highlight_failed(database, highlight_id, user_id, "Автоперевод временно недоступен.")
+                delete_highlight_rows(database, [row], user_id=user_id)
 
-        processing_error = (
-            f"Не удалось подготовить переводов: {failed}. Можно обработать статью повторно."
-            if failed
-            else None
-        )
+        imported_count = database.execute(
+            """SELECT COUNT(*) FROM highlights
+               WHERE document_id = ? AND user_id = ? AND source = 'pdf_import'""",
+            (document_id, user_id),
+        ).fetchone()[0]
         database.execute(
             """UPDATE documents
-               SET highlight_status = 'ready', highlight_error = ?,
+               SET highlight_status = 'ready', highlight_error = NULL,
                    highlight_processed_at = ?, imported_highlight_count = ?
                WHERE id = ? AND user_id = ?""",
-            (processing_error, now(), len(imported_ids), document_id, user_id),
+            (now(), imported_count, document_id, user_id),
         )
+        if discarded:
+            app.logger.warning(
+                "Discarded %s highlights after enrichment retries", discarded
+            )
         database.commit()
     except Exception:
         app.logger.exception("PDF highlight processing failed")
@@ -1280,20 +1283,6 @@ def process_document_highlights(app: Flask, document_id: str, user_id: int) -> N
         database.commit()
     finally:
         database.close()
-
-
-def mark_highlight_failed(
-    database: sqlite3.Connection,
-    highlight_id: str,
-    user_id: int,
-    message: str,
-) -> None:
-    database.execute(
-        """UPDATE highlights SET status = 'failed', error = ?, updated_at = ?
-           WHERE id = ? AND user_id = ?""",
-        (message, now(), highlight_id, user_id),
-    )
-    database.commit()
 
 
 def remove_managed_files(data_dir: Path, paths: list[str | None]) -> None:

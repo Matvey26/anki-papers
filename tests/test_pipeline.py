@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import csv
 
-from articles_to_anki.enrich import build_openrouter_payload
+import articles_to_anki.enrich as enrich_module
 from articles_to_anki.cli import _exclude_processed_targets, _load_excluded_targets
+from articles_to_anki.enrich import build_openrouter_payload, enrich_targets
 from articles_to_anki.export import write_anki_csv
 from articles_to_anki.extract import (
     ExtractionConfig,
@@ -146,6 +147,40 @@ def test_luna_payload_omits_unsupported_temperature() -> None:
     assert "temperature" not in payload
     assert payload["response_format"]["type"] == "json_schema"
     assert payload["provider"]["require_parameters"] is True
+
+
+def test_enrichment_retries_five_times_with_varied_requests(monkeypatch) -> None:
+    payloads = []
+
+    def fail_request(payload, _api_key):
+        payloads.append(payload)
+        raise OSError("provider unavailable")
+
+    monkeypatch.setattr(enrich_module, "_post_json", fail_request)
+    monkeypatch.setattr(enrich_module.time, "sleep", lambda _seconds: None)
+    target = TargetContext(
+        id="abc",
+        target="retained",
+        sentence="The system retained the cached values.",
+        sentence_html="The system <b>retained</b> the cached values.",
+        recall_template_html=f"The system {RECALL_PLACEHOLDER} the cached values.",
+        source_page=1,
+        highlight_coverage=0.8,
+    )
+
+    with pytest.raises(RuntimeError, match="after 5 attempts"):
+        enrich_targets([target], api_key="test-key")
+
+    assert len(payloads) == 5
+    assert [payload["temperature"] for payload in payloads] == [
+        0.2,
+        0.1,
+        0.3,
+        0.0,
+        0.25,
+    ]
+    retry_prompts = [payload["messages"][-1]["content"] for payload in payloads[1:]]
+    assert len(set(retry_prompts)) == 4
 
 
 def test_enrichment_rejects_non_russian_replacement_and_duplicates() -> None:

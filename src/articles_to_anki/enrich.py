@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import os
 import time
@@ -20,6 +21,13 @@ from .models import (
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "google/gemma-4-26b-a4b-it"
 CACHE_VERSION = "v4"
+RETRY_TEMPERATURES = (0.2, 0.1, 0.3, 0.0, 0.25)
+RETRY_INSTRUCTIONS = (
+    "Retry independently. Re-read the sentence before choosing the target's exact sense.",
+    "Start over with different wording. Draft each field mentally, then emit only valid JSON.",
+    "Prioritize schema validity and exact property names; use conservative common translations.",
+    "Final attempt: solve one item at a time, verify every constraint, then return the schema.",
+)
 
 SYSTEM_PROMPT = """\
 You create English-to-Russian vocabulary cards for an advanced English learner.
@@ -78,7 +86,7 @@ def enrich_targets(
     model: str = DEFAULT_MODEL,
     batch_size: int = 1,
     cache_path: str | Path | None = None,
-    max_attempts: int = 3,
+    max_attempts: int = 5,
 ) -> list[EnrichedItem]:
     if not api_key:
         raise ValueError("OPENROUTER_API_KEY is missing.")
@@ -175,11 +183,34 @@ def _request_batch(
         EnrichmentRequestItem(id=item.id, target=item.target, sentence=item.sentence)
         for item in targets
     ]
-    payload = build_openrouter_payload(requests, model)
+    base_payload = build_openrouter_payload(requests, model)
     expected_ids = {item.id for item in requests}
     last_error: Exception | None = None
+    previous_content: str | None = None
 
     for attempt in range(1, max_attempts + 1):
+        payload = deepcopy(base_payload)
+        if "temperature" in payload:
+            payload["temperature"] = RETRY_TEMPERATURES[
+                min(attempt - 1, len(RETRY_TEMPERATURES) - 1)
+            ]
+        if attempt > 1:
+            retry_instruction = RETRY_INSTRUCTIONS[
+                min(attempt - 2, len(RETRY_INSTRUCTIONS) - 1)
+            ]
+            if previous_content is not None:
+                payload["messages"].append(
+                    {"role": "assistant", "content": previous_content}
+                )
+            payload["messages"].append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"{retry_instruction} Previous failure: "
+                        f"{str(last_error)[:700]}"
+                    ),
+                }
+            )
         content: str | None = None
         try:
             response = _post_json(payload, api_key)
@@ -206,22 +237,9 @@ def _request_batch(
                         f"OpenRouter repeated target in alternatives for {item.id}."
                     )
             return by_id
-        except (KeyError, TypeError, ValidationError, RuntimeError, OSError) as exc:
+        except (KeyError, TypeError, ValueError, RuntimeError, OSError) as exc:
             last_error = exc
-            if content is not None:
-                payload["messages"].extend(
-                    [
-                        {"role": "assistant", "content": content},
-                        {
-                            "role": "user",
-                            "content": (
-                                "The previous JSON failed validation. Regenerate it from "
-                                "scratch using exactly the schema property names. Validation "
-                                f"summary: {str(exc)[:700]}"
-                            ),
-                        },
-                    ]
-                )
+            previous_content = content
             if attempt < max_attempts:
                 time.sleep(2 ** (attempt - 1))
 
