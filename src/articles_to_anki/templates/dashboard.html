@@ -79,7 +79,7 @@
         <select name="deck_id" aria-label="Исходная колода">
           {% for deck in decks %}<option value="{{ deck['id'] }}">{{ deck['name'] }}</option>{% endfor %}
         </select>
-        <button class="primary" {% if not new_apkg %}disabled{% endif %}>Скачать обновлённую</button>
+        <button class="primary">Скачать обновлённую</button>
       </form>
     {% else %}
       <form action="{{ url_for('upload_apkg') }}" method="post" enctype="multipart/form-data">

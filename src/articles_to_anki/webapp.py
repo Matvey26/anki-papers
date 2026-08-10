@@ -475,9 +475,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         deck_id = request.form.get("deck_id", "")
         deck = owned_document(deck_id, "apkg")
         cards = pending_cards("apkg_exported_at")
+        stem = Path(deck["name"]).stem
         if not cards:
-            flash("Новых карточек для APKG нет.", "error")
-            return redirect(url_for("dashboard"))
+            return send_file(
+                deck["stored_path"],
+                mimetype="application/octet-stream",
+                as_attachment=True,
+                download_name=f"{safe_download_name(stem)}-updated.apkg",
+            )
         from .apkg import merge
 
         try:
@@ -495,6 +500,12 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                     temporary / "combined.csv",
                 )
                 content = destination.read_bytes()
+                replace_managed_file(Path(deck["stored_path"]), content)
+                get_database().execute(
+                    "UPDATE documents SET size = ? WHERE id = ? AND user_id = ?",
+                    (len(content), deck["id"], session["user_id"]),
+                )
+                get_database().commit()
         except Exception:
             app.logger.exception("APKG export failed")
             flash(
@@ -503,7 +514,6 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             )
             return redirect(url_for("dashboard"))
         mark_exported(cards, "apkg_exported_at")
-        stem = Path(deck["name"]).stem
         return Response(
             content,
             mimetype="application/octet-stream",
@@ -1316,6 +1326,22 @@ def remove_managed_files(data_dir: Path, paths: list[str | None]) -> None:
             path.parent.rmdir()
         except OSError:
             pass
+
+
+def replace_managed_file(destination: Path, content: bytes) -> None:
+    temporary_handle = tempfile.NamedTemporaryFile(
+        prefix=f".{destination.stem}-",
+        suffix=destination.suffix,
+        dir=destination.parent,
+        delete=False,
+    )
+    temporary = Path(temporary_handle.name)
+    try:
+        with temporary_handle:
+            temporary_handle.write(content)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def add_pdf_highlights(source: Path, rows: list[sqlite3.Row]) -> bytes:

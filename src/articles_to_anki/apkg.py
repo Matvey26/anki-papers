@@ -96,16 +96,20 @@ def merge(source: Path, destination: Path, csv_paths: list[Path], combined_csv: 
             max_card_id = connection.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM cards").fetchone()[0]
             max_note_id = connection.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM notes").fetchone()[0]
             base_id = max(int(time.time() * 1000), max_card_id, max_note_id)
-            existing_fronts = {
-                _normalized_front(fields.split("\x1f", 1)[0])
-                for (fields,) in connection.execute("SELECT flds FROM notes")
+            existing_identities = {
+                _card_identity(
+                    fields.split("\x1f", 1)[0],
+                    fields.split("\x1f", 1)[1] if "\x1f" in fields else "",
+                    tags,
+                )
+                for fields, tags in connection.execute("SELECT flds, tags FROM notes")
             }
             rows_to_add: list[dict[str, str]] = []
             for row in rows:
-                normalized = _normalized_front(row["Front"])
-                if normalized in existing_fronts:
+                identity = _card_identity(row["Front"], row["Back"], row["Tags"])
+                if identity in existing_identities:
                     continue
-                existing_fronts.add(normalized)
+                existing_identities.add(identity)
                 rows_to_add.append(row)
 
             for index, row in enumerate(rows_to_add):
@@ -165,6 +169,21 @@ def merge(source: Path, destination: Path, csv_paths: list[Path], combined_csv: 
 
 def _normalized_front(value: str) -> str:
     return " ".join(plain_text(value).casefold().split())
+
+
+def _card_identity(front: str, back: str, tags: str) -> tuple[str, str]:
+    tag_set = set(tags.split())
+    if "card::recall" in tag_set:
+        target = _normalized_front(back)
+        if target:
+            return "recall", target
+    if "card::meaning" in tag_set:
+        match = re.search(r"<b\b[^>]*>(.*?)</b>", front, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            target = _normalized_front(match.group(1))
+            if target:
+                return "meaning", target
+    return "front", _normalized_front(front)
 
 
 def _deck_id(connection: sqlite3.Connection) -> int:

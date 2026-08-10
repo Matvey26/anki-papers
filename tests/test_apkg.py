@@ -118,3 +118,75 @@ def test_merge_supports_zstd_without_content_size(tmp_path: Path) -> None:
     assert database.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 2
     assert database.execute("SELECT due FROM cards WHERE id = 1").fetchone()[0] == 42
     database.close()
+
+
+def test_merge_deduplicates_generated_cards_by_type_and_target(tmp_path: Path) -> None:
+    source = tmp_path / "source.apkg"
+    write_apkg(
+        source,
+        "collection.anki21b",
+        collection_bytes(tmp_path / "source.sqlite"),
+    )
+    first_csv = tmp_path / "first.csv"
+    with first_csv.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["Front", "Back", "Tags"])
+        writer.writeheader()
+        writer.writerow(
+            {
+                "Front": "A <b>robust</b> result.",
+                "Back": "• надёжный",
+                "Tags": "card::meaning",
+            }
+        )
+        writer.writerow(
+            {
+                "Front": "A <b>надёжный</b> result.",
+                "Back": "<b>robust</b>",
+                "Tags": "card::recall",
+            }
+        )
+    first = tmp_path / "first.apkg"
+    merge(source, first, [first_csv], tmp_path / "first-combined.csv")
+
+    second_csv = tmp_path / "second.csv"
+    with second_csv.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["Front", "Back", "Tags"])
+        writer.writeheader()
+        writer.writerow(
+            {
+                "Front": "A different <b>robust</b> example.",
+                "Back": "• устойчивый",
+                "Tags": "card::meaning",
+            }
+        )
+        writer.writerow(
+            {
+                "Front": "A different <b>устойчивый</b> example.",
+                "Back": "<b>robust</b>",
+                "Tags": "card::recall",
+            }
+        )
+        writer.writerow(
+            {
+                "Front": "A <b>precise</b> result.",
+                "Back": "• точный",
+                "Tags": "card::meaning",
+            }
+        )
+        writer.writerow(
+            {
+                "Front": "A <b>точный</b> result.",
+                "Back": "<b>precise</b>",
+                "Tags": "card::recall",
+            }
+        )
+    destination = tmp_path / "destination.apkg"
+    merge(first, destination, [second_csv], tmp_path / "second-combined.csv")
+
+    database = read_collection(destination, "collection.anki21b", tmp_path)
+    fields = [row[0] for row in database.execute("SELECT flds FROM notes")]
+    assert database.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 5
+    assert sum("robust" in value for value in fields) == 2
+    assert sum("precise" in value for value in fields) == 2
+    assert all("different" not in value.casefold() for value in fields)
+    database.close()
