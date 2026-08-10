@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Highlight, Text
-from pypdf.generic import ArrayObject, FloatObject
+from pypdf.generic import ArrayObject, DecodedStreamObject, FloatObject
 
 import articles_to_anki.webapp as webapp_module
 from articles_to_anki.extract import ExtractedHighlight
@@ -104,6 +104,7 @@ def test_register_upload_add_and_export_only_new_cards(
     assert ">Текст<" not in reader.text
     assert 'id="card-dialog"' not in reader.text
     assert 'id="selection-action"' in reader.text
+    assert 'id="highlight-delete"' in reader.text
     assert "Добавить «${target}»" in (Path(webapp_module.__file__).parent / "static" / "reader.js").read_text()
 
     response = client.post(
@@ -147,6 +148,11 @@ def test_register_upload_add_and_export_only_new_cards(
         follow_redirects=True,
     )
     assert "Карточка удалена" not in deleted.text
+    assert client.get(f"/api/article/{document_id}/highlights").json["highlights"] == []
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 0
+        assert database.execute("SELECT COUNT(*) FROM highlights").fetchone()[0] == 0
+        assert database.execute("SELECT COUNT(*) FROM deleted_highlights").fetchone()[0] == 1
 
 
 def test_users_cannot_open_each_others_documents(tmp_path: Path) -> None:
@@ -166,6 +172,10 @@ def test_users_cannot_open_each_others_documents(tmp_path: Path) -> None:
     assert second.get(f"/article/{document_id}").status_code == 404
     assert second.get(f"/file/pdf/{document_id}").status_code == 404
     assert second.get(f"/api/article/{document_id}/highlights").status_code == 404
+    assert second.delete(
+        f"/api/article/{document_id}/highlights/{uuid.uuid4()}",
+        headers={"X-CSRF-Token": csrf(second_dashboard)},
+    ).status_code == 404
     assert second.get(f"/article/{document_id}/highlighted.pdf").status_code == 404
     assert second.post(
         f"/article/{document_id}/read",
@@ -364,6 +374,18 @@ def test_uploaded_pdf_highlights_are_imported_automatically(
         assert highlight["status"] == "ready"
         assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 1
 
+    reader = client.get(f"/article/{document['id']}")
+    deleted = client.delete(
+        f"/api/article/{document['id']}/highlights/{highlight['id']}",
+        headers={"X-CSRF-Token": csrf(reader)},
+    )
+    assert deleted.status_code == 200
+    webapp_module.process_document_highlights(app, document["id"], document["user_id"])
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        assert database.execute("SELECT COUNT(*) FROM highlights").fetchone()[0] == 0
+        assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 0
+        assert database.execute("SELECT COUNT(*) FROM deleted_highlights").fetchone()[0] == 1
+
 
 def test_existing_pdf_can_be_processed_directly_without_reupload(
     tmp_path: Path, monkeypatch
@@ -413,11 +435,66 @@ def test_existing_pdf_can_be_processed_directly_without_reupload(
     assert "Обработать заново" not in dashboard.text
 
 
+def test_pdf_import_does_not_duplicate_overlapping_reader_highlight(
+    tmp_path: Path, monkeypatch
+) -> None:
+    install_fake_enrichment(monkeypatch)
+    extracted = ExtractedHighlight(
+        context=make_target_context(
+            "robust",
+            "This is a robust result.",
+            context_id="source-highlight",
+            page=1,
+        ),
+        rects=[{"x1": 82, "y1": 191, "x2": 119, "y2": 204}],
+    )
+    monkeypatch.setattr(webapp_module, "extract_highlights", lambda _path: [extracted])
+    app = make_app(tmp_path)
+    client = app.test_client()
+    dashboard = identify(client)
+    client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(dashboard), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+    )
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        document_id, user_id = database.execute(
+            "SELECT id, user_id FROM documents"
+        ).fetchone()
+    reader = client.get(f"/article/{document_id}")
+    response = client.post(
+        f"/api/article/{document_id}/highlights",
+        json={
+            "id": str(uuid.uuid4()),
+            "target": "robust",
+            "sentence": "This is a robust result.",
+            "page": 1,
+            "rects": [{"x1": 80, "y1": 190, "x2": 120, "y2": 205}],
+        },
+        headers={"X-CSRF-Token": csrf(reader)},
+    )
+    assert response.status_code == 200
+
+    webapp_module.process_document_highlights(app, document_id, user_id)
+
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        assert database.execute("SELECT COUNT(*) FROM highlights").fetchone()[0] == 1
+        assert database.execute("SELECT source FROM highlights").fetchone()[0] == "reader"
+        assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 1
+        assert database.execute("SELECT COUNT(*) FROM card_highlights").fetchone()[0] == 1
+
+
 def test_clean_pdf_removes_only_native_highlight_annotations(tmp_path: Path) -> None:
     source = tmp_path / "source.pdf"
     destination = tmp_path / "working.pdf"
     writer = PdfWriter()
-    writer.add_blank_page(width=300, height=400)
+    page = writer.add_blank_page(width=300, height=400)
+    content = DecodedStreamObject()
+    content.set_data(
+        b"q\n/SPenSDK_PAGE_LIST BMC\n0 0 10 10 re f\nEMC\nQ\n"
+        b"q\n0 0 m\n10 10 l\nS\nQ\n"
+    )
+    page.replace_contents(content)
     writer.add_annotation(
         page_number=0,
         annotation=Highlight(
@@ -442,6 +519,9 @@ def test_clean_pdf_removes_only_native_highlight_annotations(tmp_path: Path) -> 
         for reference in PdfReader(destination).pages[0]["/Annots"]
     ]
     assert annotations == ["/Text"]
+    cleaned_content = PdfReader(destination).pages[0].get_contents().get_data()
+    assert b"SPenSDK_PAGE_LIST" not in cleaned_content
+    assert b"10 10 l" in cleaned_content
 
 
 def test_article_delete_removes_database_rows_and_files(

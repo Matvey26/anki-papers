@@ -37,7 +37,13 @@ from flask import (
 )
 from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Highlight
-from pypdf.generic import ArrayObject, FloatObject, NameObject, TextStringObject
+from pypdf.generic import (
+    ArrayObject,
+    ContentStream,
+    FloatObject,
+    NameObject,
+    TextStringObject,
+)
 from .enrich import DEFAULT_MODEL, enrich_targets, load_env_file
 from .extract import RECALL_PLACEHOLDER, extract_highlights
 from .models import TargetContext
@@ -238,17 +244,20 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def delete_article(document_id: str) -> Response:
         require_csrf()
         document = owned_document(document_id, "pdf")
-        highlight_ids = [
-            row["id"]
-            for row in get_database().execute(
-                "SELECT id FROM highlights WHERE document_id = ? AND user_id = ?",
-                (document_id, session["user_id"]),
-            ).fetchall()
-        ]
+        highlight_rows = get_database().execute(
+            "SELECT * FROM highlights WHERE document_id = ? AND user_id = ?",
+            (document_id, session["user_id"]),
+        ).fetchall()
+        highlight_ids = [row["id"] for row in highlight_rows]
         paths = [document["stored_path"], document["source_path"], document["text_path"]]
         paths.extend(
             str(Path(app.config["DATA_DIR"]) / "highlight_cache" / f"{highlight_id}.json")
             for highlight_id in highlight_ids
+        )
+        delete_highlight_rows(
+            get_database(),
+            highlight_rows,
+            user_id=session["user_id"],
         )
         get_database().execute(
             "DELETE FROM documents WHERE id = ? AND user_id = ?",
@@ -402,15 +411,57 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             return fail_highlight(row["id"], "Автоперевод временно недоступен.", 502)
         return jsonify(highlight=highlight_json(ready))
 
+    @app.delete("/api/article/<document_id>/highlights/<highlight_id>")
+    @login_required
+    def delete_article_highlight(document_id: str, highlight_id: str) -> Response:
+        owned_document(document_id, "pdf")
+        require_csrf(header=True)
+        row = get_database().execute(
+            """SELECT * FROM highlights
+               WHERE id = ? AND document_id = ? AND user_id = ?""",
+            (highlight_id, document_id, session["user_id"]),
+        ).fetchone()
+        if row is None:
+            abort(404)
+        delete_highlight_rows(
+            get_database(),
+            [row],
+            user_id=session["user_id"],
+        )
+        return jsonify(ok=True, deleted_highlight_id=highlight_id)
+
     @app.post("/cards/<card_id>/delete")
     @login_required
     def delete_card(card_id: str) -> Response:
         require_csrf()
-        get_database().execute(
+        database = get_database()
+        card = database.execute(
+            "SELECT * FROM cards WHERE id = ? AND user_id = ?",
+            (card_id, session["user_id"]),
+        ).fetchone()
+        if card is None:
+            abort(404)
+        rows = database.execute(
+            """SELECT highlights.* FROM highlights
+               JOIN card_highlights ON card_highlights.highlight_id = highlights.id
+               WHERE card_highlights.card_id = ? AND highlights.user_id = ?""",
+            (card_id, session["user_id"]),
+        ).fetchall()
+        if not rows:
+            rows = [
+                row
+                for row in database.execute(
+                    "SELECT * FROM highlights WHERE user_id = ?",
+                    (session["user_id"],),
+                ).fetchall()
+                if normalize_target(row["target"]) == card["target_normalized"]
+            ]
+        delete_highlight_rows(database, rows, user_id=session["user_id"])
+        database.execute(
             "DELETE FROM cards WHERE id = ? AND user_id = ?",
             (card_id, session["user_id"]),
         )
-        get_database().commit()
+        database.commit()
         return redirect(url_for("dashboard"))
 
     @app.post("/export/csv")
@@ -575,6 +626,7 @@ def close_database(_: BaseException | None = None) -> None:
 
 def init_database(app: Flask) -> None:
     connection = sqlite3.connect(app.config["DATABASE"])
+    connection.row_factory = sqlite3.Row
     try:
         connection.executescript(
             """
@@ -645,6 +697,21 @@ def init_database(app: Flask) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_cards_user_created
                 ON cards(user_id, created_at);
+            CREATE TABLE IF NOT EXISTS card_highlights (
+                card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+                highlight_id TEXT NOT NULL REFERENCES highlights(id) ON DELETE CASCADE,
+                PRIMARY KEY(card_id, highlight_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_card_highlights_highlight
+                ON card_highlights(highlight_id);
+            CREATE TABLE IF NOT EXISTS deleted_highlights (
+                highlight_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_deleted_highlights_document
+                ON deleted_highlights(user_id, document_id);
             """
         )
         document_columns = {
@@ -674,6 +741,24 @@ def init_database(app: Flask) -> None:
         user_columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")}
         if "password_hash" in user_columns:
             connection.execute("ALTER TABLE users DROP COLUMN password_hash")
+        cards_by_target = {
+            (row["user_id"], row["target_normalized"]): row["id"]
+            for row in connection.execute(
+                "SELECT id, user_id, target_normalized FROM cards"
+            ).fetchall()
+        }
+        for row in connection.execute(
+            "SELECT id, user_id, target FROM highlights WHERE status = 'ready'"
+        ).fetchall():
+            card_id = cards_by_target.get(
+                (row["user_id"], normalize_target(row["target"]))
+            )
+            if card_id:
+                connection.execute(
+                    """INSERT OR IGNORE INTO card_highlights (card_id, highlight_id)
+                       VALUES (?, ?)""",
+                    (card_id, row["id"]),
+                )
         connection.execute("PRAGMA optimize")
         connection.commit()
     finally:
@@ -733,6 +818,34 @@ def clean_highlight_rects(value: Any) -> list[dict[str, float]]:
     return cleaned
 
 
+def highlight_rects_match(
+    first: list[dict[str, float]],
+    second: list[dict[str, float]],
+    *,
+    minimum_overlap: float = 0.60,
+) -> bool:
+    first_area = sum(
+        (rectangle["x2"] - rectangle["x1"])
+        * (rectangle["y2"] - rectangle["y1"])
+        for rectangle in first
+    )
+    second_area = sum(
+        (rectangle["x2"] - rectangle["x1"])
+        * (rectangle["y2"] - rectangle["y1"])
+        for rectangle in second
+    )
+    smaller_area = min(first_area, second_area)
+    if smaller_area <= 0:
+        return False
+    intersection = 0.0
+    for left in first:
+        for right in second:
+            width = max(0.0, min(left["x2"], right["x2"]) - max(left["x1"], right["x1"]))
+            height = max(0.0, min(left["y2"], right["y2"]) - max(left["y1"], right["y1"]))
+            intersection += width * height
+    return intersection / smaller_area >= minimum_overlap
+
+
 def highlight_json(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -749,6 +862,65 @@ def highlight_json(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def delete_highlight_rows(
+    database: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    *,
+    user_id: int,
+) -> None:
+    if not rows:
+        return
+    card_ids: set[str] = set()
+    timestamp = now()
+    for row in rows:
+        linked = database.execute(
+            "SELECT card_id FROM card_highlights WHERE highlight_id = ?",
+            (row["id"],),
+        ).fetchall()
+        card_ids.update(link["card_id"] for link in linked)
+        database.execute(
+            """INSERT OR IGNORE INTO deleted_highlights
+               (highlight_id, user_id, document_id, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (row["id"], user_id, row["document_id"], timestamp),
+        )
+        database.execute(
+            "DELETE FROM highlights WHERE id = ? AND user_id = ?",
+            (row["id"], user_id),
+        )
+
+    for card_id in card_ids:
+        replacement = database.execute(
+            """SELECT highlights.* FROM highlights
+               JOIN card_highlights ON card_highlights.highlight_id = highlights.id
+               WHERE card_highlights.card_id = ? AND highlights.user_id = ?
+               ORDER BY highlights.created_at LIMIT 1""",
+            (card_id, user_id),
+        ).fetchone()
+        if replacement is None:
+            database.execute(
+                "DELETE FROM cards WHERE id = ? AND user_id = ?",
+                (card_id, user_id),
+            )
+        else:
+            database.execute(
+                """UPDATE cards
+                   SET document_id = ?, target = ?, target_normalized = ?,
+                       sentence = ?, page = ?
+                   WHERE id = ? AND user_id = ?""",
+                (
+                    replacement["document_id"],
+                    replacement["target"],
+                    normalize_target(replacement["target"]),
+                    replacement["sentence"],
+                    replacement["page"],
+                    card_id,
+                    user_id,
+                ),
+            )
+    database.commit()
+
+
 class MissingApiKeyError(RuntimeError):
     pass
 
@@ -762,7 +934,7 @@ def enrich_highlight_row(
     document_id: str,
 ) -> sqlite3.Row:
     existing = database.execute(
-        """SELECT translations_json, replacement, alternatives_json
+        """SELECT id, translations_json, replacement, alternatives_json
            FROM cards WHERE user_id = ? AND target_normalized = ?""",
         (user_id, normalize_target(row["target"])),
     ).fetchone()
@@ -810,10 +982,23 @@ def enrich_highlight_row(
                 timestamp,
             ),
         )
+        existing = database.execute(
+            """SELECT id, translations_json, replacement, alternatives_json
+               FROM cards WHERE user_id = ? AND target_normalized = ?""",
+            (user_id, normalize_target(row["target"])),
+        ).fetchone()
     else:
         translations = existing["translations_json"]
         replacement = existing["replacement"]
         alternatives = existing["alternatives_json"]
+
+    if existing is None:
+        raise RuntimeError("Card disappeared during enrichment")
+    database.execute(
+        """INSERT OR IGNORE INTO card_highlights (card_id, highlight_id)
+           VALUES (?, ?)""",
+        (existing["id"], row["id"]),
+    )
 
     database.execute(
         """UPDATE highlights
@@ -837,18 +1022,23 @@ def write_pdf_without_native_highlights(source: Path, destination: Path) -> None
     writer = PdfWriter()
     writer.clone_document_from_reader(reader)
     for page in writer.pages:
+        _remove_embedded_spen_highlights(page, writer)
         annotations = page.get("/Annots")
-        if annotations is None:
-            continue
-        kept = ArrayObject()
-        for reference in annotations:
-            annotation = reference.get_object()
-            if annotation.get("/Subtype") != "/Highlight":
-                kept.append(reference)
-        if kept:
-            page[NameObject("/Annots")] = kept
-        elif NameObject("/Annots") in page:
-            del page[NameObject("/Annots")]
+        if annotations is not None:
+            kept = ArrayObject()
+            for reference in annotations:
+                annotation = reference.get_object()
+                if annotation.get("/Subtype") != "/Highlight":
+                    kept.append(reference)
+            if kept:
+                page[NameObject("/Annots")] = kept
+            elif NameObject("/Annots") in page:
+                del page[NameObject("/Annots")]
+
+    writer.compress_identical_objects(
+        remove_duplicates=False,
+        remove_unreferenced=True,
+    )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary_handle = tempfile.NamedTemporaryFile(
@@ -865,6 +1055,51 @@ def write_pdf_without_native_highlights(source: Path, destination: Path) -> None
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _remove_embedded_spen_highlights(page: Any, writer: PdfWriter) -> None:
+    contents = page.get_contents()
+    if contents is None or b"/SPenSDK_PAGE_LIST" not in contents.get_data():
+        return
+    stream = ContentStream(contents, writer)
+    kept_operations: list[tuple[list[Any], bytes]] = []
+    marker_depth = 0
+    removed = False
+    for operands, operator in stream.operations:
+        if marker_depth:
+            if operator in {b"BMC", b"BDC"}:
+                marker_depth += 1
+            elif operator == b"EMC":
+                marker_depth -= 1
+            continue
+        if (
+            operator in {b"BMC", b"BDC"}
+            and operands
+            and str(operands[0]) == "/SPenSDK_PAGE_LIST"
+        ):
+            marker_depth = 1
+            removed = True
+            continue
+        kept_operations.append((operands, operator))
+    if not removed:
+        return
+    stream.operations = kept_operations
+    page.replace_contents(stream)
+
+    used_xobjects = {
+        str(operands[0])
+        for operands, operator in kept_operations
+        if operator == b"Do" and operands
+    }
+    resources = page.get("/Resources")
+    if resources is None:
+        return
+    xobjects = resources.get("/XObject")
+    if xobjects is None:
+        return
+    for name in list(xobjects.keys()):
+        if str(name).startswith("/FXX") and str(name) not in used_xobjects:
+            del xobjects[name]
 
 
 def enqueue_document_processing(app: Flask, document_id: str, user_id: int) -> None:
@@ -938,6 +1173,23 @@ def process_document_highlights(app: Flask, document_id: str, user_id: int) -> N
         for item in extracted:
             rects = clean_highlight_rects(item.rects)
             rects_json = json.dumps(rects, separators=(",", ":"))
+            reader_candidates = database.execute(
+                """SELECT target, rects_json FROM highlights
+                   WHERE user_id = ? AND document_id = ? AND page = ?
+                     AND source = 'reader'""",
+                (user_id, document_id, item.context.source_page),
+            ).fetchall()
+            duplicate_reader_highlight = any(
+                normalize_target(candidate["target"])
+                == normalize_target(item.context.target)
+                and highlight_rects_match(
+                    rects,
+                    clean_highlight_rects(json.loads(candidate["rects_json"])),
+                )
+                for candidate in reader_candidates
+            )
+            if duplicate_reader_highlight:
+                continue
             identity = f"{item.context.source_page}:{rects_json}:{normalize_target(item.context.target)}"
             try:
                 namespace = uuid.UUID(document_id)
@@ -945,6 +1197,13 @@ def process_document_highlights(app: Flask, document_id: str, user_id: int) -> N
                 namespace = uuid.NAMESPACE_URL
                 identity = f"{document_id}:{identity}"
             highlight_id = str(uuid.uuid5(namespace, identity))
+            deleted = database.execute(
+                """SELECT 1 FROM deleted_highlights
+                   WHERE highlight_id = ? AND user_id = ? AND document_id = ?""",
+                (highlight_id, user_id, document_id),
+            ).fetchone()
+            if deleted is not None:
+                continue
             database.execute(
                 """INSERT OR IGNORE INTO highlights
                    (id, user_id, document_id, target, sentence, page, rects_json,

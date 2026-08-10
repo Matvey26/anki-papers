@@ -6,11 +6,13 @@ const status = document.querySelector("#pdf-status");
 const popover = document.querySelector("#highlight-popover");
 const popoverWord = document.querySelector("#highlight-word");
 const popoverTranslation = document.querySelector("#highlight-translation");
+const highlightDelete = document.querySelector("#highlight-delete");
 const selectionAction = document.querySelector("#selection-action");
 const pageStates = new Map();
 const highlights = new Map();
 const highlightSignatures = new Set();
 const savingHighlights = new Set();
+const deletedHighlightIds = new Set();
 const visiblePages = new Set();
 let pdfDocument = null;
 let selectionTimer = null;
@@ -373,6 +375,7 @@ async function saveHighlight(highlight) {
       }),
     });
     const result = await response.json();
+    if (deletedHighlightIds.has(highlight.id)) return;
     if (result.highlight) {
       if (result.highlight.id !== highlight.id) {
         highlights.delete(highlight.id);
@@ -384,6 +387,7 @@ async function saveHighlight(highlight) {
     }
     if (!response.ok) throw new Error(result.error || "Автоперевод недоступен.");
   } catch (error) {
+    if (deletedHighlightIds.has(highlight.id)) return;
     const current = highlights.get(activeHighlight.id) || activeHighlight;
     if (current.status === "pending") {
       current.status = "failed";
@@ -434,6 +438,7 @@ function scheduleProcessingPoll(processingStatus) {
 }
 
 function rememberHighlight(highlight) {
+  if (deletedHighlightIds.has(highlight.id)) return;
   const previous = highlights.get(highlight.id);
   if (previous) highlightSignatures.delete(highlightSignature(previous));
   highlights.set(highlight.id, highlight);
@@ -518,9 +523,37 @@ function renderPopoverText(highlight) {
   if (highlight.status === "ready") {
     popoverTranslation.textContent = highlight.translations.join(" · ");
   } else if (highlight.status === "failed") {
-    popoverTranslation.textContent = "Повторяем перевод…";
+    popoverTranslation.textContent = highlight.error || "Перевод недоступен.";
   } else {
     popoverTranslation.textContent = "Перевод готовится…";
+  }
+}
+
+async function deleteOpenHighlight() {
+  const highlight = highlights.get(openHighlightId);
+  if (!highlight) return;
+  highlightDelete.disabled = true;
+  highlightDelete.textContent = "Удаляем…";
+  try {
+    const response = await fetch(
+      `${workspace.dataset.highlightsUrl}/${encodeURIComponent(highlight.id)}`,
+      {
+        method: "DELETE",
+        headers: {"X-CSRF-Token": window.ANKI_PAPERS_CSRF},
+      },
+    );
+    if (!response.ok) throw new Error("Не удалось удалить выделение.");
+    deletedHighlightIds.add(highlight.id);
+    highlights.delete(highlight.id);
+    highlightSignatures.delete(highlightSignature(highlight));
+    popover.hidden = true;
+    openHighlightId = null;
+    drawPageHighlights(highlight.page);
+  } catch (error) {
+    popoverTranslation.textContent = error.message;
+  } finally {
+    highlightDelete.disabled = false;
+    highlightDelete.textContent = "Удалить выделение";
   }
 }
 
@@ -546,6 +579,10 @@ function makeUuid() {
 }
 
 document.addEventListener("pointerdown", hideTranslation);
+highlightDelete.addEventListener("click", (event) => {
+  event.stopPropagation();
+  void deleteOpenHighlight();
+});
 document.addEventListener("pointerdown", (event) => {
   if (!event.target.closest?.(".selection-action")) hideSelectionAction();
 });

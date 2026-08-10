@@ -107,7 +107,7 @@
           <p>{{ card['sentence'] }}</p>
           <form action="{{ url_for('delete_card', card_id=card['id']) }}" method="post">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <button class="link-button danger">Удалить</button>
+            <button class="link-button danger" title="Карточка и выделение удалятся вместе">Удалить</button>
           </form>
         </article>
       {% endfor %}
