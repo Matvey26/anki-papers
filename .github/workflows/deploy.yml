@@ -134,12 +134,22 @@ jobs:
           run_root systemctl is-active --quiet anki-papers.service
           unset DEPLOY_PASSWORD_B64
 
-          sleep 3
           .venv/bin/python - <<'PY'
+          import time
+          from urllib.error import URLError
           from urllib.request import urlopen
 
-          with urlopen("http://127.0.0.1:8000/health", timeout=5) as response:
-              if response.status != 200:
-                  raise SystemExit(f"health check failed: {response.status}")
+          last_error = None
+          for _ in range(15):
+              try:
+                  with urlopen("http://127.0.0.1:8000/health", timeout=5) as response:
+                      if response.status == 200:
+                          break
+                      last_error = RuntimeError(f"health check failed: {response.status}")
+              except URLError as exc:
+                  last_error = exc
+              time.sleep(2)
+          else:
+              raise SystemExit(f"health check failed after retries: {last_error}")
           PY
           REMOTE
