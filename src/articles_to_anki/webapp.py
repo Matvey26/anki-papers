@@ -61,6 +61,13 @@ from .security import (
     verify_password,
 )
 from .sync_queue import enqueue_sync_job
+from .sync_ui import (
+    build_sync_status,
+    format_sync_time,
+    sync_error_text,
+    sync_job_reason,
+    sync_job_state,
+)
 
 USERNAME_RE = re.compile(r"^[\w.\-]{3,32}$", re.UNICODE)
 WORD_RE = re.compile(r"^[\w]+(?:['’\-][\w]+)*$", re.UNICODE)
@@ -103,6 +110,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         lambda: {
             "csrf_token": csrf_token,
             "word_count_label": word_count_label,
+            "format_sync_time": format_sync_time,
+            "sync_error_text": sync_error_text,
+            "sync_job_reason": sync_job_reason,
+            "sync_job_state": sync_job_state,
         }
     )
 
@@ -299,10 +310,6 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                ORDER BY documents.created_at DESC""",
             (user_id,),
         ).fetchall()
-        decks = db.execute(
-            "SELECT * FROM documents WHERE user_id = ? AND kind = 'apkg' ORDER BY created_at DESC",
-            (user_id,),
-        ).fetchall()
         cards = db.execute(
             """SELECT cards.*, documents.name AS document_name
                FROM cards JOIN documents ON documents.id = cards.document_id
@@ -312,21 +319,25 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         anki_account = db.execute(
             "SELECT * FROM anki_accounts WHERE user_id = ?", (user_id,)
         ).fetchone()
-        queued_sync = db.execute(
-            """SELECT state FROM sync_jobs
+        active_sync = db.execute(
+            """SELECT * FROM sync_jobs
                WHERE user_id = ? AND state IN ('queued', 'running')
                ORDER BY created_at LIMIT 1""",
             (user_id,),
         ).fetchone()
+        latest_sync = db.execute(
+            "SELECT * FROM sync_jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        pending_words = sum(card["anki_synced_at"] is None for card in cards)
         return render_template(
             "dashboard.html",
             documents=documents,
-            decks=decks,
             cards=cards,
-            new_csv=sum(card["csv_exported_at"] is None for card in cards) * 2,
-            new_apkg=sum(card["apkg_exported_at"] is None for card in cards) * 2,
             anki_account=anki_account,
-            queued_sync=queued_sync,
+            sync_status=build_sync_status(
+                anki_account, active_sync, latest_sync, pending_words
+            ),
         )
 
     @app.get("/settings")
@@ -340,17 +351,31 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             "SELECT state FROM user_credentials WHERE user_id = ?", (session["user_id"],)
         ).fetchone()
         jobs = database.execute(
-            """SELECT state, reason, attempts, created_at, finished_at
+            """SELECT state, reason, attempts, run_after, started_at, finished_at,
+                      error_code, created_at, updated_at
                FROM sync_jobs WHERE user_id = ?
                ORDER BY created_at DESC LIMIT 5""",
             (session["user_id"],),
         ).fetchall()
+        active_job = database.execute(
+            """SELECT * FROM sync_jobs
+               WHERE user_id = ? AND state IN ('queued', 'running')
+               ORDER BY created_at LIMIT 1""",
+            (session["user_id"],),
+        ).fetchone()
+        pending_words = database.execute(
+            "SELECT COUNT(*) FROM cards WHERE user_id = ? AND anki_synced_at IS NULL",
+            (session["user_id"],),
+        ).fetchone()[0]
         allowed = ankiweb_enabled_for_user(current_app, session["username"])
         return render_template(
             "settings.html",
             account=account,
             credentials=credentials,
             jobs=jobs,
+            sync_status=build_sync_status(
+                account, active_job, jobs[0] if jobs else None, pending_words
+            ),
             decks=json.loads(account["available_decks_json"]) if account else [],
             ankiweb_allowed=allowed,
             credentials_configured=bool(current_app.config["ANKI_CREDENTIAL_KEYS"]),

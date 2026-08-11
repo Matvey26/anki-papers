@@ -92,6 +92,9 @@ def test_register_upload_add_and_export_only_new_cards(
     response = identify(client)
     assert response.status_code == 200
     assert "Библиотека" in response.text
+    assert "Выгрузка" not in response.text
+    assert ">CSV<" not in response.text
+    assert ">APKG<" not in response.text
 
     response = client.post(
         "/upload/pdf",
@@ -946,7 +949,8 @@ def test_recent_cards_are_collapsed_after_five(tmp_path: Path) -> None:
         database.commit()
 
     response = client.get("/dashboard")
-    assert "Недавние сохранённые карточки" in response.text
+    assert "Сохранённые слова" in response.text
+    assert "Каждое слово создаёт две карточки Anki" in response.text
     assert response.text.count('class="saved-card"') == 6
     assert 'class="card-list is-collapsed"' in response.text
     assert "Показать все · 6" in response.text

@@ -1,81 +1,123 @@
 {% extends "base.html" %}
 {% block title %}Настройки — Anki Papers{% endblock %}
 {% block content %}
-<header class="page-heading"><div><h1>Настройки</h1><p>Пароль сайта и фоновая синхронизация AnkiWeb.</p></div></header>
+<header class="page-heading">
+  <div><h1>Настройки</h1><p>Состояние AnkiWeb, целевая колода и безопасность аккаунта.</p></div>
+</header>
 
-<section class="settings-section">
-  <h2>Пароль сайта</h2>
-  <form class="settings-form" action="{{ url_for('change_password') }}" method="post">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <label>Текущий пароль<input type="password" name="current_password" autocomplete="current-password" required></label>
-    <label>Новый пароль<input type="password" name="new_password" minlength="12" autocomplete="new-password" required></label>
-    <label>Повторите новый пароль<input type="password" name="password_confirmation" minlength="12" autocomplete="new-password" required></label>
-    <button class="primary">Сменить пароль</button>
-  </form>
-</section>
-
-<section class="settings-section">
-  <h2>AnkiWeb</h2>
+<section class="settings-section sync-settings">
+  <div class="section-heading"><div><span class="eyebrow">Основной поток</span><h2>AnkiWeb</h2></div></div>
   {% if not ankiweb_allowed %}
     <div class="empty">Интеграция пока включена только для пилотного профиля.</div>
   {% elif not credentials_configured %}
-    <div class="notice error">ANKI_CREDENTIAL_KEY не настроен на сервере.</div>
+    <div class="notice error">Синхронизация недоступна: на сервере не настроен ключ шифрования.</div>
   {% elif not account %}
-    <p>После подключения сервер скачает коллекцию, покажет колоды и preview. Полный upload программно запрещён.</p>
-    <form class="settings-form" action="{{ url_for('connect_ankiweb') }}" method="post">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <label>Пароль сайта<input type="password" name="site_password" autocomplete="current-password" required></label>
-      <label>AnkiWeb ID<input name="ankiweb_id" autocomplete="username" required></label>
-      <label>Пароль AnkiWeb<input type="password" name="ankiweb_password" autocomplete="current-password" required></label>
-      <button class="primary">Подключить AnkiWeb</button>
-    </form>
-  {% else %}
-    <div class="sync-state sync-state-{{ account['state'] }}">
-      <strong>
-        {% if account['state'] == 'connecting' %}Проверка и скачивание
-        {% elif account['state'] == 'awaiting_deck' %}Нужно выбрать колоду
-        {% elif account['state'] == 'syncing' %}Синхронизация
-        {% elif account['state'] == 'needs_reconnect' %}Нужно переподключить AnkiWeb
-        {% elif account['state'] == 'error' %}Временная ошибка
-        {% else %}Подключено{% endif %}
-      </strong>
-      {% if account['selected_deck_name'] %}<span>Колода: {{ account['selected_deck_name'] }}</span>{% endif %}
-      {% if account['last_success_at'] %}<span>Последний успех: {{ account['last_success_at'] }}</span>{% endif %}
-      {% if account['last_added_count'] %}<span>Добавлено: {{ account['last_added_count'] }}</span>{% endif %}
-      {% if account['last_error'] %}<span>{{ account['last_error'] }}</span>{% endif %}
-    </div>
-    {% if decks %}
-      <form class="settings-form" action="{{ url_for('select_anki_deck') }}" method="post">
+    <div class="setup-card">
+      <div><h3>Подключите AnkiWeb один раз</h3><p>Сервис скачает коллекцию, предложит целевую колоду и дальше будет синхронизировать сохранённые слова автоматически. Полная загрузка с сервера в AnkiWeb запрещена.</p></div>
+      <form class="settings-form connect-form" action="{{ url_for('connect_ankiweb') }}" method="post">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <label>Целевая колода
-          <select name="deck_id" required>
-            {% for deck in decks %}<option value="{{ deck['id'] }}" {% if account['selected_deck_id'] == deck['id'] %}selected{% endif %}>{{ deck['name'] }}</option>{% endfor %}
-          </select>
-        </label>
-        {% if account['state'] == 'awaiting_deck' %}
-          <p>Preview: найдено {{ account['preview_existing'] }}; будет добавлено {{ account['preview_missing'] }} карточек.</p>
-        {% else %}
-          <p>Смена колоды не перемещает уже созданные карточки.</p>
-        {% endif %}
-        <button class="primary">{{ 'Подтвердить и синхронизировать' if account['state'] == 'awaiting_deck' else 'Сменить колоду' }}</button>
+        <label>Пароль от Anki Papers<input type="password" name="site_password" autocomplete="current-password" required></label>
+        <label>AnkiWeb ID <span class="field-help">Почта, которой вы входите в AnkiWeb</span><input name="ankiweb_id" autocomplete="username" required></label>
+        <label>Пароль AnkiWeb<input type="password" name="ankiweb_password" autocomplete="current-password" required></label>
+        <button class="primary">Подключить и проверить</button>
+      </form>
+    </div>
+  {% else %}
+    <div class="sync-overview sync-tone-{{ sync_status['tone'] }} sync-overview-full" {% if sync_status['active'] %}data-sync-auto-refresh{% endif %}>
+      <div class="sync-overview-main">
+        <div class="sync-status-heading">
+          <span class="sync-status-dot" aria-hidden="true"></span>
+          <div><span class="eyebrow">Текущее состояние</span><h3>{{ sync_status['title'] }}</h3></div>
+        </div>
+        <p>{{ sync_status['message'] }}</p>
+        {% if sync_status.get('error_detail') %}<p class="sync-error-detail">Что это значит: {{ sync_status['error_detail'] }}</p>{% endif %}
+        <div class="sync-progress-label"><span>{{ sync_status['stage'] }}</span>{% if sync_status['active'] %}<span>Автообновление включено</span>{% endif %}</div>
+        <progress class="sync-progress-track" aria-label="Этап синхронизации" value="{{ sync_status['progress'] }}" max="100">{{ sync_status['progress'] }}%</progress>
+        <dl class="sync-meta">
+          {% if sync_status.get('selected_deck') %}<div><dt>Целевая колода</dt><dd>{{ sync_status['selected_deck'] }}</dd></div>{% endif %}
+          <div><dt>Сохранённые слова</dt><dd>{{ sync_status['pending_words'] }} ожидают · {{ sync_status['pending_notes'] }} карточек</dd></div>
+          {% if sync_status.get('last_success_at') %}<div><dt>Последний успех</dt><dd>{{ sync_status['last_success_label'] }}</dd></div>{% endif %}
+          {% if sync_status.get('last_added_count') %}<div><dt>Добавлено тогда</dt><dd>{{ sync_status['last_added_count'] }} карточек</dd></div>{% endif %}
+        </dl>
+      </div>
+    </div>
+
+    {% if account['state'] == 'awaiting_deck' and decks %}
+      <div class="next-action-card">
+        <div>
+          <span class="eyebrow">Следующий шаг</span>
+          <h3>Куда добавлять карточки?</h3>
+          <p>В Anki уже найдено {{ account['preview_existing'] }} связанных карточек. Будет добавлено {{ account['preview_missing'] }} карточек для {{ account['preview_missing'] // 2 }} сохранённых слов.</p>
+        </div>
+        <form class="deck-action-form" action="{{ url_for('select_anki_deck') }}" method="post">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <label>Целевая колода<select name="deck_id" required>{% for deck in decks %}<option value="{{ deck['id'] }}">{{ deck['name'] }}</option>{% endfor %}</select></label>
+          <button class="primary">Выбрать и синхронизировать</button>
+        </form>
+      </div>
+    {% elif account['state'] in ('connected', 'error') %}
+      <form class="primary-sync-action" action="{{ url_for('sync_ankiweb_now') }}" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="primary">{{ 'Повторить синхронизацию' if account['state'] == 'error' else 'Синхронизировать сейчас' }}</button>
+        <span>Обычно это не нужно: новые слова ставятся в очередь автоматически.</span>
       </form>
     {% endif %}
-    <div class="settings-actions">
-      <form action="{{ url_for('sync_ankiweb_now') }}" method="post">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button {% if account['state'] not in ('connected', 'error') %}disabled{% endif %}>Синхронизировать сейчас</button>
-      </form>
-      <form action="{{ url_for('disconnect_ankiweb') }}" method="post">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button class="danger">Отключить AnkiWeb</button>
-      </form>
-    </div>
+
+    {% if decks and account['state'] != 'awaiting_deck' %}
+      <details class="settings-disclosure">
+        <summary>Изменить целевую колоду</summary>
+        <div class="disclosure-content">
+          <p>Новые карточки пойдут в выбранную колоду. Уже созданные карточки не перемещаются.</p>
+          <form class="deck-action-form" action="{{ url_for('select_anki_deck') }}" method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label>Целевая колода<select name="deck_id" required>{% for deck in decks %}<option value="{{ deck['id'] }}" {% if account['selected_deck_id'] == deck['id'] %}selected{% endif %}>{{ deck['name'] }}</option>{% endfor %}</select></label>
+            <button class="secondary">Сохранить колоду</button>
+          </form>
+        </div>
+      </details>
+    {% endif %}
+
+    {% if jobs %}
+      <details class="settings-disclosure sync-history" {% if account['state'] == 'error' %}open{% endif %}>
+        <summary>История синхронизации</summary>
+        <div class="sync-event-list">
+          {% for job in jobs %}
+            <article class="sync-event sync-event-{{ job['state'] }}">
+              <span class="event-state">{{ sync_job_state(job['state']) }}</span>
+              <div><strong>{{ sync_job_reason(job['reason']) }}</strong><span>{{ format_sync_time(job['finished_at'] or job['updated_at']) }}{% if job['attempts'] > 1 %} · попытка {{ job['attempts'] }}{% endif %}</span>{% if sync_error_text(job['error_code']) %}<p>{{ sync_error_text(job['error_code']) }}</p>{% endif %}</div>
+            </article>
+          {% endfor %}
+        </div>
+      </details>
+    {% endif %}
+
+    <details class="settings-disclosure danger-disclosure">
+      <summary>Управление подключением</summary>
+      <div class="disclosure-content">
+        <p>Отключение удалит сохранённые реквизиты AnkiWeb и локальное зеркало коллекции. Карточки в AnkiWeb останутся.</p>
+        <form action="{{ url_for('disconnect_ankiweb') }}" method="post" data-confirm-disconnect>
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button class="secondary danger">Отключить AnkiWeb</button>
+        </form>
+      </div>
+    </details>
   {% endif %}
 </section>
 
-{% if jobs %}
-<section class="settings-section"><h2>Последние задания</h2><ul class="job-list">
-  {% for job in jobs %}<li><strong>{{ job['state'] }}</strong> · {{ job['reason'] }} · попытка {{ job['attempts'] }}</li>{% endfor %}
-</ul></section>
-{% endif %}
+<section class="settings-section">
+  <details class="settings-disclosure security-settings">
+    <summary>Пароль Anki Papers</summary>
+    <div class="disclosure-content">
+      <p>Смена пароля завершит текущий сеанс. После сохранения войдите снова.</p>
+      <form class="settings-form" action="{{ url_for('change_password') }}" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label>Текущий пароль<input type="password" name="current_password" autocomplete="current-password" required></label>
+        <label>Новый пароль<input type="password" name="new_password" minlength="12" autocomplete="new-password" required></label>
+        <label>Повторите новый пароль<input type="password" name="password_confirmation" minlength="12" autocomplete="new-password" required></label>
+        <button class="primary">Сменить пароль</button>
+      </form>
+    </div>
+  </details>
+</section>
 {% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='sync-status.js') }}"></script>{% endblock %}

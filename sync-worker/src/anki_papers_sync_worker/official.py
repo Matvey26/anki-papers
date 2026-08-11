@@ -21,6 +21,9 @@ class PermanentSyncError(RuntimeError):
     pass
 
 
+MANAGED_NOTETYPE_NAME = "Anki Papers"
+
+
 @dataclass(frozen=True)
 class AdapterResult:
     hkey: str
@@ -277,9 +280,7 @@ class OfficialAnkiAdapter:
         from anki.decks import DeckId
         from anki.utils import base91
 
-        notetype = collection.models.by_name("Basic")
-        if notetype is None:
-            raise PermanentSyncError("basic_notetype_missing")
+        notetype = OfficialAnkiAdapter._managed_notetype(collection)
         note = collection.new_note(notetype)
         note.guid = base91(
             int.from_bytes(
@@ -293,6 +294,25 @@ class OfficialAnkiAdapter:
         note.tags = [f"anki_papers::{card['id']}", f"direction::{direction}"]
         collection.add_note(note, DeckId(deck_id))
         return note
+
+    @staticmethod
+    def _managed_notetype(collection: Any) -> Any:
+        notetype = collection.models.by_name(MANAGED_NOTETYPE_NAME)
+        if notetype is not None:
+            field_names = [field["name"] for field in notetype["flds"]]
+            if field_names[:2] != ["Front", "Back"] or not notetype["tmpls"]:
+                raise PermanentSyncError("managed_notetype_invalid")
+            return notetype
+
+        notetype = collection.models.new(MANAGED_NOTETYPE_NAME)
+        collection.models.add_field(notetype, collection.models.new_field("Front"))
+        collection.models.add_field(notetype, collection.models.new_field("Back"))
+        template = collection.models.new_template("Card 1")
+        template["qfmt"] = "{{Front}}"
+        template["afmt"] = '{{FrontSide}}<hr id="answer">{{Back}}'
+        collection.models.add_template(notetype, template)
+        collection.models.add(notetype)
+        return notetype
 
     @staticmethod
     def _raise_classified(exc: Exception) -> None:

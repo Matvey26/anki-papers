@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
+from anki.collection import Collection
 from anki_papers_sync_worker.official import OfficialAnkiAdapter
 
 
@@ -41,3 +43,28 @@ def test_full_download_uses_endpoint_returned_by_ankiweb() -> None:
     assert auth.endpoint == "https://sync6.ankiweb.net/"
     assert collection.download_endpoint == "https://sync6.ankiweb.net/"
     assert collection.reopened is True
+
+
+def test_managed_notetype_does_not_depend_on_english_basic_name(tmp_path: Path) -> None:
+    collection = Collection(str(tmp_path / "collection.anki2"))
+    basic = collection.models.by_name("Basic")
+    assert basic is not None
+    basic["name"] = "Базовая"
+    collection.models.update_dict(basic)
+    card = {
+        "id": "context-1",
+        "target": "robust",
+        "sentence": "A robust result.",
+        "replacement": "надёжный",
+        "translations": ["надёжный"],
+        "alternatives": ["strong"],
+        "document_name": "paper.pdf",
+        "page": 1,
+    }
+
+    note = OfficialAnkiAdapter._add_note(collection, card, "meaning", 1)
+
+    assert collection.models.by_name("Basic") is None
+    assert collection.models.by_name("Anki Papers") is not None
+    assert note.fields == ["A <b>robust</b> result.", "• надёжный"]
+    collection.close()

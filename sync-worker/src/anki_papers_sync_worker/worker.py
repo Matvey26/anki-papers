@@ -82,20 +82,22 @@ class SyncWorker:
             except AuthenticationError:
                 database.rollback()
                 self._auth_failed(database, job)
-            except PermanentSyncError:
+            except PermanentSyncError as exc:
                 database.rollback()
+                detail = str(exc)
                 database.execute(
                     """UPDATE anki_accounts SET state = 'error', last_error = ?, updated_at = ?
                        WHERE user_id = ? AND state != 'needs_reconnect'""",
-                    ("Синхронизация требует ручной проверки.", now(), job["user_id"]),
+                    (permanent_error_message(detail), now(), job["user_id"]),
                 )
-                self._finish_failed(database, job, "configuration")
-            except (RetryableSyncError, OSError, sqlite3.OperationalError):
+                self._finish_failed(database, job, f"configuration:{detail}")
+            except (RetryableSyncError, OSError, sqlite3.OperationalError) as exc:
                 database.rollback()
-                self._retry_or_fail(database, job, "temporary")
-            except Exception:  # noqa: BLE001 - job boundary must contain unexpected failures
+                detail = str(exc) if isinstance(exc, RetryableSyncError) else type(exc).__name__
+                self._retry_or_fail(database, job, f"temporary:{detail}")
+            except Exception as exc:  # noqa: BLE001 - job boundary must contain unexpected failures
                 database.rollback()
-                self._retry_or_fail(database, job, "internal")
+                self._retry_or_fail(database, job, f"internal:{type(exc).__name__}")
             return True
 
     @contextmanager
@@ -371,6 +373,15 @@ class SyncWorker:
     def _retry_or_fail(self, database: sqlite3.Connection, job: sqlite3.Row, code: str) -> None:
         attempts = int(job["attempts"])
         if attempts >= MAX_ATTEMPTS:
+            database.execute(
+                """UPDATE anki_accounts SET state = 'error', last_error = ?, updated_at = ?
+                   WHERE user_id = ?""",
+                (
+                    "Синхронизация не удалась после пяти попыток. Запустите повтор вручную.",
+                    now(),
+                    job["user_id"],
+                ),
+            )
             self._finish_failed(database, job, code)
             return
         delay = RETRY_MINUTES[min(attempts - 1, len(RETRY_MINUTES) - 1)]
@@ -447,3 +458,16 @@ def run_forever(worker: SyncWorker, poll_seconds: float = 2.0) -> None:
         worked = worker.run_once()
         if not worked:
             time.sleep(poll_seconds)
+
+
+def permanent_error_message(code: str) -> str:
+    return {
+        "remote_collection_empty": (
+            "Коллекция AnkiWeb пуста. Сначала загрузите её из Anki Desktop."
+        ),
+        "deck_not_selected": "Не выбрана целевая колода AnkiWeb.",
+        "managed_notetype_invalid": (
+            "Тип карточек «Anki Papers» изменён вручную и несовместим."
+        ),
+        "repeated_full_sync": "AnkiWeb несколько раз потребовал полную синхронизацию.",
+    }.get(code, "Коллекция требует ручной проверки перед синхронизацией.")

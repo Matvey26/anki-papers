@@ -2,28 +2,55 @@
 {% block title %}Библиотека — Anki Papers{% endblock %}
 {% block content %}
 <header class="page-heading">
-  <div><h1>Библиотека</h1><p>Загрузите PDF, читайте и выделяйте незнакомые слова.</p></div>
+  <div>
+    <h1>Библиотека</h1>
+    <p>Читайте PDF и сохраняйте слова — карточки попадут в AnkiWeb автоматически.</p>
+  </div>
   <form class="upload-inline" action="{{ url_for('upload_pdf') }}" method="post" enctype="multipart/form-data">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <label class="file-button">Добавить PDF<input name="file" type="file" accept=".pdf,application/pdf" required onchange="this.form.submit()"></label>
   </form>
 </header>
 
-<section class="summary">
-  <div><strong>{{ documents|length }}</strong><span>статей</span></div>
-  <div><strong>{{ cards|length }}</strong><span>слов</span></div>
-  <div><strong>{{ new_csv }}</strong><span>новых карточек</span></div>
+<section class="sync-overview sync-tone-{{ sync_status['tone'] }}" {% if sync_status['active'] %}data-sync-auto-refresh{% endif %}>
+  <div class="sync-overview-main">
+    <div class="sync-status-heading">
+      <span class="sync-status-dot" aria-hidden="true"></span>
+      <div>
+        <span class="eyebrow">AnkiWeb</span>
+        <h2>{{ sync_status['title'] }}</h2>
+      </div>
+    </div>
+    <p>{{ sync_status['message'] }}</p>
+    {% if sync_status.get('error_detail') %}<p class="sync-error-detail">{{ sync_status['error_detail'] }}</p>{% endif %}
+
+    <div class="sync-progress-label">
+      <span>{{ sync_status['stage'] }}</span>
+      {% if sync_status['active'] %}<span>Проверяем каждые 4 секунды</span>{% endif %}
+    </div>
+    <progress class="sync-progress-track" aria-label="Этап синхронизации" value="{{ sync_status['progress'] }}" max="100">{{ sync_status['progress'] }}%</progress>
+
+    {% if sync_status.get('selected_deck') or sync_status.get('last_success_at') %}
+      <dl class="sync-meta">
+        {% if sync_status.get('selected_deck') %}<div><dt>Колода</dt><dd>{{ sync_status['selected_deck'] }}</dd></div>{% endif %}
+        {% if sync_status.get('last_success_at') %}<div><dt>Последняя синхронизация</dt><dd>{{ sync_status['last_success_label'] }}</dd></div>{% endif %}
+      </dl>
+    {% endif %}
+  </div>
+  <div class="sync-overview-action">
+    <a class="{{ 'primary' if sync_status['tone'] in ('error', 'action', 'neutral') else 'secondary' }}" href="{{ url_for('settings') }}">
+      {% if not anki_account %}Подключить AnkiWeb
+      {% elif anki_account['state'] == 'awaiting_deck' %}Выбрать колоду
+      {% elif anki_account['state'] in ('error', 'needs_reconnect') %}Исправить
+      {% else %}Подробнее{% endif %}
+    </a>
+  </div>
 </section>
 
-{% if anki_account %}
-<a class="sync-summary" href="{{ url_for('settings') }}">
-  <strong>AnkiWeb</strong>
-  <span>{% if queued_sync and queued_sync['state'] == 'running' %}синхронизация{% elif queued_sync %}ожидает{% elif anki_account['state'] == 'needs_reconnect' %}нужно переподключить AnkiWeb{% elif anki_account['last_added_count'] %}добавлено {{ anki_account['last_added_count'] }}{% else %}{{ anki_account['state'] }}{% endif %}</span>
-</a>
-{% endif %}
-
 <section>
-  <h2>Статьи</h2>
+  <div class="section-heading">
+    <div><h2>Статьи</h2><p>Число рядом с PDF — сохранённые слова из этой статьи.</p></div>
+  </div>
   {% if documents %}
     <div class="article-list">
       {% for document in documents %}
@@ -42,22 +69,10 @@
             </form>
           </div>
           <div class="article-icon-actions">
-            <a
-              class="round-icon-button"
-              href="{{ url_for('highlighted_pdf', document_id=document['id']) }}"
-              aria-label="Скачать PDF с хайлайтами"
-              title="Скачать PDF с хайлайтами"
-            >
+            <a class="round-icon-button" href="{{ url_for('highlighted_pdf', document_id=document['id']) }}" aria-label="Скачать PDF с хайлайтами" title="Скачать PDF с хайлайтами">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 18v2h14v-2"/></svg>
             </a>
-            <button
-              class="round-icon-button danger delete-article-trigger"
-              type="button"
-              data-delete-url="{{ url_for('delete_article', document_id=document['id']) }}"
-              data-document-name="{{ document['name'] }}"
-              aria-label="Удалить статью"
-              title="Удалить статью"
-            >
+            <button class="round-icon-button danger delete-article-trigger" type="button" data-delete-url="{{ url_for('delete_article', document_id=document['id']) }}" data-document-name="{{ document['name'] }}" aria-label="Удалить статью" title="Удалить статью">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg>
             </button>
           </div>
@@ -65,52 +80,24 @@
       {% endfor %}
     </div>
   {% else %}
-    <div class="empty">Пока нет статей.</div>
-  {% endif %}
-</section>
-
-<section class="exports">
-  <h2>Выгрузка</h2>
-  <div class="export-box">
-    <div><strong>CSV</strong><span>{{ new_csv }} новых карточек</span></div>
-    <form action="{{ url_for('export_csv') }}" method="post">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <button class="primary" {% if not new_csv %}disabled{% endif %}>Скачать новые</button>
-    </form>
-  </div>
-  <div class="export-box">
-    <div><strong>APKG</strong><span>{{ new_apkg }} новых карточек; старое расписание сохраняется</span></div>
-    {% if decks %}
-      <form class="apkg-form" action="{{ url_for('export_apkg') }}" method="post">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <select name="deck_id" aria-label="Исходная колода">
-          {% for deck in decks %}<option value="{{ deck['id'] }}">{{ deck['name'] }}</option>{% endfor %}
-        </select>
-        <button class="primary">Скачать обновлённую</button>
-      </form>
-    {% else %}
-      <form action="{{ url_for('upload_apkg') }}" method="post" enctype="multipart/form-data">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <label class="file-button secondary">Добавить APKG<input name="file" type="file" accept=".apkg" required onchange="this.form.submit()"></label>
-      </form>
-    {% endif %}
-  </div>
-  {% if decks %}
-    <form class="small-upload" action="{{ url_for('upload_apkg') }}" method="post" enctype="multipart/form-data">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <label>Заменить или добавить исходную колоду <input name="file" type="file" accept=".apkg" required><button>Загрузить</button></label>
-    </form>
+    <div class="empty">Пока нет статей. Добавьте первый PDF.</div>
   {% endif %}
 </section>
 
 <section>
-  <h2>Недавние сохранённые карточки</h2>
+  <div class="section-heading">
+    <div>
+      <h2>Сохранённые слова</h2>
+      <p>Каждое слово создаёт две карточки Anki: значение и обратный перевод.</p>
+    </div>
+  </div>
   {% if cards %}
     <div id="recent-card-list" class="card-list is-collapsed">
       {% for card in cards %}
         <article class="saved-card">
           <div><strong>{{ card['target'] }}</strong><span>{{ card['document_name'] }} · стр. {{ card['page'] }}</span></div>
           <p>{{ card['sentence'] }}</p>
+          <span class="card-sync-badge {{ 'is-synced' if card['anki_synced_at'] else 'is-pending' }}">{{ 'В Anki' if card['anki_synced_at'] else 'Ожидает Anki' }}</span>
           <form action="{{ url_for('delete_card', card_id=card['id']) }}" method="post">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button class="link-button danger" title="Карточка и выделение удалятся вместе">Удалить</button>
@@ -118,9 +105,7 @@
         </article>
       {% endfor %}
     </div>
-    {% if cards|length > 5 %}
-      <button class="cards-toggle" type="button" data-cards-toggle aria-expanded="false" aria-controls="recent-card-list">Показать все · {{ cards|length }}</button>
-    {% endif %}
+    {% if cards|length > 5 %}<button class="cards-toggle" type="button" data-cards-toggle aria-expanded="false" aria-controls="recent-card-list">Показать все · {{ cards|length }}</button>{% endif %}
   {% else %}
     <div class="empty">Выделите слово прямо в PDF.</div>
   {% endif %}
@@ -141,4 +126,7 @@
   </div>
 </dialog>
 {% endblock %}
-{% block scripts %}<script src="{{ url_for('static', filename='dashboard.js') }}"></script>{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+<script src="{{ url_for('static', filename='sync-status.js') }}"></script>
+{% endblock %}

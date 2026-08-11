@@ -9,6 +9,7 @@ from pathlib import Path
 from anki_papers_sync_worker.official import (
     AdapterResult,
     AuthenticationError,
+    PermanentSyncError,
 )
 from anki_papers_sync_worker.worker import SyncWorker
 
@@ -72,6 +73,11 @@ class FakeAdapter:
 class AuthFailAdapter(FakeAdapter):
     def connect(self, path, username, password, cards, known_links=None):
         raise AuthenticationError("hidden details")
+
+
+class ConfigurationFailAdapter(FakeAdapter):
+    def connect(self, path, username, password, cards, known_links=None):
+        raise PermanentSyncError("managed_notetype_invalid")
 
 
 def make_connected_web_state(tmp_path: Path):
@@ -166,6 +172,11 @@ def test_connect_preview_then_incremental_sync(tmp_path: Path) -> None:
         assert b"fresh-hkey" not in credentials_blob
 
     settings = client.get("/settings")
+    assert "Выберите целевую колоду" in settings.text
+    assert "Коллекция загружена" in settings.text
+    assert "Подключение AnkiWeb" in settings.text
+    assert "awaiting_deck" not in settings.text
+    assert ">succeeded<" not in settings.text
     selected = client.post(
         "/settings/anki/deck",
         data={"csrf_token": csrf(settings), "deck_id": "42"},
@@ -220,6 +231,29 @@ def test_two_auth_failures_require_reconnect_without_leaking_error(tmp_path: Pat
     assert account == ("needs_reconnect", "Нужно переподключить AnkiWeb.")
     assert job == ("failed", "auth")
     assert "hidden details" not in account[1]
+
+
+def test_configuration_failure_records_safe_actionable_reason(tmp_path: Path) -> None:
+    make_connected_web_state(tmp_path)
+    worker = SyncWorker(
+        tmp_path / "app.sqlite3",
+        tmp_path,
+        keys={1: KEY},
+        adapter=ConfigurationFailAdapter(),
+    )
+
+    assert worker.run_once()
+
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        account = database.execute(
+            "SELECT state, last_error FROM anki_accounts"
+        ).fetchone()
+        job = database.execute("SELECT state, error_code FROM sync_jobs").fetchone()
+    assert account == (
+        "error",
+        "Тип карточек «Anki Papers» изменён вручную и несовместим.",
+    )
+    assert job == ("failed", "configuration:managed_notetype_invalid")
 
 
 def test_official_adapter_has_no_full_upload_path() -> None:
