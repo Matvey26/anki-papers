@@ -21,6 +21,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 from flask import (
     Flask,
@@ -102,6 +104,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     )
     app.extensions["highlight_jobs"] = set()
     app.extensions["highlight_jobs_lock"] = threading.Lock()
+    app.extensions["reader_highlight_jobs"] = set()
+    app.extensions["quick_translation_cache"] = {}
+    app.extensions["quick_translation_cache_lock"] = threading.Lock()
     app.extensions["deleted_document_paths"] = {}
     app.extensions["highlight_resume_done"] = False
 
@@ -307,7 +312,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                          AND highlights.user_id = documents.user_id) AS highlight_count
                FROM documents
                WHERE documents.user_id = ? AND documents.kind = 'pdf'
-               ORDER BY documents.created_at DESC""",
+               ORDER BY documents.last_opened_at DESC, documents.created_at DESC""",
             (user_id,),
         ).fetchall()
         cards = db.execute(
@@ -588,29 +593,81 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @login_required
     def article(document_id: str) -> Response:
         document = owned_document(document_id, "pdf")
+        requested_page = request.args.get("page", type=int)
         page_number = min(
-            max(request.args.get("page", 1, type=int), 1),
+            max(requested_page if requested_page is not None else document["last_page"] or 1, 1),
             max(1, document["page_count"]),
         )
+        get_database().execute(
+            """UPDATE documents SET last_opened_at = ?
+               WHERE id = ? AND user_id = ?""",
+            (now(), document["id"], session["user_id"]),
+        )
+        get_database().commit()
         return render_template(
             "reader.html",
             document=document,
             page_number=page_number,
         )
 
+    @app.get("/api/quick-translation")
+    @login_required
+    def quick_translation() -> Response:
+        word = request.args.get("word", "").strip()
+        if not is_single_word(word):
+            return jsonify(error="Нужно указать одно слово."), 400
+        cache: dict[str, tuple[float, list[dict[str, Any]]]] = app.extensions[
+            "quick_translation_cache"
+        ]
+        lock: threading.Lock = app.extensions["quick_translation_cache_lock"]
+        key = word.casefold()
+        with lock:
+            cached = cache.get(key)
+            if cached and cached[0] > time.monotonic():
+                return jsonify(groups=cached[1])
+        groups = quick_translation_groups(word)
+        with lock:
+            cache[key] = (time.monotonic() + 7 * 24 * 60 * 60, groups)
+        return jsonify(groups=groups)
+
     @app.post("/article/<document_id>/read")
     @login_required
     def mark_article_read(document_id: str) -> Response:
-        require_csrf()
+        is_json_request = request.is_json
+        require_csrf(header=is_json_request)
         document = owned_document(document_id, "pdf")
-        read_at = now() if request.form.get("read") == "1" else None
+        payload = request.get_json(silent=True) if is_json_request else request.form
+        read_at = now() if payload and str(payload.get("read")) == "1" else None
         get_database().execute(
             "UPDATE documents SET read_at = ? WHERE id = ? AND user_id = ?",
             (read_at, document["id"], session["user_id"]),
         )
         get_database().commit()
+        if is_json_request:
+            return jsonify(read=bool(read_at))
         flash("Статья отмечена прочитанной." if read_at else "Статья снова в непрочитанных.", "success")
         return redirect(url_for("dashboard"))
+
+    @app.post("/api/article/<document_id>/progress")
+    @login_required
+    def save_article_progress(document_id: str) -> Response:
+        require_csrf(header=True)
+        document = owned_document(document_id, "pdf")
+        payload = request.get_json(silent=True) or {}
+        try:
+            page_number = int(payload.get("page"))
+        except (TypeError, ValueError):
+            return jsonify(error="Некорректная страница."), 400
+        if page_number < 1 or page_number > document["page_count"]:
+            return jsonify(error="Некорректная страница."), 400
+        database = get_database()
+        database.execute(
+            """UPDATE documents SET last_page = ?, last_opened_at = ?
+               WHERE id = ? AND user_id = ?""",
+            (page_number, now(), document["id"], session["user_id"]),
+        )
+        database.commit()
+        return jsonify(page=page_number)
 
     @app.post("/article/<document_id>/delete")
     @login_required
@@ -691,6 +748,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 "SELECT highlight_status FROM documents WHERE id = ?",
                 (document_id,),
             ).fetchone()
+            for row in rows:
+                if row["status"] == "pending" and row["source"] == "reader":
+                    enqueue_reader_highlight_enrichment(
+                        app,
+                        highlight_id=row["id"],
+                        user_id=session["user_id"],
+                        document_id=document_id,
+                    )
             return jsonify(
                 highlights=[highlight_json(row) for row in rows],
                 processing_status=current["highlight_status"],
@@ -753,24 +818,19 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             abort(500, "Не удалось сохранить выделение")
         if row["status"] == "ready":
             return jsonify(highlight=highlight_json(row))
-
-        try:
-            ready = enrich_highlight_row(
-                app,
-                database,
-                row,
-                user_id=session["user_id"],
-                document_id=document_id,
-            )
-        except MissingApiKeyError:
-            app.logger.error("OPENROUTER_API_KEY is missing; discarding highlight")
-            delete_highlight_rows(database, [row], user_id=session["user_id"])
+        enqueue_reader_highlight_enrichment(
+            app,
+            highlight_id=row["id"],
+            user_id=session["user_id"],
+            document_id=document_id,
+        )
+        current = database.execute(
+            "SELECT * FROM highlights WHERE id = ? AND user_id = ?",
+            (row["id"], session["user_id"]),
+        ).fetchone()
+        if current is None:
             return jsonify(discarded_highlight_id=row["id"])
-        except Exception:
-            app.logger.exception("Automatic highlight enrichment failed")
-            delete_highlight_rows(database, [row], user_id=session["user_id"])
-            return jsonify(discarded_highlight_id=row["id"])
-        return jsonify(highlight=highlight_json(ready))
+        return jsonify(highlight=highlight_json(current))
 
     @app.delete("/api/article/<document_id>/highlights/<highlight_id>")
     @login_required
@@ -1138,10 +1198,12 @@ def init_database(app: Flask) -> None:
                 name TEXT NOT NULL,
                 stored_path TEXT NOT NULL,
                 text_path TEXT,
-                page_count INTEGER NOT NULL DEFAULT 0,
-                size INTEGER NOT NULL,
-                read_at TEXT,
-                source_path TEXT,
+               page_count INTEGER NOT NULL DEFAULT 0,
+               size INTEGER NOT NULL,
+               read_at TEXT,
+                last_page INTEGER,
+                last_opened_at TEXT,
+               source_path TEXT,
                 highlight_status TEXT NOT NULL DEFAULT 'idle'
                     CHECK(highlight_status IN ('idle', 'queued', 'processing', 'ready', 'failed')),
                 highlight_error TEXT,
@@ -1298,6 +1360,8 @@ def init_database(app: Flask) -> None:
         if "read_at" not in document_columns:
             connection.execute("ALTER TABLE documents ADD COLUMN read_at TEXT")
         document_migrations = {
+            "last_page": "INTEGER",
+            "last_opened_at": "TEXT",
             "source_path": "TEXT",
             "highlight_status": "TEXT NOT NULL DEFAULT 'idle'",
             "highlight_error": "TEXT",
@@ -1509,6 +1573,109 @@ def word_count_label(value: int) -> str:
 
 def is_single_word(value: str) -> bool:
     return bool(WORD_RE.fullmatch(value)) and len(value) <= 100
+
+
+WIKTIONARY_PARTS_OF_SPEECH = {
+    "Noun": "сущ.",
+    "Verb": "гл.",
+    "Adjective": "прил.",
+    "Adverb": "нареч.",
+    "Pronoun": "мест.",
+    "Preposition": "предл.",
+    "Conjunction": "союз",
+    "Interjection": "межд.",
+    "Numeral": "числ.",
+    "Article": "артикль",
+    "Determiner": "опред.",
+    "Proper noun": "имя собств.",
+}
+
+
+def fetch_public_json(url: str, *, timeout: float = 2.0) -> Any:
+    request = Request(url, headers={"User-Agent": "Anki-Papers/1.0"})
+    with urlopen(request, timeout=timeout) as response:
+        if response.status != 200:
+            raise RuntimeError(f"Translation API returned HTTP {response.status}")
+        return json.load(response)
+
+
+def wiktionary_wikitext(page: str) -> str:
+    payload = fetch_public_json(
+        "https://en.wiktionary.org/w/api.php?action=parse&prop=wikitext"
+        f"&format=json&formatversion=2&page={quote(page, safe='')}",
+    )
+    return payload.get("parse", {}).get("wikitext", "")
+
+
+def parse_wiktionary_translation_groups(wikitext: str) -> list[dict[str, Any]]:
+    english = re.search(r"(?ms)^==English==\s*(.*?)(?=^==[^=]|\Z)", wikitext)
+    if english is None:
+        return []
+    groups: list[dict[str, Any]] = []
+    sections = list(re.finditer(r"(?m)^===([^=]+)===\s*$", english.group(1)))
+    for index, section in enumerate(sections):
+        part = section.group(1).strip()
+        label = WIKTIONARY_PARTS_OF_SPEECH.get(part)
+        if label is None:
+            continue
+        end = sections[index + 1].start() if index + 1 < len(sections) else len(english.group(1))
+        content = english.group(1)[section.end() : end]
+        translations = re.search(
+            r"(?ms)^====Translations====\s*$\s*(.*?)(?=^====|\Z)", content
+        )
+        if translations is None:
+            continue
+        values: list[str] = []
+        for value in re.findall(r"\{\{t\+?\|ru\|([^|}]+)", translations.group(1)):
+            cleaned = value.strip()
+            if cleaned and cleaned not in values:
+                values.append(cleaned)
+            if len(values) == 6:
+                break
+        if values:
+            groups.append({"part_of_speech": label, "translations": values})
+    return groups
+
+
+def wiktionary_translation_groups(word: str) -> list[dict[str, Any]]:
+    wikitext = wiktionary_wikitext(word)
+    if not isinstance(wikitext, str):
+        return []
+    groups = parse_wiktionary_translation_groups(wikitext)
+    if groups or "{{see translation subpage|" not in wikitext:
+        return groups
+    subpage = wiktionary_wikitext(f"{word}/translations")
+    return parse_wiktionary_translation_groups(subpage) if isinstance(subpage, str) else []
+
+
+def mymemory_translation_groups(word: str) -> list[dict[str, Any]]:
+    payload = fetch_public_json(
+        "https://api.mymemory.translated.net/get?"
+        f"q={quote(word, safe='')}&langpair=en%7Cru&mt=1",
+    )
+    values: list[str] = []
+    candidates = [payload.get("responseData", {}).get("translatedText", "")]
+    candidates.extend(match.get("translation", "") for match in payload.get("matches", []))
+    for value in candidates:
+        cleaned = html.unescape(str(value)).strip()
+        if cleaned and cleaned.casefold() != word.casefold() and cleaned not in values:
+            values.append(cleaned)
+        if len(values) == 6:
+            break
+    return [{"part_of_speech": "", "translations": values}] if values else []
+
+
+def quick_translation_groups(word: str) -> list[dict[str, Any]]:
+    try:
+        groups = wiktionary_translation_groups(word)
+    except (OSError, TimeoutError, ValueError):
+        groups = []
+    if groups:
+        return groups
+    try:
+        return mymemory_translation_groups(word)
+    except (OSError, TimeoutError, ValueError):
+        return []
 
 
 def clean_highlight_rects(value: Any) -> list[dict[str, float]]:
@@ -1748,6 +1915,59 @@ def enrich_highlight_row(
     if ready is None:
         raise RuntimeError("Highlight disappeared during enrichment")
     return ready
+
+
+def enqueue_reader_highlight_enrichment(
+    app: Flask,
+    *,
+    highlight_id: str,
+    user_id: int,
+    document_id: str,
+) -> None:
+    jobs: set[str] = app.extensions["reader_highlight_jobs"]
+    lock: threading.Lock = app.extensions["highlight_jobs_lock"]
+    with lock:
+        if highlight_id in jobs:
+            return
+        jobs.add(highlight_id)
+
+    def run() -> None:
+        database = sqlite3.connect(app.config["DATABASE"], timeout=30)
+        database.row_factory = sqlite3.Row
+        database.execute("PRAGMA foreign_keys = ON")
+        try:
+            row = database.execute(
+                """SELECT * FROM highlights
+                   WHERE id = ? AND user_id = ? AND document_id = ?""",
+                (highlight_id, user_id, document_id),
+            ).fetchone()
+            if row is None or row["status"] == "ready":
+                return
+            enrich_highlight_row(
+                app,
+                database,
+                row,
+                user_id=user_id,
+                document_id=document_id,
+            )
+        except MissingApiKeyError:
+            app.logger.error("OPENROUTER_API_KEY is missing; discarding highlight")
+            if "row" in locals() and row is not None:
+                delete_highlight_rows(database, [row], user_id=user_id)
+        except Exception:
+            app.logger.exception("Automatic highlight enrichment failed")
+            if "row" in locals() and row is not None:
+                delete_highlight_rows(database, [row], user_id=user_id)
+        finally:
+            database.close()
+            with lock:
+                jobs.discard(highlight_id)
+
+    if app.config["PROCESS_DOCUMENTS_INLINE"]:
+        run()
+    else:
+        executor: ThreadPoolExecutor = app.extensions["highlight_executor"]
+        executor.submit(run)
 
 
 def write_pdf_without_native_highlights(source: Path, destination: Path) -> None:

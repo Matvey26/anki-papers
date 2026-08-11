@@ -26,10 +26,11 @@ def csrf(response) -> str:
     return match.group(1).decode()
 
 
-def pdf_bytes() -> io.BytesIO:
+def pdf_bytes(page_count: int = 1) -> io.BytesIO:
     stream = io.BytesIO()
     writer = PdfWriter()
-    writer.add_blank_page(width=300, height=400)
+    for _ in range(page_count):
+        writer.add_blank_page(width=300, height=400)
     writer.write(stream)
     stream.seek(0)
     return stream
@@ -166,6 +167,25 @@ def test_register_upload_add_and_export_only_new_cards(
         assert database.execute("SELECT COUNT(*) FROM deleted_highlights").fetchone()[0] == 1
 
 
+def test_quick_translation_returns_part_of_speech_groups(tmp_path: Path, monkeypatch) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+    identify(client)
+    monkeypatch.setattr(
+        webapp_module,
+        "quick_translation_groups",
+        lambda word: [{"part_of_speech": "гл.", "translations": [word, "мчаться"]}],
+    )
+
+    response = client.get("/api/quick-translation?word=run")
+
+    assert response.status_code == 200
+    assert response.json == {
+        "groups": [{"part_of_speech": "гл.", "translations": ["run", "мчаться"]}]
+    }
+    assert client.get("/api/quick-translation?word=two%20words").status_code == 400
+
+
 def test_users_cannot_open_each_others_documents(tmp_path: Path) -> None:
     app = make_app(tmp_path)
     first = app.test_client()
@@ -294,7 +314,7 @@ def test_highlight_is_enriched_saved_and_downloaded_in_pdf(
     assert 'aria-label="Скачать PDF с хайлайтами"' in dashboard.text
     assert ">Открыть<" not in dashboard.text
     assert ">Отметить<" not in dashboard.text
-    assert ">Прочитано<" in dashboard.text
+    assert ">Прочитано<" not in dashboard.text
     download = client.get(f"/article/{document_id}/highlighted.pdf")
     assert download.status_code == 200
     assert download.headers["Content-Disposition"].startswith("attachment;")
@@ -609,7 +629,50 @@ def test_existing_database_gets_read_at_migration(tmp_path: Path) -> None:
     make_app(tmp_path)
     with sqlite3.connect(tmp_path / "app.sqlite3") as database:
         columns = {row[1] for row in database.execute("PRAGMA table_info(documents)")}
-    assert "read_at" in columns
+    assert {"read_at", "last_page", "last_opened_at"} <= columns
+
+
+def test_reader_saves_progress_restores_page_and_moves_article_to_top(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+    dashboard = identify(client)
+    for filename in ("first.pdf", "second.pdf"):
+        uploaded = client.post(
+            "/upload/pdf",
+            data={"csrf_token": csrf(dashboard), "file": (pdf_bytes(2), filename)},
+            content_type="multipart/form-data",
+        )
+        dashboard = client.get("/dashboard")
+        assert uploaded.status_code == 302
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        rows = database.execute(
+            "SELECT id, name FROM documents WHERE kind = 'pdf' ORDER BY name"
+        ).fetchall()
+    first_id, second_id = (rows[0][0], rows[1][0])
+
+    first_reader = client.get(f"/article/{first_id}")
+    progress = client.post(
+        f"/api/article/{first_id}/progress",
+        json={"page": 2},
+        headers={"X-CSRF-Token": csrf(first_reader)},
+    )
+    assert progress.json == {"page": 2}
+    restored_reader = client.get(f"/article/{first_id}")
+    assert 'data-initial-page="2"' in restored_reader.text
+    assert 'id="reader-completion"' in restored_reader.text
+    assert 'role="switch"' in restored_reader.text
+
+    second_reader = client.get(f"/article/{second_id}")
+    dashboard = client.get("/dashboard")
+    assert dashboard.text.index("second.pdf") < dashboard.text.index("first.pdf")
+    assert "Стр. 2 из 2 · 100%" in dashboard.text
+
+    marked_read = client.post(
+        f"/article/{first_id}/read",
+        json={"read": "1"},
+        headers={"X-CSRF-Token": csrf(second_reader)},
+    )
+    assert marked_read.json == {"read": True}
 
 
 def test_legacy_card_schema_migration_preserves_data_and_note_link_fk(

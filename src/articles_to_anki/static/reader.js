@@ -7,7 +7,11 @@ const popover = document.querySelector("#highlight-popover");
 const popoverWord = document.querySelector("#highlight-word");
 const popoverTranslation = document.querySelector("#highlight-translation");
 const highlightDelete = document.querySelector("#highlight-delete");
+const selectionPopover = document.querySelector("#selection-popover");
+const selectionTranslation = document.querySelector("#selection-translation");
 const selectionAction = document.querySelector("#selection-action");
+const readToggle = document.querySelector("#read-toggle");
+const readToggleLabel = document.querySelector("#read-toggle-label");
 const pageStates = new Map();
 const highlights = new Map();
 const highlightSignatures = new Set();
@@ -18,8 +22,13 @@ let pdfDocument = null;
 let selectionTimer = null;
 let qualityTimer = null;
 let processingTimer = null;
+let progressTimer = null;
+let pendingProgressPage = null;
+let savedProgressPage = null;
+let savingProgress = false;
 let openHighlightId = null;
 let chosenSelection = null;
+let selectionAnchor = null;
 
 pdfjs.GlobalWorkerOptions.workerSrc = workspace.dataset.workerUrl;
 
@@ -101,6 +110,82 @@ async function openPdf() {
   status.hidden = true;
   const targetPage = viewer.querySelector(`[data-page="${initialPage}"]`);
   targetPage?.scrollIntoView({block: "start"});
+  window.setTimeout(scheduleProgressFromViewport, 100);
+}
+
+function scheduleProgressFromViewport() {
+  window.clearTimeout(progressTimer);
+  progressTimer = window.setTimeout(() => {
+    const viewportMiddle = window.innerHeight / 2;
+    let nearestPage = null;
+    let nearestDistance = Infinity;
+    for (const state of pageStates.values()) {
+      const bounds = state.shell.getBoundingClientRect();
+      if (bounds.bottom < 0 || bounds.top > window.innerHeight) continue;
+      const distance = Math.abs((bounds.top + bounds.bottom) / 2 - viewportMiddle);
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestPage = state.pageNumber;
+      }
+    }
+    if (nearestPage !== null) queueProgressSave(nearestPage);
+  }, 350);
+}
+
+function queueProgressSave(pageNumber) {
+  pendingProgressPage = pageNumber;
+  if (!savingProgress) void saveProgress();
+}
+
+async function saveProgress() {
+  if (savingProgress || pendingProgressPage === null) return;
+  const pageNumber = pendingProgressPage;
+  if (pageNumber === savedProgressPage) return;
+  savingProgress = true;
+  try {
+    const response = await fetch(workspace.dataset.progressUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": workspace.dataset.csrfToken,
+      },
+      body: JSON.stringify({page: pageNumber}),
+    });
+    if (!response.ok) throw new Error("Не удалось сохранить место чтения.");
+    savedProgressPage = pageNumber;
+  } catch (error) {
+    console.error(error);
+    if (pendingProgressPage === pageNumber) pendingProgressPage = null;
+  } finally {
+    savingProgress = false;
+    if (pendingProgressPage !== savedProgressPage) void saveProgress();
+  }
+}
+
+async function saveReadState() {
+  if (!readToggle) return;
+  const wasRead = !readToggle.checked;
+  readToggle.disabled = true;
+  try {
+    const response = await fetch(workspace.dataset.readUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": workspace.dataset.csrfToken,
+      },
+      body: JSON.stringify({read: readToggle.checked ? "1" : "0"}),
+    });
+    if (!response.ok) throw new Error("Не удалось изменить статус статьи.");
+    const result = await response.json();
+    readToggle.checked = result.read;
+    readToggleLabel.textContent = result.read ? "Прочитано" : "Не прочитано";
+  } catch (error) {
+    console.error(error);
+    readToggle.checked = wasRead;
+    readToggleLabel.textContent = wasRead ? "Прочитано" : "Не прочитано";
+  } finally {
+    readToggle.disabled = false;
+  }
 }
 
 async function renderPage(pageNumber) {
@@ -244,26 +329,90 @@ function captureSelection() {
   }
   chosenSelection = provisional;
   selectionAction.textContent = `Добавить «${target}»`;
-  selectionAction.hidden = false;
-  positionSelectionAction(range);
+  selectionTranslation.textContent = "Ищем быстрый перевод…";
+  selectionPopover.hidden = false;
+  selectionAnchor = rectFromRange(range);
+  positionOverlay(selectionPopover, selectionAnchor);
+  void loadQuickTranslation(provisional);
 }
 
-function positionSelectionAction(range) {
-  const anchor = range.getBoundingClientRect();
+function rectFromRange(range) {
+  const rect = range.getBoundingClientRect();
+  return {left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width};
+}
+
+function visualBounds() {
+  const viewport = window.visualViewport;
+  const left = viewport?.offsetLeft || 0;
+  const top = viewport?.offsetTop || 0;
+  return {
+    left,
+    top,
+    width: viewport?.width || window.innerWidth,
+    height: viewport?.height || window.innerHeight,
+  };
+}
+
+function updateOverlayScale(element) {
+  const zoom = window.visualViewport?.scale || 1;
+  element.style.setProperty("--reader-control-scale", String(Math.max(0.6, 1 / zoom)));
+}
+
+function positionOverlay(element, anchor, centered = false) {
+  if (!anchor || element.hidden) return;
+  const bounds = visualBounds();
+  const gap = 10;
+  updateOverlayScale(element);
+  element.style.maxWidth = `${Math.max(150, bounds.width - gap * 2)}px`;
+  const width = element.offsetWidth;
+  const height = element.offsetHeight;
+  const preferredLeft = centered
+    ? anchor.left + anchor.width / 2 - width / 2
+    : anchor.left;
   const left = Math.min(
-    window.innerWidth - selectionAction.offsetWidth - 10,
-    Math.max(10, anchor.left + anchor.width / 2 - selectionAction.offsetWidth / 2),
+    bounds.left + bounds.width - width - gap,
+    Math.max(bounds.left + gap, preferredLeft),
   );
-  const top = anchor.top > selectionAction.offsetHeight + 14
-    ? anchor.top - selectionAction.offsetHeight - 7
-    : anchor.bottom + 7;
-  selectionAction.style.left = `${left}px`;
-  selectionAction.style.top = `${Math.max(10, top)}px`;
+  const above = anchor.top - height - 8;
+  const below = anchor.bottom + 8;
+  const top = above >= bounds.top + gap
+    ? above
+    : Math.min(bounds.top + bounds.height - height - gap, Math.max(bounds.top + gap, below));
+  element.style.left = `${left}px`;
+  element.style.top = `${top}px`;
 }
 
 function hideSelectionAction() {
-  selectionAction.hidden = true;
+  selectionPopover.hidden = true;
   chosenSelection = null;
+  selectionAnchor = null;
+}
+
+async function loadQuickTranslation(selection) {
+  try {
+    const url = new URL(workspace.dataset.quickTranslationUrl, window.location.origin);
+    url.searchParams.set("word", selection.target);
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("Быстрый перевод недоступен.");
+    const result = await response.json();
+    selection.quickTranslation = result.groups || [];
+    if (chosenSelection !== selection || selectionPopover.hidden) return;
+    selectionTranslation.textContent = formatQuickTranslation(selection.quickTranslation);
+    positionOverlay(selectionPopover, selectionAnchor, true);
+  } catch (error) {
+    if (chosenSelection === selection && !selectionPopover.hidden) {
+      selectionTranslation.textContent = "Быстрый перевод недоступен.";
+      positionOverlay(selectionPopover, selectionAnchor, true);
+    }
+  }
+}
+
+function formatQuickTranslation(groups) {
+  const text = groups
+    .filter((group) => Array.isArray(group.translations) && group.translations.length)
+    .map((group) => `${group.part_of_speech ? `${group.part_of_speech}: ` : ""}${group.translations.join(", ")}`)
+    .join(" · ");
+  return text || "Быстрый перевод не найден.";
 }
 
 selectionAction.addEventListener("pointerdown", (event) => {
@@ -389,8 +538,8 @@ async function saveHighlight(highlight) {
         highlightSignatures.delete(highlightSignature(highlight));
         if (openHighlightId === highlight.id) openHighlightId = result.highlight.id;
       }
-      activeHighlight = result.highlight;
-      rememberHighlight(result.highlight);
+      activeHighlight = {...result.highlight, quickTranslation: highlight.quickTranslation || []};
+      rememberHighlight(activeHighlight);
     }
     if (!response.ok) throw new Error(result.error || "Автоперевод недоступен.");
   } catch (error) {
@@ -404,6 +553,7 @@ async function saveHighlight(highlight) {
   } finally {
     savingHighlights.delete(highlight.id);
     drawPageHighlights(highlight.page);
+    scheduleProcessingPoll(null);
   }
 }
 
@@ -419,19 +569,21 @@ function syncStoredHighlights(payload) {
       highlightSignatures.delete(highlightSignature(highlight));
     }
   }
-  for (const highlight of payload.highlights) rememberHighlight(highlight);
-  for (const pageNumber of pageStates.keys()) drawPageHighlights(pageNumber);
-  for (const highlight of highlights.values()) {
-    if (highlight.status === "pending" && highlight.source !== "pdf_import") {
-      void saveHighlight(highlight);
-    }
+  for (const highlight of payload.highlights) {
+    const previous = highlights.get(highlight.id);
+    if (previous?.quickTranslation) highlight.quickTranslation = previous.quickTranslation;
+    rememberHighlight(highlight);
   }
+  for (const pageNumber of pageStates.keys()) drawPageHighlights(pageNumber);
   scheduleProcessingPoll(payload.processing_status);
 }
 
 function scheduleProcessingPoll(processingStatus) {
   window.clearTimeout(processingTimer);
-  if (!["queued", "processing"].includes(processingStatus)) return;
+  const hasPendingReaderHighlight = [...highlights.values()].some(
+    (highlight) => highlight.status === "pending" && highlight.source !== "pdf_import",
+  );
+  if (!["queued", "processing"].includes(processingStatus) && !hasPendingReaderHighlight) return;
   processingTimer = window.setTimeout(async () => {
     try {
       const response = await fetch(workspace.dataset.highlightsUrl);
@@ -514,16 +666,7 @@ function showTranslation(event, highlight) {
   popoverWord.textContent = highlight.target;
   renderPopoverText(highlight);
   popover.hidden = false;
-  const anchor = event.currentTarget.getBoundingClientRect();
-  const left = Math.min(
-    window.innerWidth - popover.offsetWidth - 10,
-    Math.max(10, anchor.left),
-  );
-  const top = anchor.top > popover.offsetHeight + 16
-    ? anchor.top - popover.offsetHeight - 8
-    : anchor.bottom + 8;
-  popover.style.left = `${left}px`;
-  popover.style.top = `${Math.max(10, top)}px`;
+  positionOverlay(popover, event.currentTarget.getBoundingClientRect());
 }
 
 function renderPopoverText(highlight) {
@@ -532,7 +675,10 @@ function renderPopoverText(highlight) {
   } else if (highlight.status === "failed") {
     popoverTranslation.textContent = highlight.error || "Перевод недоступен.";
   } else {
-    popoverTranslation.textContent = "Перевод готовится…";
+    const quick = formatQuickTranslation(highlight.quickTranslation || []);
+    popoverTranslation.textContent = quick === "Быстрый перевод не найден."
+      ? "Перевод готовится…"
+      : `${quick} · Уточняем по контексту…`;
   }
 }
 
@@ -593,7 +739,23 @@ highlightDelete.addEventListener("click", (event) => {
 document.addEventListener("pointerdown", (event) => {
   if (!event.target.closest?.(".selection-action")) hideSelectionAction();
 });
+function repositionOpenOverlays() {
+  if (!selectionPopover.hidden) positionOverlay(selectionPopover, selectionAnchor, true);
+  if (!popover.hidden && openHighlightId) {
+    const highlight = highlights.get(openHighlightId);
+    const page = highlight && pageStates.get(highlight.page);
+    const anchor = page?.shell.querySelector(".word-highlight");
+    if (anchor) positionOverlay(popover, anchor.getBoundingClientRect());
+  }
+}
+
+window.visualViewport?.addEventListener("resize", repositionOpenOverlays, {passive: true});
+window.visualViewport?.addEventListener("scroll", repositionOpenOverlays, {passive: true});
 window.addEventListener("scroll", () => {
   hideTranslation();
   hideSelectionAction();
+  scheduleProgressFromViewport();
 }, {passive: true});
+readToggle?.addEventListener("change", () => {
+  void saveReadState();
+});

@@ -9,6 +9,9 @@
   class="pdf-workspace"
   data-pdf-url="{{ url_for('pdf_file', document_id=document['id']) }}"
   data-highlights-url="{{ url_for('article_highlights', document_id=document['id']) }}"
+  data-progress-url="{{ url_for('save_article_progress', document_id=document['id']) }}"
+  data-read-url="{{ url_for('mark_article_read', document_id=document['id']) }}"
+  data-quick-translation-url="{{ url_for('quick_translation') }}"
   data-worker-url="{{ url_for('static', filename='vendor/pdfjs/pdf.worker.min.mjs') }}"
   data-initial-page="{{ page_number }}"
   data-csrf-token="{{ csrf_token() }}"
@@ -17,7 +20,19 @@
   <a class="viewer-back" href="{{ url_for('dashboard') }}" aria-label="Вернуться в библиотеку">← Библиотека</a>
   <div id="pdf-status" class="pdf-status">Открываем PDF…</div>
   <div id="pdf-viewer" class="pdf-viewer" aria-label="{{ document['name'] }}"></div>
-  <button id="selection-action" class="selection-action" type="button" hidden></button>
+  <section id="reader-completion" class="reader-completion" aria-label="Статус прочтения">
+    <p>Последняя страница</p>
+    <h1>Прочитано</h1>
+    <label class="read-switch">
+      <input id="read-toggle" type="checkbox" role="switch" {% if document['read_at'] %}checked{% endif %}>
+      <span class="read-switch-track" aria-hidden="true"><span class="read-switch-knob"></span></span>
+      <span id="read-toggle-label">{{ 'Прочитано' if document['read_at'] else 'Не прочитано' }}</span>
+    </label>
+  </section>
+  <div id="selection-popover" class="selection-popover" role="status" hidden>
+    <span id="selection-translation">Ищем быстрый перевод…</span>
+    <button id="selection-action" class="selection-action" type="button"></button>
+  </div>
   <div id="highlight-popover" class="highlight-popover" role="dialog" aria-label="Перевод выделения" hidden>
     <strong id="highlight-word"></strong>
     <span id="highlight-translation"></span>

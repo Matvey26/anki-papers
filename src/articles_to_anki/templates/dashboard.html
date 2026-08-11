@@ -59,15 +59,15 @@
             <span class="article-title">
               <strong>{{ document['name'] }}</strong>
               <small>{{ document['page_count'] }} стр. · {{ (document['size'] / 1024 / 1024)|round(1) }} МБ · {{ word_count_label(document['highlight_count']) }}{% if document['read_at'] %} · Прочитано{% endif %}</small>
+              {% if not document['read_at'] and document['last_opened_at'] %}
+                {% set progress = ((document['last_page'] or 1) / document['page_count'] * 100)|round|int %}
+                <span class="article-progress">
+                  <progress class="article-progress-track" value="{{ progress }}" max="100">{{ progress }}%</progress>
+                  <small>Стр. {{ document['last_page'] or 1 }} из {{ document['page_count'] }} · {{ progress }}%</small>
+                </span>
+              {% endif %}
             </span>
           </a>
-          <div class="article-actions">
-            <form action="{{ url_for('mark_article_read', document_id=document['id']) }}" method="post">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-              <input type="hidden" name="read" value="{{ '0' if document['read_at'] else '1' }}">
-              <button class="read-button">{{ 'Вернуть' if document['read_at'] else 'Прочитано' }}</button>
-            </form>
-          </div>
           <div class="article-icon-actions">
             <a class="round-icon-button" href="{{ url_for('highlighted_pdf', document_id=document['id']) }}" aria-label="Скачать PDF с хайлайтами" title="Скачать PDF с хайлайтами">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 18v2h14v-2"/></svg>
