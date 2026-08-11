@@ -214,6 +214,8 @@ class OfficialAnkiAdapter:
                 else:
                     existing += 1
                 if note is not None:
+                    if add:
+                        self._ensure_sync_tags(collection, note, card["id"], direction)
                     used_note_ids.add(int(note.id))
                     links.append(
                         {
@@ -252,6 +254,16 @@ class OfficialAnkiAdapter:
             if self._legacy_matches(note, card, direction):
                 return note
         return None
+
+    @staticmethod
+    def _ensure_sync_tags(collection: Any, note: Any, card_id: str, direction: str) -> None:
+        """Make a reconciled legacy note identifiable without changing its content or schedule."""
+        required = (f"anki_papers::{card_id}", f"direction::{direction}")
+        current = list(note.tags)
+        if all(tag in current for tag in required):
+            return
+        note.tags = [*current, *(tag for tag in required if tag not in current)]
+        collection.update_note(note)
 
     @staticmethod
     def _legacy_matches(note: Any, card: dict[str, Any], direction: str) -> bool:

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from anki.collection import Collection
+from anki.decks import DeckId
 from anki_papers_sync_worker.official import OfficialAnkiAdapter
 
 
@@ -67,4 +68,25 @@ def test_managed_notetype_does_not_depend_on_english_basic_name(tmp_path: Path) 
     assert collection.models.by_name("Basic") is None
     assert collection.models.by_name("Anki Papers") is not None
     assert note.fields == ["A <b>robust</b> result.", "• надёжный"]
+    collection.close()
+
+
+def test_reconciled_legacy_note_gets_stable_sync_tags(tmp_path: Path) -> None:
+    collection = Collection(str(tmp_path / "collection.anki2"))
+    legacy = collection.new_note(collection.models.by_name("Basic"))
+    legacy["Front"] = "Old front"
+    legacy["Back"] = "Old back"
+    legacy.tags = ["article::old", "card::meaning"]
+    collection.add_note(legacy, DeckId(1))
+
+    OfficialAnkiAdapter._ensure_sync_tags(collection, legacy, "site-card-1", "meaning")
+    OfficialAnkiAdapter._ensure_sync_tags(collection, legacy, "site-card-1", "meaning")
+
+    reloaded = collection.get_note(legacy.id)
+    assert reloaded.tags == [
+        "anki_papers::site-card-1",
+        "article::old",
+        "card::meaning",
+        "direction::meaning",
+    ]
     collection.close()
