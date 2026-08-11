@@ -111,16 +111,59 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app.extensions["highlight_resume_done"] = False
 
     app.teardown_appcontext(close_database)
-    app.context_processor(
-        lambda: {
+    @app.context_processor
+    def template_context() -> dict[str, Any]:
+        context: dict[str, Any] = {
             "csrf_token": csrf_token,
             "word_count_label": word_count_label,
             "format_sync_time": format_sync_time,
             "sync_error_text": sync_error_text,
             "sync_job_reason": sync_job_reason,
             "sync_job_state": sync_job_state,
+            "header_sync": None,
         }
-    )
+        user_id = session.get("user_id")
+        if user_id is None:
+            return context
+
+        database = get_database()
+        account = database.execute(
+            "SELECT * FROM anki_accounts WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        active_job = database.execute(
+            """SELECT * FROM sync_jobs
+               WHERE user_id = ? AND state IN ('queued', 'running')
+               ORDER BY created_at LIMIT 1""",
+            (user_id,),
+        ).fetchone()
+        latest_job = database.execute(
+            "SELECT * FROM sync_jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        pending_words = database.execute(
+            "SELECT COUNT(*) FROM cards WHERE user_id = ? AND anki_synced_at IS NULL",
+            (user_id,),
+        ).fetchone()[0]
+        status = build_sync_status(account, active_job, latest_job, pending_words)
+        state = account["state"] if account else None
+
+        header_sync: dict[str, Any] = {
+            "tone": status["tone"],
+            "title": status["title"],
+            "active": status["active"],
+        }
+        if status["active"]:
+            header_sync.update(kind="disabled", label="Синхронизация…")
+        elif state in {"connected", "error"}:
+            header_sync.update(kind="submit", label="Синхронизировать")
+        elif state == "awaiting_deck":
+            header_sync.update(kind="link", label="Выбрать колоду")
+        elif state == "needs_reconnect":
+            header_sync.update(kind="link", label="Исправить синхронизацию")
+        else:
+            header_sync.update(kind="link", label="Подключить AnkiWeb")
+        context["header_sync"] = header_sync
+        return context
 
     @app.before_request
     def resume_interrupted_highlight_jobs() -> None:
@@ -531,7 +574,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             enqueue_sync_job(database, session["user_id"], "manual", delay_seconds=0)
             database.commit()
             flash("Синхронизация поставлена в очередь.", "success")
-        return redirect(url_for("settings"))
+        destination = request.form.get("next")
+        if destination not in {url_for("dashboard"), url_for("settings")}:
+            destination = url_for("settings")
+        return redirect(destination)
 
     @app.post("/settings/anki/disconnect")
     @login_required

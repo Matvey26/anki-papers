@@ -3,6 +3,7 @@
 {% block content %}
 <header class="page-heading">
   <div><h1>Настройки</h1><p>Состояние AnkiWeb, целевая колода и безопасность аккаунта.</p></div>
+  <p class="settings-profile">Профиль: {{ session.get('username') }}</p>
 </header>
 
 <section class="settings-section sync-settings">
@@ -120,4 +121,3 @@
   </details>
 </section>
 {% endblock %}
-{% block scripts %}<script src="{{ url_for('static', filename='sync-status.js') }}"></script>{% endblock %}

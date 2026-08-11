@@ -12,41 +12,6 @@
   </form>
 </header>
 
-<section class="sync-overview sync-tone-{{ sync_status['tone'] }}" {% if sync_status['active'] %}data-sync-auto-refresh{% endif %}>
-  <div class="sync-overview-main">
-    <div class="sync-status-heading">
-      <span class="sync-status-dot" aria-hidden="true"></span>
-      <div>
-        <span class="eyebrow">AnkiWeb</span>
-        <h2>{{ sync_status['title'] }}</h2>
-      </div>
-    </div>
-    <p>{{ sync_status['message'] }}</p>
-    {% if sync_status.get('error_detail') %}<p class="sync-error-detail">{{ sync_status['error_detail'] }}</p>{% endif %}
-
-    <div class="sync-progress-label">
-      <span>{{ sync_status['stage'] }}</span>
-      {% if sync_status['active'] %}<span>Проверяем каждые 4 секунды</span>{% endif %}
-    </div>
-    <progress class="sync-progress-track" aria-label="Этап синхронизации" value="{{ sync_status['progress'] }}" max="100">{{ sync_status['progress'] }}%</progress>
-
-    {% if sync_status.get('selected_deck') or sync_status.get('last_success_at') %}
-      <dl class="sync-meta">
-        {% if sync_status.get('selected_deck') %}<div><dt>Колода</dt><dd>{{ sync_status['selected_deck'] }}</dd></div>{% endif %}
-        {% if sync_status.get('last_success_at') %}<div><dt>Последняя синхронизация</dt><dd>{{ sync_status['last_success_label'] }}</dd></div>{% endif %}
-      </dl>
-    {% endif %}
-  </div>
-  <div class="sync-overview-action">
-    <a class="{{ 'primary' if sync_status['tone'] in ('error', 'action', 'neutral') else 'secondary' }}" href="{{ url_for('settings') }}">
-      {% if not anki_account %}Подключить AnkiWeb
-      {% elif anki_account['state'] == 'awaiting_deck' %}Выбрать колоду
-      {% elif anki_account['state'] in ('error', 'needs_reconnect') %}Исправить
-      {% else %}Подробнее{% endif %}
-    </a>
-  </div>
-</section>
-
 <section>
   <div class="section-heading">
     <div><h2>Статьи</h2><p>Число рядом с PDF — сохранённые слова из этой статьи.</p></div>
@@ -128,5 +93,4 @@
 {% endblock %}
 {% block scripts %}
 <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
-<script src="{{ url_for('static', filename='sync-status.js') }}"></script>
 {% endblock %}

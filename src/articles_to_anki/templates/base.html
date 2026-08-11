@@ -14,7 +14,17 @@
       <nav>
         <a href="{{ url_for('dashboard') }}">Библиотека</a>
         <a href="{{ url_for('settings') }}">Настройки</a>
-        <span>{{ session.get('username') }}</span>
+        {% if header_sync['kind'] == 'submit' %}
+          <form action="{{ url_for('sync_ankiweb_now') }}" method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="next" value="{{ url_for('dashboard') }}">
+            <button class="sync-button sync-tone-{{ header_sync['tone'] }}" title="{{ header_sync['title'] }}">{{ header_sync['label'] }}</button>
+          </form>
+        {% elif header_sync['kind'] == 'disabled' %}
+          <button class="sync-button sync-tone-{{ header_sync['tone'] }}" type="button" title="{{ header_sync['title'] }}" disabled data-sync-auto-refresh>{{ header_sync['label'] }}</button>
+        {% else %}
+          <a class="sync-button sync-tone-{{ header_sync['tone'] }}" href="{{ url_for('settings') }}" title="{{ header_sync['title'] }}">{{ header_sync['label'] }}</a>
+        {% endif %}
         <form action="{{ url_for('logout') }}" method="post">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="link-button">Выйти</button>
@@ -32,5 +42,6 @@
     {% block content %}{% endblock %}
   </main>
   {% block scripts %}{% endblock %}
+  {% if session.get('user_id') %}<script src="{{ url_for('static', filename='sync-status.js') }}"></script>{% endif %}
 </body>
 </html>

@@ -167,6 +167,40 @@ def test_register_upload_add_and_export_only_new_cards(
         assert database.execute("SELECT COUNT(*) FROM deleted_highlights").fetchone()[0] == 1
 
 
+def test_sync_moves_from_library_to_header_and_hides_profile_name(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+    dashboard = identify(client, "library-reader")
+
+    assert 'class="sync-overview' not in dashboard.text
+    assert "library-reader" not in dashboard.text
+    assert ">Подключить AnkiWeb<" in dashboard.text
+
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        user_id = database.execute(
+            "SELECT id FROM users WHERE username = 'library-reader'"
+        ).fetchone()[0]
+        database.execute(
+            "INSERT INTO anki_accounts (user_id, state, updated_at) VALUES (?, 'connected', '2026-08-11T00:00:00+00:00')",
+            (user_id,),
+        )
+        database.commit()
+
+    dashboard = client.get("/dashboard")
+    assert ">Синхронизировать<" in dashboard.text
+    queued = client.post(
+        "/settings/anki/sync",
+        data={"csrf_token": csrf(dashboard), "next": "/dashboard"},
+        follow_redirects=True,
+    )
+    assert "Синхронизация поставлена в очередь" in queued.text
+    assert ">Синхронизация…<" in queued.text
+    assert "library-reader" not in queued.text
+
+    settings = client.get("/settings")
+    assert "Профиль: library-reader" in settings.text
+
+
 def test_quick_translation_returns_part_of_speech_groups(tmp_path: Path, monkeypatch) -> None:
     app = make_app(tmp_path)
     client = app.test_client()

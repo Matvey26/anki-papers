@@ -21,8 +21,13 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .topbar { height: 58px; padding: 0 max(20px, calc((100vw - 980px) / 2)); display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); background: var(--surface); }
 .brand { color: var(--text); font-size: 18px; font-weight: 750; }
 .topbar nav { display: flex; align-items: center; gap: 18px; }
-.topbar nav span { color: var(--muted); }
 .topbar form { margin: 0; }
+.sync-button { min-height: 34px; padding: 6px 10px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid transparent; border-radius: 7px; font-size: 13px; font-weight: 700; white-space: nowrap; }
+.sync-button.sync-tone-neutral { border-color: var(--border); background: #f4f4f1; color: var(--muted); }
+.sync-button.sync-tone-success { border-color: #badbc5; background: #e9f5ed; color: var(--success); }
+.sync-button.sync-tone-progress { background: var(--accent); color: white; }
+.sync-button.sync-tone-action { border-color: #ead3ad; background: #fff2df; color: var(--warning); }
+.sync-button.sync-tone-error { background: var(--danger); color: white; }
 .page { width: min(980px, calc(100% - 32px)); margin: 36px auto 80px; }
 .page h1 { margin: 0; font-size: 32px; line-height: 1.2; }
 .page h2 { margin: 38px 0 14px; font-size: 20px; }
@@ -149,7 +154,8 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 @media (max-width: 700px) {
   .page { width: min(100% - 22px, 980px); margin-top: 22px; }
   .topbar { padding: 0 12px; }
-  .topbar nav > span { display: none; }
+  .topbar nav { gap: 10px; }
+  .sync-button { padding: 6px 8px; font-size: 12px; }
   .page-heading { align-items: start; }
   .page h1 { font-size: 27px; }
   .summary div { padding: 12px; text-align: center; }
@@ -169,6 +175,7 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 }
 .auth-links { display: flex; gap: 1rem; flex-wrap: wrap; }
 .settings-section { margin: 2rem 0; }
+.settings-profile { margin: 0; color: var(--muted); font-size: 13px; }
 .settings-form { display: grid; gap: 1rem; max-width: 36rem; }
 .settings-form label, .deck-action-form label { display: grid; gap: .4rem; font-size: 13px; font-weight: 680; }
 .settings-form input, .settings-form select, .deck-action-form select { width: 100%; min-height: 42px; padding: 8px 10px; border: 1px solid #c8cac3; border-radius: 7px; background: var(--surface); color: var(--text); }
