@@ -73,6 +73,8 @@ from .sync_ui import (
 
 USERNAME_RE = re.compile(r"^[\w.\-]{3,32}$", re.UNICODE)
 WORD_RE = re.compile(r"^[\w]+(?:['’\-][\w]+)*$", re.UNICODE)
+HYPHENATED_LINE_BREAK_RE = re.compile(r"[-\u2010\u00ad]\s*\r?\n\s*")
+MAX_TARGET_WORDS = 3
 
 
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
@@ -659,9 +661,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @app.get("/api/quick-translation")
     @login_required
     def quick_translation() -> Response:
-        word = request.args.get("word", "").strip()
-        if not is_single_word(word):
-            return jsonify(error="Нужно указать одно слово."), 400
+        word = normalize_selected_text(request.args.get("word", ""))
+        if not is_selectable_target(word):
+            return jsonify(error="Нужно указать до трёх слов."), 400
         cache: dict[str, tuple[float, list[dict[str, Any]]]] = app.extensions[
             "quick_translation_cache"
         ]
@@ -815,7 +817,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 raise ValueError
         except ValueError:
             return jsonify(error="Некорректный ID выделения."), 400
-        target = str(payload.get("target", "")).strip()
+        target = normalize_selected_text(str(payload.get("target", "")))
         sentence = str(payload.get("sentence", "")).strip()
         page_number = payload.get("page")
         try:
@@ -823,8 +825,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             rects = clean_highlight_rects(payload.get("rects"))
         except (KeyError, OverflowError, TypeError, ValueError):
             return jsonify(error="Некорректные координаты выделения."), 400
-        if not is_single_word(target) or not sentence or len(sentence) > 1200:
-            return jsonify(error="Нужно выделить одно слово."), 400
+        if not is_selectable_target(target) or not sentence or len(sentence) > 1200:
+            return jsonify(error="Нужно выделить до трёх слов."), 400
         if page_number < 1 or page_number > document["page_count"]:
             return jsonify(error="Некорректная страница."), 400
 
@@ -1617,8 +1619,17 @@ def word_count_label(value: int) -> str:
     return f"{value} {noun}"
 
 
-def is_single_word(value: str) -> bool:
-    return bool(WORD_RE.fullmatch(value)) and len(value) <= 100
+def normalize_selected_text(value: str) -> str:
+    return " ".join(HYPHENATED_LINE_BREAK_RE.sub("", value).split())
+
+
+def is_selectable_target(value: str) -> bool:
+    words = value.split()
+    return (
+        1 <= len(words) <= MAX_TARGET_WORDS
+        and all(WORD_RE.fullmatch(word) for word in words)
+        and len(value) <= 100
+    )
 
 
 WIKTIONARY_PARTS_OF_SPEECH = {

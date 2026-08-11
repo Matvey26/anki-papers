@@ -298,8 +298,8 @@ function scheduleSelectionCapture(delay) {
 
 function captureSelection() {
   const selection = window.getSelection();
-  const target = selection?.toString().trim() || "";
-  if (!selection || selection.rangeCount !== 1 || selection.isCollapsed || !isSingleWord(target)) return;
+  const target = normalizeSelectedText(selection?.toString() || "");
+  if (!selection || selection.rangeCount !== 1 || selection.isCollapsed || !isSelectableTarget(target)) return;
   const range = selection.getRangeAt(0);
   const node = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
     ? range.commonAncestorContainer
@@ -491,8 +491,18 @@ function selectionHint(range, shell) {
   return 0;
 }
 
-function isSingleWord(value) {
-  return /^[\p{L}\p{N}_]+(?:['’\-][\p{L}\p{N}_]+)*$/u.test(value) && value.length <= 100;
+function normalizeSelectedText(value) {
+  return value
+    .replace(/[-\u2010\u00ad]\s*\r?\n\s*/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isSelectableTarget(value) {
+  const words = value.split(" ");
+  return words.length <= 3
+    && words.every((word) => /^[\p{L}\p{N}_]+(?:['’\-][\p{L}\p{N}_]+)*$/u.test(word))
+    && value.length <= 100;
 }
 
 function findSentence(text, target, hint = 0) {

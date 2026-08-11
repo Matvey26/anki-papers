@@ -217,7 +217,17 @@ def test_quick_translation_returns_part_of_speech_groups(tmp_path: Path, monkeyp
     assert response.json == {
         "groups": [{"part_of_speech": "гл.", "translations": ["run", "мчаться"]}]
     }
-    assert client.get("/api/quick-translation?word=two%20words").status_code == 400
+    assert client.get("/api/quick-translation?word=two%20words").status_code == 200
+    assert client.get("/api/quick-translation?word=one%20two%20three").status_code == 200
+    assert client.get("/api/quick-translation?word=one%20two%20three%20four").status_code == 400
+
+
+def test_selected_text_normalizes_line_break_hyphens_and_keeps_regular_hyphens() -> None:
+    assert webapp_module.normalize_selected_text("inter-\nnational") == "international"
+    assert webapp_module.normalize_selected_text("well-known") == "well-known"
+    assert webapp_module.is_selectable_target("rule out")
+    assert webapp_module.is_selectable_target("one two three")
+    assert not webapp_module.is_selectable_target("one two three four")
 
 
 def test_users_cannot_open_each_others_documents(tmp_path: Path) -> None:
