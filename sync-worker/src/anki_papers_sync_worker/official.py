@@ -52,6 +52,7 @@ class OfficialAnkiAdapter:
             collection = Collection(str(collection_path))
             auth = collection.sync_login(username, password, endpoint=self.endpoint)
             output = collection.sync_collection(auth, sync_media=False)
+            self._apply_new_endpoint(auth, output)
             if output.required == output.FULL_UPLOAD:
                 collection.close()
                 raise PermanentSyncError("remote_collection_empty")
@@ -142,10 +143,16 @@ class OfficialAnkiAdapter:
 
     def _normal_or_download(self, collection: Any, auth: Any) -> bool:
         output = collection.sync_collection(auth, sync_media=False)
+        self._apply_new_endpoint(auth, output)
         if output.required == output.NO_CHANGES:
             return False
         self._full_download(collection, auth)
         return True
+
+    @staticmethod
+    def _apply_new_endpoint(auth: Any, output: Any) -> None:
+        if endpoint := output.new_endpoint:
+            auth.endpoint = endpoint
 
     @staticmethod
     def _full_download(collection: Any, auth: Any) -> None:
