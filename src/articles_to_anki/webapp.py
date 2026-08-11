@@ -211,8 +211,6 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             try:
                 reconcile_apkg_exports(owned_document(document_id, "apkg"))
             except Exception:
-                # The exporter will surface a useful error if this is not a real
-                # Anki package. Keeping the upload preserves the old behaviour.
                 app.logger.warning("Could not inspect uploaded APKG", exc_info=True)
             flash("Колода загружена.", "success")
         return redirect(url_for("dashboard"))
@@ -448,7 +446,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                     "SELECT * FROM highlights WHERE user_id = ?",
                     (session["user_id"],),
                 ).fetchall()
-                if normalize_target(row["target"]) == card["target_normalized"]
+                if card_context_key(row) == card_context_key(card)
             ]
         delete_highlight_rows(database, rows, user_id=session["user_id"])
         database.execute(
@@ -622,35 +620,25 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         get_database().commit()
 
     def reconcile_apkg_exports(deck: sqlite3.Row) -> None:
-        """Make the uploaded APKG, rather than an old flag, the source of truth."""
-        from .apkg import managed_identities, merge
+        from .apkg import card_identities, managed_identities
 
-        stored_path = Path(deck["stored_path"])
-        with tempfile.TemporaryDirectory(prefix="anki-papers-upload-") as temporary_name:
-            temporary = Path(temporary_name)
-            empty_csv = temporary / "empty.csv"
-            empty_csv.write_bytes(cards_to_csv([]))
-            normalized = temporary / "normalized.apkg"
-            merge(stored_path, normalized, [empty_csv], temporary / "combined.csv")
-            content = normalized.read_bytes()
-            replace_managed_file(stored_path, content)
-            get_database().execute(
-                "UPDATE documents SET size = ? WHERE id = ? AND user_id = ?",
-                (len(content), deck["id"], session["user_id"]),
-            )
-        identities = managed_identities(stored_path)
-        timestamp = now()
+        deck_identities = managed_identities(Path(deck["stored_path"]))
         cards = get_database().execute(
-            "SELECT id, target_normalized, apkg_exported_at FROM cards WHERE user_id = ?",
+            """SELECT cards.*, documents.name AS document_name
+               FROM cards JOIN documents ON documents.id = cards.document_id
+               WHERE cards.user_id = ? ORDER BY cards.created_at""",
             (session["user_id"],),
         ).fetchall()
+        timestamp = now()
         updates = []
         for card in cards:
-            target = normalize_target(card["target_normalized"])
-            complete = {
-                ("meaning", target),
-                ("recall", target),
-            }.issubset(identities)
+            rows = csv.DictReader(
+                io.StringIO(cards_to_csv([card]).decode("utf-8-sig"))
+            )
+            complete = all(
+                bool(card_identities(row["Front"], row["Back"], row["Tags"]) & deck_identities)
+                for row in rows
+            )
             exported_at = (card["apkg_exported_at"] or timestamp) if complete else None
             updates.append((exported_at, card["id"], session["user_id"]))
         get_database().executemany(
@@ -756,7 +744,7 @@ def init_database(app: Flask) -> None:
                 csv_exported_at TEXT,
                 apkg_exported_at TEXT,
                 created_at TEXT NOT NULL,
-                UNIQUE(user_id, target_normalized)
+                UNIQUE(user_id, document_id, page, target_normalized, sentence)
             );
             CREATE INDEX IF NOT EXISTS idx_cards_user_created
                 ON cards(user_id, created_at);
@@ -812,24 +800,8 @@ def init_database(app: Flask) -> None:
             (now(),),
         )
         connection.execute("DELETE FROM highlights WHERE status = 'failed'")
-        cards_by_target = {
-            (row["user_id"], row["target_normalized"]): row["id"]
-            for row in connection.execute(
-                "SELECT id, user_id, target_normalized FROM cards"
-            ).fetchall()
-        }
-        for row in connection.execute(
-            "SELECT id, user_id, target FROM highlights WHERE status = 'ready'"
-        ).fetchall():
-            card_id = cards_by_target.get(
-                (row["user_id"], normalize_target(row["target"]))
-            )
-            if card_id:
-                connection.execute(
-                    """INSERT OR IGNORE INTO card_highlights (card_id, highlight_id)
-                       VALUES (?, ?)""",
-                    (card_id, row["id"]),
-                )
+        migrate_cards_to_contexts(connection)
+        synchronize_card_highlights_by_context(connection)
         connection.execute("PRAGMA optimize")
         connection.commit()
     finally:
@@ -853,6 +825,110 @@ def require_csrf(*, header: bool = False) -> None:
 
 def normalize_target(value: str) -> str:
     return " ".join(value.casefold().strip().split())
+
+
+def card_context_key(row: sqlite3.Row) -> tuple[int, str, int, str, str]:
+    return (
+        int(row["user_id"]),
+        str(row["document_id"]),
+        int(row["page"]),
+        normalize_target(row["target"]),
+        " ".join(str(row["sentence"]).casefold().split()),
+    )
+
+
+def migrate_cards_to_contexts(connection: sqlite3.Connection) -> None:
+    schema_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cards'"
+    ).fetchone()
+    schema = "" if schema_row is None else "".join(str(schema_row[0]).split())
+    if "UNIQUE(user_id,target_normalized)" not in schema:
+        return
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.executescript(
+        """
+        ALTER TABLE card_highlights RENAME TO card_highlights_by_target;
+        ALTER TABLE cards RENAME TO cards_by_target;
+        CREATE TABLE cards (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            target TEXT NOT NULL,
+            target_normalized TEXT NOT NULL,
+            sentence TEXT NOT NULL,
+            page INTEGER NOT NULL,
+            translations_json TEXT NOT NULL,
+            replacement TEXT NOT NULL,
+            alternatives_json TEXT NOT NULL,
+            csv_exported_at TEXT,
+            apkg_exported_at TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, document_id, page, target_normalized, sentence)
+        );
+        INSERT INTO cards SELECT * FROM cards_by_target;
+        DROP TABLE card_highlights_by_target;
+        DROP TABLE cards_by_target;
+        CREATE INDEX idx_cards_user_created ON cards(user_id, created_at);
+        CREATE TABLE card_highlights (
+            card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+            highlight_id TEXT NOT NULL REFERENCES highlights(id) ON DELETE CASCADE,
+            PRIMARY KEY(card_id, highlight_id)
+        );
+        CREATE UNIQUE INDEX idx_card_highlights_highlight
+            ON card_highlights(highlight_id);
+        """
+    )
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys = ON")
+
+
+def synchronize_card_highlights_by_context(connection: sqlite3.Connection) -> None:
+    cards = connection.execute("SELECT * FROM cards").fetchall()
+    cards_by_context = {card_context_key(row): row for row in cards}
+    cards_by_target = {
+        (int(row["user_id"]), normalize_target(row["target"])): row
+        for row in cards
+    }
+    connection.execute("DELETE FROM card_highlights")
+    highlights = connection.execute(
+        "SELECT * FROM highlights WHERE status = 'ready' ORDER BY created_at"
+    ).fetchall()
+    for highlight in highlights:
+        key = card_context_key(highlight)
+        card = cards_by_context.get(key)
+        if card is None:
+            template = cards_by_target.get((key[0], key[3]))
+            card_id = str(uuid.uuid4())
+            connection.execute(
+                """INSERT INTO cards
+                   (id, user_id, document_id, target, target_normalized, sentence,
+                    page, translations_json, replacement, alternatives_json,
+                    csv_exported_at, apkg_exported_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)""",
+                (
+                    card_id,
+                    highlight["user_id"],
+                    highlight["document_id"],
+                    highlight["target"],
+                    key[3],
+                    highlight["sentence"],
+                    highlight["page"],
+                    highlight["translations_json"] if template is None else template["translations_json"],
+                    highlight["replacement"] if template is None else template["replacement"],
+                    highlight["alternatives_json"] if template is None else template["alternatives_json"],
+                    highlight["created_at"],
+                ),
+            )
+            card = connection.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
+            if card is None:
+                raise RuntimeError("Failed to split card contexts")
+            cards_by_context[key] = card
+            cards_by_target[(key[0], key[3])] = card
+        connection.execute(
+            "INSERT INTO card_highlights (card_id, highlight_id) VALUES (?, ?)",
+            (card["id"], highlight["id"]),
+        )
 
 
 def word_count_label(value: int) -> str:
@@ -1006,8 +1082,16 @@ def enrich_highlight_row(
 ) -> sqlite3.Row:
     existing = database.execute(
         """SELECT id, translations_json, replacement, alternatives_json
-           FROM cards WHERE user_id = ? AND target_normalized = ?""",
-        (user_id, normalize_target(row["target"])),
+           FROM cards
+           WHERE user_id = ? AND document_id = ? AND page = ?
+             AND target_normalized = ? AND sentence = ?""",
+        (
+            user_id,
+            document_id,
+            row["page"],
+            normalize_target(row["target"]),
+            row["sentence"],
+        ),
     ).fetchone()
     timestamp = now()
     if existing is None:
@@ -1055,8 +1139,16 @@ def enrich_highlight_row(
         )
         existing = database.execute(
             """SELECT id, translations_json, replacement, alternatives_json
-               FROM cards WHERE user_id = ? AND target_normalized = ?""",
-            (user_id, normalize_target(row["target"])),
+               FROM cards
+               WHERE user_id = ? AND document_id = ? AND page = ?
+                 AND target_normalized = ? AND sentence = ?""",
+            (
+                user_id,
+                document_id,
+                row["page"],
+                normalize_target(row["target"]),
+                row["sentence"],
+            ),
         ).fetchone()
     else:
         translations = existing["translations_json"]
@@ -1484,7 +1576,7 @@ def cards_to_csv(cards: list[sqlite3.Row]) -> bytes:
         front = emphasize_target(card["sentence"], card["target"], html.escape(card["target"]))
         back = "<br>".join(f"• {html.escape(value)}" for value in translations)
         tag = re.sub(r"[^A-Za-z0-9_:-]+", "_", Path(card["document_name"]).stem).strip("_") or "article"
-        common = f"article::{tag} page::{card['page']}"
+        common = f"article::{tag} page::{card['page']} anki_papers::{card['id']}"
         writer.writerow({"Front": front, "Back": back, "Tags": f"{common} card::meaning"})
         replacement = f"<b>{html.escape(card['replacement'])}</b>"
         recall = emphasize_target(card["sentence"], card["target"], replacement, replacement_is_html=True)

@@ -188,6 +188,45 @@ def test_users_cannot_open_each_others_documents(tmp_path: Path) -> None:
     ).status_code == 404
 
 
+def test_same_word_in_different_contexts_creates_separate_cards(
+    tmp_path: Path, monkeypatch
+) -> None:
+    install_fake_enrichment(monkeypatch)
+    app = make_app(tmp_path)
+    client = app.test_client()
+    dashboard = identify(client)
+    client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(dashboard), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+    )
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        document_id = database.execute(
+            "SELECT id FROM documents WHERE kind = 'pdf'"
+        ).fetchone()[0]
+    reader = client.get(f"/article/{document_id}")
+    for index, sentence in enumerate(
+        ("This is a robust result.", "We need a robust implementation."), start=1
+    ):
+        response = client.post(
+            f"/api/article/{document_id}/highlights",
+            json={
+                "id": str(uuid.uuid4()),
+                "target": "robust",
+                "sentence": sentence,
+                "page": 1,
+                "rects": [{"x1": 80, "y1": 180 + index * 20, "x2": 120, "y2": 195 + index * 20}],
+            },
+            headers={"X-CSRF-Token": csrf(reader)},
+        )
+        assert response.status_code == 200
+
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        assert database.execute(
+            "SELECT COUNT(*) FROM cards WHERE target_normalized = 'robust'"
+        ).fetchone()[0] == 2
+
+
 def test_highlight_is_enriched_saved_and_downloaded_in_pdf(
     tmp_path: Path, monkeypatch
 ) -> None:
