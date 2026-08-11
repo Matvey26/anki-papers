@@ -1,0 +1,16 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+  - package-ecosystem: pip
+    directory: /sync-worker
+    schedule:
+      interval: monthly
+    ignore:
+      - dependency-name: anki
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch

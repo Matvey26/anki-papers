@@ -1,0 +1,18 @@
+[Unit]
+Description=Anki Papers web application
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=__APP_DIR__/.env
+Environment=ANKI_PAPERS_DATA_DIR=__DATA_DIR__
+ExecStart=__APP_DIR__/.venv/bin/python -m articles_to_anki.webapp --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

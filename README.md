@@ -1,10 +1,12 @@
 # Articles to Anki
 
-Простой Python-сайт создаёт профиль и входит в него только по логину,
+Простой Python-сайт создаёт профиль с обязательным паролем от 12 символов,
 хранит PDF и APKG отдельно, показывает PDF с нативным выделением слов,
 после кнопки «Добавить» переводит и сохраняет жёлтые хайлайты, отмечает статьи
 прочитанными и выгружает только новые карточки. При экспорте
 APKG старые карточки и их расписание сохраняются, новые добавляются без дублей.
+Основной поток может синхронизировать карточки напрямую через AnkiWeb; APKG
+остаётся резервным способом.
 Каждый сохранённый контекст — отдельная карточка: одно слово можно добавлять
 из разных предложений. Новые карточки получают стабильный ID в тегах Anki;
 старые сопоставляются по типу, слову и контексту предложения. При загрузке APKG
@@ -34,9 +36,56 @@ python -m pip install -e '.[dev]'
 anki-papers-web --host 0.0.0.0 --port 8000
 ```
 
-Сайт откроется на `http://localhost:8000`. SQLite, PDF и APKG лежат в
+Сайт откроется на `http://localhost:8000`. Production запускает web только на
+`127.0.0.1:8000`, а публичный адрес обслуживает Caddy:
+`https://151-241-221-199.sslip.io`. SQLite, PDF, APKG и зашифрованные зеркала лежат в
 `data/`; этот каталог исключён из Git. Для постоянного запуска используется
-Waitress, отдельные Node.js, Docker и внешняя база не нужны.
+Waitress и отдельный sync-worker; Redis, Celery, Docker и внешняя база не нужны.
+
+## AnkiWeb sync
+
+Worker — отдельный AGPL-3.0-or-later компонент в `sync-worker/`. MIT web-пакет
+не импортирует `anki`; связь идёт только через SQLite jobs. Закреплена версия
+`anki==26.5`. Обновлять её нужно отдельным PR после protocol-тестов.
+
+Поток:
+
+1. пользователь повторяет пароль сайта и вводит AnkiWeb ID/password;
+2. worker проверяет credentials через `sync_login()` и делает только full download;
+3. сайт показывает колоды и preview;
+4. после выбора колоды worker сначала скачивает remote changes, сопоставляет
+   старые notes, добавляет только отсутствующие `meaning`/`recall`, затем делает
+   второй incremental sync;
+5. любой mandatory full sync всегда выбирает download. Full upload отсутствует
+   в application code.
+
+AnkiWeb ID, password, `hkey` и `collection.anki2` шифруются AES-256-GCM.
+Создать production key:
+
+```bash
+python -c 'import base64,secrets; print("1:" + base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'
+```
+
+Значение хранится как GitHub Environment Secret `ANKI_CREDENTIAL_KEY` и в
+production `.env`. Для ротации сначала добавьте новый ключ через запятую,
+например `1:OLD,2:NEW`; worker перешифрует credentials и mirror текущей версией.
+Старый ключ удаляется только после успешной синхронизации всех подключённых
+профилей.
+
+Локальный запуск worker:
+
+```bash
+python -m pip install -e ./sync-worker
+anki-papers-sync-worker --data-dir data
+```
+
+Старые passwordless-профили активируются только одноразовым claim-кодом:
+
+```bash
+anki-papers-admin --data-dir data issue-claim USERNAME
+```
+
+Код действует 24 часа и погашается после установки пароля.
 
 ## CI/CD на Ubuntu
 
@@ -44,14 +93,16 @@ Workflow `.github/workflows/deploy.yml` на каждый push в `main`:
 
 1. запускает тесты;
 2. копирует код по SSH в `~/anki-papers` существующего пользователя;
-3. создаёт/обновляет `.venv`;
-4. перезапускает Python-процесс на порту `8000` через `systemd`;
-5. проверяет `/health`.
+3. делает backup SQLite, APKG и encrypted mirrors;
+4. создаёт/обновляет `.venv`;
+5. ставит Caddy и перезапускает web + worker через `systemd`;
+6. проверяет HTTPS `/health` и `/health/worker`.
 
 GitHub Actions нужны секреты `SERVER_IP`, `SERVER_USER`, `SERVER_PASSWORD`,
-`OPENROUTER_API_KEY`, `OPENROUTER_MODEL` и `APP_SECRET`. Сервис работает от
-существующего `SERVER_USER`, запускается после reboot и пишет логи в journald:
-`sudo journalctl -u anki-papers`. Каталог `~/anki-papers/data/` хранит SQLite,
+`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `APP_SECRET` и
+`ANKI_CREDENTIAL_KEY`. Сервисы работают от существующего `SERVER_USER`,
+запускаются после reboot и пишут логи в journald:
+`sudo journalctl -u anki-papers-web -u anki-papers-sync-worker`. Каталог `~/anki-papers/data/` хранит SQLite,
 PDF и APKG; при деплое, рестарте процесса и reboot он не удаляется и не
 перезаписывается. Одинаковый `APP_SECRET` сохраняет активные сессии между
 рестартами.

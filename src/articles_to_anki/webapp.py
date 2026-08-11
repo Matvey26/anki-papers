@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import csv
 import functools
 import html
@@ -15,10 +14,13 @@ import shutil
 import sqlite3
 import tempfile
 import threading
+import time
 import uuid
-from datetime import UTC, datetime
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from flask import (
     Flask,
@@ -44,9 +46,21 @@ from pypdf.generic import (
     NameObject,
     TextStringObject,
 )
+from werkzeug.middleware.proxy_fix import ProxyFix
+
 from .enrich import DEFAULT_MODEL, enrich_targets, load_env_file
 from .extract import RECALL_PLACEHOLDER, extract_highlights
 from .models import TargetContext
+from .security import (
+    claim_token_digest,
+    encrypt_value,
+    hash_password,
+    load_credential_keys,
+    password_needs_rehash,
+    validate_password,
+    verify_password,
+)
+from .sync_queue import enqueue_sync_job
 
 USERNAME_RE = re.compile(r"^[\w.\-]{3,32}$", re.UNICODE)
 WORD_RE = re.compile(r"^[\w]+(?:['’\-][\w]+)*$", re.UNICODE)
@@ -63,10 +77,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         MAX_CONTENT_LENGTH=85 * 1024 * 1024,
         AUTO_PROCESS_UPLOADS=True,
         PROCESS_DOCUMENTS_INLINE=False,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=True,
+        PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+        ANKIWEB_ALLOWED_USERS=os.environ.get("ANKIWEB_ALLOWED_USERS", "risesduckness"),
+        ANKI_CREDENTIAL_KEYS=load_credential_keys(),
     )
     if test_config:
         app.config.update(test_config)
     Path(app.config["DATA_DIR"]).mkdir(parents=True, exist_ok=True)
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
     init_database(app)
     app.extensions["highlight_executor"] = ThreadPoolExecutor(
         max_workers=2,
@@ -100,9 +121,39 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         for row in rows:
             enqueue_document_processing(app, row["id"], row["user_id"])
 
+    @app.after_request
+    def add_security_headers(response: Response) -> Response:
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' blob: data:; script-src 'self'; "
+            "style-src 'self'; object-src 'self'; base-uri 'self'; frame-ancestors 'none'",
+        )
+        if request.is_secure:
+            response.headers.setdefault(
+                "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+            )
+        return response
+
     @app.get("/health")
     def health() -> Response:
         return jsonify(ok=True)
+
+    @app.get("/health/worker")
+    def worker_health() -> Response:
+        row = get_database().execute(
+            "SELECT MAX(updated_at) AS updated_at FROM worker_heartbeat"
+        ).fetchone()
+        if row is None or not row["updated_at"]:
+            return jsonify(ok=False), 503
+        try:
+            updated = datetime.fromisoformat(row["updated_at"])
+        except ValueError:
+            return jsonify(ok=False), 503
+        healthy = datetime.now(UTC) - updated <= timedelta(seconds=90)
+        return jsonify(ok=healthy), 200 if healthy else 503
 
     @app.get("/")
     def index() -> Response:
@@ -115,30 +166,116 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if request.method == "POST":
             require_csrf()
             username = request.form.get("username", "").strip()
-            if not USERNAME_RE.fullmatch(username):
-                flash("Логин: 3–32 символа; буквы, цифры, точка, дефис или подчёркивание.", "error")
+            password = request.form.get("password", "")
+            ip = request.remote_addr or "unknown"
+            database = get_database()
+            if login_is_rate_limited(database, username, ip):
+                return render_template("auth.html", mode="login"), 429
+            user = database.execute(
+                "SELECT id, username, password_hash FROM users WHERE username = ? COLLATE NOCASE",
+                (username,),
+            ).fetchone()
+            valid = bool(
+                USERNAME_RE.fullmatch(username)
+                and user is not None
+                and verify_password(user["password_hash"], password)
+            )
+            record_login_attempt(database, username, ip, valid)
+            if not valid:
+                recent = failed_login_count(database, username, ip)
+                time.sleep(min(0.15 * (2 ** max(recent - 1, 0)), 1.2))
+                if user is not None and not user["password_hash"]:
+                    flash("Для старого профиля нужен одноразовый claim-код.", "error")
+                else:
+                    flash("Неверный логин или пароль.", "error")
             else:
-                database = get_database()
-                database.execute(
-                    "INSERT OR IGNORE INTO users (username, created_at) VALUES (?, ?)",
-                    (username, now()),
-                )
-                database.commit()
-                user = database.execute(
-                    "SELECT id, username FROM users WHERE username = ? COLLATE NOCASE",
-                    (username,),
-                ).fetchone()
-                if user is None:
-                    abort(500, "Не удалось создать профиль")
-                session.clear()
-                session["user_id"] = user["id"]
-                session["username"] = user["username"]
+                if password_needs_rehash(user["password_hash"]):
+                    database.execute(
+                        "UPDATE users SET password_hash = ? WHERE id = ?",
+                        (hash_password(password), user["id"]),
+                    )
+                    database.commit()
+                start_user_session(user)
                 return redirect(url_for("dashboard"))
-        return render_template("auth.html")
+        return render_template("auth.html", mode="login")
 
     @app.route("/register", methods=["GET", "POST"])
     def register() -> Response:
-        return login()
+        if request.method == "POST":
+            require_csrf()
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "")
+            confirmation = request.form.get("password_confirmation", "")
+            try:
+                if not USERNAME_RE.fullmatch(username):
+                    raise ValueError(
+                        "Логин: 3–32 символа; буквы, цифры, точка, дефис или подчёркивание."
+                    )
+                validate_password(password)
+                if password != confirmation:
+                    raise ValueError("Пароли не совпадают.")
+                database = get_database()
+                cursor = database.execute(
+                    """INSERT INTO users (username, password_hash, password_set_at, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (username, hash_password(password), now(), now()),
+                )
+                database.commit()
+            except sqlite3.IntegrityError:
+                flash("Этот логин уже занят.", "error")
+            except ValueError as exc:
+                flash(str(exc), "error")
+            else:
+                user = database.execute(
+                    "SELECT id, username FROM users WHERE id = ?", (cursor.lastrowid,)
+                ).fetchone()
+                start_user_session(user)
+                return redirect(url_for("dashboard"))
+        return render_template("auth.html", mode="register")
+
+    @app.route("/claim", methods=["GET", "POST"])
+    def claim_account() -> Response:
+        if request.method == "POST":
+            require_csrf()
+            username = request.form.get("username", "").strip()
+            code = request.form.get("claim_code", "").strip()
+            password = request.form.get("password", "")
+            confirmation = request.form.get("password_confirmation", "")
+            database = get_database()
+            user = database.execute(
+                "SELECT id, username, password_hash FROM users WHERE username = ? COLLATE NOCASE",
+                (username,),
+            ).fetchone()
+            token = None
+            if user is not None and not user["password_hash"]:
+                token = database.execute(
+                    """SELECT id FROM account_claim_tokens
+                       WHERE user_id = ? AND token_hash = ? AND used_at IS NULL
+                         AND expires_at > ? ORDER BY created_at DESC LIMIT 1""",
+                    (user["id"], claim_token_digest(code), now()),
+                ).fetchone()
+            try:
+                validate_password(password)
+                if password != confirmation:
+                    raise ValueError("Пароли не совпадают.")
+                if token is None:
+                    raise ValueError("Claim-код недействителен или истёк.")
+            except ValueError as exc:
+                flash(str(exc), "error")
+            else:
+                timestamp = now()
+                database.execute(
+                    "UPDATE users SET password_hash = ?, password_set_at = ? WHERE id = ?",
+                    (hash_password(password), timestamp, user["id"]),
+                )
+                database.execute(
+                    "UPDATE account_claim_tokens SET used_at = ? WHERE id = ?",
+                    (timestamp, token["id"]),
+                )
+                database.commit()
+                start_user_session(user)
+                return redirect(url_for("dashboard"))
+        return render_template("auth.html", mode="claim")
 
     @app.post("/logout")
     @login_required
@@ -172,6 +309,15 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                WHERE cards.user_id = ? ORDER BY cards.created_at DESC""",
             (user_id,),
         ).fetchall()
+        anki_account = db.execute(
+            "SELECT * FROM anki_accounts WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        queued_sync = db.execute(
+            """SELECT state FROM sync_jobs
+               WHERE user_id = ? AND state IN ('queued', 'running')
+               ORDER BY created_at LIMIT 1""",
+            (user_id,),
+        ).fetchone()
         return render_template(
             "dashboard.html",
             documents=documents,
@@ -179,7 +325,205 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             cards=cards,
             new_csv=sum(card["csv_exported_at"] is None for card in cards) * 2,
             new_apkg=sum(card["apkg_exported_at"] is None for card in cards) * 2,
+            anki_account=anki_account,
+            queued_sync=queued_sync,
         )
+
+    @app.get("/settings")
+    @login_required
+    def settings() -> Response:
+        database = get_database()
+        account = database.execute(
+            "SELECT * FROM anki_accounts WHERE user_id = ?", (session["user_id"],)
+        ).fetchone()
+        credentials = database.execute(
+            "SELECT state FROM user_credentials WHERE user_id = ?", (session["user_id"],)
+        ).fetchone()
+        jobs = database.execute(
+            """SELECT state, reason, attempts, created_at, finished_at
+               FROM sync_jobs WHERE user_id = ?
+               ORDER BY created_at DESC LIMIT 5""",
+            (session["user_id"],),
+        ).fetchall()
+        allowed = ankiweb_enabled_for_user(current_app, session["username"])
+        return render_template(
+            "settings.html",
+            account=account,
+            credentials=credentials,
+            jobs=jobs,
+            decks=json.loads(account["available_decks_json"]) if account else [],
+            ankiweb_allowed=allowed,
+            credentials_configured=bool(current_app.config["ANKI_CREDENTIAL_KEYS"]),
+        )
+
+    @app.post("/settings/password")
+    @login_required
+    def change_password() -> Response:
+        require_csrf()
+        current_password = request.form.get("current_password", "")
+        new_password = request.form.get("new_password", "")
+        confirmation = request.form.get("password_confirmation", "")
+        database = get_database()
+        user = database.execute(
+            "SELECT password_hash FROM users WHERE id = ?", (session["user_id"],)
+        ).fetchone()
+        try:
+            if user is None or not verify_password(user["password_hash"], current_password):
+                raise ValueError("Текущий пароль неверен.")
+            validate_password(new_password)
+            if new_password != confirmation:
+                raise ValueError("Пароли не совпадают.")
+        except ValueError as exc:
+            flash(str(exc), "error")
+        else:
+            database.execute(
+                "UPDATE users SET password_hash = ?, password_set_at = ? WHERE id = ?",
+                (hash_password(new_password), now(), session["user_id"]),
+            )
+            database.commit()
+            session.clear()
+            flash("Пароль изменён. Войдите снова.", "success")
+            return redirect(url_for("login"))
+        return redirect(url_for("settings"))
+
+    @app.post("/settings/anki/connect")
+    @login_required
+    def connect_ankiweb() -> Response:
+        require_csrf()
+        if not ankiweb_enabled_for_user(current_app, session["username"]):
+            abort(403)
+        database = get_database()
+        site_password = request.form.get("site_password", "")
+        ankiweb_id = request.form.get("ankiweb_id", "").strip()
+        ankiweb_password = request.form.get("ankiweb_password", "")
+        user = database.execute(
+            "SELECT password_hash FROM users WHERE id = ?", (session["user_id"],)
+        ).fetchone()
+        keys = current_app.config["ANKI_CREDENTIAL_KEYS"]
+        if not keys:
+            flash("Серверный ключ AnkiWeb не настроен.", "error")
+            return redirect(url_for("settings"))
+        if user is None or not verify_password(user["password_hash"], site_password):
+            flash("Пароль сайта неверен.", "error")
+            return redirect(url_for("settings"))
+        if not ankiweb_id or not ankiweb_password or len(ankiweb_password) > 1024:
+            flash("Введите AnkiWeb ID и пароль.", "error")
+            return redirect(url_for("settings"))
+        encrypted_id = encrypt_value(
+            ankiweb_id,
+            user_id=session["user_id"],
+            field="ankiweb_id",
+            keys=keys,
+        )
+        encrypted_password = encrypt_value(
+            ankiweb_password,
+            user_id=session["user_id"],
+            field="ankiweb_password",
+            keys=keys,
+        )
+        timestamp = now()
+        database.execute(
+            """INSERT INTO user_credentials
+               (user_id, ankiweb_id_ciphertext, ankiweb_id_nonce,
+                password_ciphertext, password_nonce, hkey_ciphertext, hkey_nonce,
+                key_version, state, auth_failures, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, 'pending', 0, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 ankiweb_id_ciphertext = excluded.ankiweb_id_ciphertext,
+                 ankiweb_id_nonce = excluded.ankiweb_id_nonce,
+                 password_ciphertext = excluded.password_ciphertext,
+                 password_nonce = excluded.password_nonce,
+                 hkey_ciphertext = NULL, hkey_nonce = NULL,
+                 key_version = excluded.key_version, state = 'pending',
+                 auth_failures = 0, updated_at = excluded.updated_at""",
+            (
+                session["user_id"],
+                encrypted_id.ciphertext,
+                encrypted_id.nonce,
+                encrypted_password.ciphertext,
+                encrypted_password.nonce,
+                encrypted_id.key_version,
+                timestamp,
+                timestamp,
+            ),
+        )
+        database.execute(
+            """INSERT INTO anki_accounts (user_id, state, updated_at)
+               VALUES (?, 'connecting', ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 state = 'connecting', last_error = NULL,
+                 available_decks_json = '[]', selected_deck_id = NULL,
+                 selected_deck_name = NULL, updated_at = excluded.updated_at""",
+            (session["user_id"], timestamp),
+        )
+        enqueue_sync_job(database, session["user_id"], "connect", delay_seconds=0)
+        database.commit()
+        flash("Проверка AnkiWeb и полное скачивание поставлены в очередь.", "success")
+        return redirect(url_for("settings"))
+
+    @app.post("/settings/anki/deck")
+    @login_required
+    def select_anki_deck() -> Response:
+        require_csrf()
+        database = get_database()
+        account = database.execute(
+            "SELECT * FROM anki_accounts WHERE user_id = ?", (session["user_id"],)
+        ).fetchone()
+        try:
+            deck_id = int(request.form.get("deck_id", ""))
+            decks = json.loads(account["available_decks_json"]) if account else []
+            selected = next(deck for deck in decks if int(deck["id"]) == deck_id)
+        except (StopIteration, TypeError, ValueError, json.JSONDecodeError):
+            abort(400, "Некорректная колода")
+        timestamp = now()
+        database.execute(
+            """UPDATE anki_accounts
+               SET selected_deck_id = ?, selected_deck_name = ?, state = 'connected',
+                   last_error = NULL, updated_at = ? WHERE user_id = ?""",
+            (deck_id, selected["name"], timestamp, session["user_id"]),
+        )
+        enqueue_sync_job(database, session["user_id"], "initial_sync", delay_seconds=0)
+        database.commit()
+        flash("Колода выбрана. Карточки синхронизируются в фоне.", "success")
+        return redirect(url_for("settings"))
+
+    @app.post("/settings/anki/sync")
+    @login_required
+    def sync_ankiweb_now() -> Response:
+        require_csrf()
+        database = get_database()
+        account = database.execute(
+            "SELECT state FROM anki_accounts WHERE user_id = ?", (session["user_id"],)
+        ).fetchone()
+        if account is None or account["state"] not in {"connected", "error"}:
+            flash("AnkiWeb ещё не готов к синхронизации.", "error")
+        else:
+            enqueue_sync_job(database, session["user_id"], "manual", delay_seconds=0)
+            database.commit()
+            flash("Синхронизация поставлена в очередь.", "success")
+        return redirect(url_for("settings"))
+
+    @app.post("/settings/anki/disconnect")
+    @login_required
+    def disconnect_ankiweb() -> Response:
+        require_csrf()
+        database = get_database()
+        account = database.execute(
+            "SELECT mirror_path FROM anki_accounts WHERE user_id = ?", (session["user_id"],)
+        ).fetchone()
+        database.execute(
+            """UPDATE sync_jobs SET state = 'cancelled', finished_at = ?, updated_at = ?
+               WHERE user_id = ? AND state IN ('queued', 'running')""",
+            (now(), now(), session["user_id"]),
+        )
+        database.execute("DELETE FROM anki_note_links WHERE user_id = ?", (session["user_id"],))
+        database.execute("DELETE FROM user_credentials WHERE user_id = ?", (session["user_id"],))
+        database.execute("DELETE FROM anki_accounts WHERE user_id = ?", (session["user_id"],))
+        database.commit()
+        if account and account["mirror_path"]:
+            remove_managed_files(Path(current_app.config["DATA_DIR"]), [account["mirror_path"]])
+        flash("AnkiWeb отключён; секреты, зеркало и ожидающие задания удалены.", "success")
+        return redirect(url_for("settings"))
 
     @app.post("/upload/pdf")
     @login_required
@@ -655,6 +999,17 @@ def login_required(view: Callable[..., Response]) -> Callable[..., Response]:
     def wrapped(**kwargs: Any) -> Response:
         if "user_id" not in session:
             return redirect(url_for("login"))
+        user = get_database().execute(
+            "SELECT username, password_hash FROM users WHERE id = ?",
+            (session["user_id"],),
+        ).fetchone()
+        if user is None:
+            session.clear()
+            return redirect(url_for("login"))
+        if not user["password_hash"]:
+            session.clear()
+            flash("Для старого профиля нужен одноразовый claim-код.", "error")
+            return redirect(url_for("claim_account"))
         return view(**kwargs)
 
     return wrapped
@@ -675,6 +1030,67 @@ def close_database(_: BaseException | None = None) -> None:
         connection.close()
 
 
+def start_user_session(user: sqlite3.Row) -> None:
+    session.clear()
+    session.permanent = True
+    session["session_id"] = secrets.token_urlsafe(24)
+    session["user_id"] = user["id"]
+    session["username"] = user["username"]
+
+
+def failed_login_count(
+    database: sqlite3.Connection, username: str, ip_address: str
+) -> int:
+    cutoff = (datetime.now(UTC) - timedelta(minutes=15)).isoformat()
+    return int(
+        database.execute(
+            """SELECT COUNT(*) FROM login_attempts
+               WHERE successful = 0 AND created_at >= ?
+                 AND (username = ? COLLATE NOCASE OR ip_address = ?)""",
+            (cutoff, username, ip_address),
+        ).fetchone()[0]
+    )
+
+
+def login_is_rate_limited(
+    database: sqlite3.Connection, username: str, ip_address: str
+) -> bool:
+    return failed_login_count(database, username, ip_address) >= 8
+
+
+def record_login_attempt(
+    database: sqlite3.Connection,
+    username: str,
+    ip_address: str,
+    successful: bool,
+) -> None:
+    if successful:
+        database.execute(
+            """DELETE FROM login_attempts
+               WHERE successful = 0
+                 AND (username = ? COLLATE NOCASE OR ip_address = ?)""",
+            (username, ip_address),
+        )
+    database.execute(
+        """INSERT INTO login_attempts (username, ip_address, successful, created_at)
+           VALUES (?, ?, ?, ?)""",
+        (username[:64], ip_address[:64], int(successful), now()),
+    )
+    database.execute(
+        "DELETE FROM login_attempts WHERE created_at < ?",
+        ((datetime.now(UTC) - timedelta(days=2)).isoformat(),),
+    )
+    database.commit()
+
+
+def ankiweb_enabled_for_user(app: Flask, username: str) -> bool:
+    configured = str(app.config.get("ANKIWEB_ALLOWED_USERS", "")).strip()
+    if configured == "*":
+        return True
+    allowed = {value.strip().casefold() for value in configured.split(",") if value.strip()}
+    return username.casefold() in allowed
+
+
 def init_database(app: Flask) -> None:
     connection = sqlite3.connect(app.config["DATABASE"])
     connection.row_factory = sqlite3.Row
@@ -686,6 +1102,8 @@ def init_database(app: Flask) -> None:
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                password_hash TEXT,
+                password_set_at TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS documents (
@@ -743,6 +1161,7 @@ def init_database(app: Flask) -> None:
                 alternatives_json TEXT NOT NULL,
                 csv_exported_at TEXT,
                 apkg_exported_at TEXT,
+                anki_synced_at TEXT,
                 created_at TEXT NOT NULL,
                 UNIQUE(user_id, document_id, page, target_normalized, sentence)
             );
@@ -763,6 +1182,89 @@ def init_database(app: Flask) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_deleted_highlights_document
                 ON deleted_highlights(user_id, document_id);
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL COLLATE NOCASE,
+                ip_address TEXT NOT NULL,
+                successful INTEGER NOT NULL CHECK(successful IN (0, 1)),
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_login_attempts_lookup
+                ON login_attempts(username, ip_address, created_at);
+            CREATE TABLE IF NOT EXISTS account_claim_tokens (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at TEXT NOT NULL,
+                used_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_claim_tokens_user
+                ON account_claim_tokens(user_id, expires_at);
+            CREATE TABLE IF NOT EXISTS user_credentials (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                ankiweb_id_ciphertext BLOB NOT NULL,
+                ankiweb_id_nonce BLOB NOT NULL,
+                password_ciphertext BLOB NOT NULL,
+                password_nonce BLOB NOT NULL,
+                hkey_ciphertext BLOB,
+                hkey_nonce BLOB,
+                key_version INTEGER NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(state IN ('pending', 'active', 'needs_reconnect')),
+                auth_failures INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS anki_accounts (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                selected_deck_id INTEGER,
+                selected_deck_name TEXT,
+                available_decks_json TEXT NOT NULL DEFAULT '[]',
+                mirror_path TEXT,
+                mirror_nonce BLOB,
+                mirror_key_version INTEGER,
+                state TEXT NOT NULL DEFAULT 'connecting'
+                    CHECK(state IN ('connecting', 'awaiting_deck', 'connected', 'syncing', 'needs_reconnect', 'error')),
+                last_success_at TEXT,
+                last_error TEXT,
+                last_added_count INTEGER NOT NULL DEFAULT 0,
+                preview_existing INTEGER NOT NULL DEFAULT 0,
+                preview_missing INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS anki_note_links (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                site_card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+                direction TEXT NOT NULL CHECK(direction IN ('meaning', 'recall')),
+                note_id INTEGER NOT NULL,
+                note_guid TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, site_card_id, direction),
+                UNIQUE(user_id, note_id)
+            );
+            CREATE TABLE IF NOT EXISTS sync_jobs (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                reason TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'queued'
+                    CHECK(state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                run_after TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                error_code TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_jobs_one_queued_user
+                ON sync_jobs(user_id) WHERE state = 'queued';
+            CREATE INDEX IF NOT EXISTS idx_sync_jobs_ready
+                ON sync_jobs(state, run_after, created_at);
+            CREATE TABLE IF NOT EXISTS worker_heartbeat (
+                worker_name TEXT PRIMARY KEY,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         document_columns = {
@@ -790,8 +1292,24 @@ def init_database(app: Flask) -> None:
                 "ALTER TABLE highlights ADD COLUMN source TEXT NOT NULL DEFAULT 'reader'"
             )
         user_columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")}
-        if "password_hash" in user_columns:
-            connection.execute("ALTER TABLE users DROP COLUMN password_hash")
+        if "password_hash" not in user_columns:
+            connection.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+        if "password_set_at" not in user_columns:
+            connection.execute("ALTER TABLE users ADD COLUMN password_set_at TEXT")
+        card_columns = {row[1] for row in connection.execute("PRAGMA table_info(cards)")}
+        if "anki_synced_at" not in card_columns:
+            connection.execute("ALTER TABLE cards ADD COLUMN anki_synced_at TEXT")
+        account_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(anki_accounts)")
+        }
+        if "preview_existing" not in account_columns:
+            connection.execute(
+                "ALTER TABLE anki_accounts ADD COLUMN preview_existing INTEGER NOT NULL DEFAULT 0"
+            )
+        if "preview_missing" not in account_columns:
+            connection.execute(
+                "ALTER TABLE anki_accounts ADD COLUMN preview_missing INTEGER NOT NULL DEFAULT 0"
+            )
         connection.execute(
             """INSERT OR IGNORE INTO deleted_highlights
                (highlight_id, user_id, document_id, created_at)
@@ -848,6 +1366,7 @@ def migrate_cards_to_contexts(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA foreign_keys = OFF")
     connection.executescript(
         """
+        DROP TABLE IF EXISTS anki_note_links;
         ALTER TABLE card_highlights RENAME TO card_highlights_by_target;
         ALTER TABLE cards RENAME TO cards_by_target;
         CREATE TABLE cards (
@@ -863,10 +1382,18 @@ def migrate_cards_to_contexts(connection: sqlite3.Connection) -> None:
             alternatives_json TEXT NOT NULL,
             csv_exported_at TEXT,
             apkg_exported_at TEXT,
+            anki_synced_at TEXT,
             created_at TEXT NOT NULL,
             UNIQUE(user_id, document_id, page, target_normalized, sentence)
         );
-        INSERT INTO cards SELECT * FROM cards_by_target;
+        INSERT INTO cards
+            (id, user_id, document_id, target, target_normalized, sentence, page,
+             translations_json, replacement, alternatives_json, csv_exported_at,
+             apkg_exported_at, anki_synced_at, created_at)
+        SELECT id, user_id, document_id, target, target_normalized, sentence, page,
+               translations_json, replacement, alternatives_json, csv_exported_at,
+               apkg_exported_at, anki_synced_at, created_at
+        FROM cards_by_target;
         DROP TABLE card_highlights_by_target;
         DROP TABLE cards_by_target;
         CREATE INDEX idx_cards_user_created ON cards(user_id, created_at);
@@ -877,6 +1404,16 @@ def migrate_cards_to_contexts(connection: sqlite3.Connection) -> None:
         );
         CREATE UNIQUE INDEX idx_card_highlights_highlight
             ON card_highlights(highlight_id);
+        CREATE TABLE anki_note_links (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            site_card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+            direction TEXT NOT NULL CHECK(direction IN ('meaning', 'recall')),
+            note_id INTEGER NOT NULL,
+            note_guid TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(user_id, site_card_id, direction),
+            UNIQUE(user_id, note_id)
+        );
         """
     )
     connection.commit()
@@ -1080,6 +1617,7 @@ def enrich_highlight_row(
     user_id: int,
     document_id: str,
 ) -> sqlite3.Row:
+    card_created = False
     existing = database.execute(
         """SELECT id, translations_json, replacement, alternatives_json
            FROM cards
@@ -1137,6 +1675,7 @@ def enrich_highlight_row(
                 timestamp,
             ),
         )
+        card_created = True
         existing = database.execute(
             """SELECT id, translations_json, replacement, alternatives_json
                FROM cards
@@ -1170,6 +1709,12 @@ def enrich_highlight_row(
            WHERE id = ? AND user_id = ?""",
         (translations, replacement, alternatives, timestamp, row["id"], user_id),
     )
+    if card_created:
+        account = database.execute(
+            "SELECT state FROM anki_accounts WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if account is not None and account["state"] in {"connected", "syncing", "error"}:
+            enqueue_sync_job(database, user_id, "card_saved", delay_seconds=30)
     database.commit()
     ready = database.execute(
         "SELECT * FROM highlights WHERE id = ? AND user_id = ?",

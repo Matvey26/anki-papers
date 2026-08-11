@@ -364,7 +364,7 @@ async function saveHighlight(highlight) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-CSRF-Token": window.ANKI_PAPERS_CSRF,
+        "X-CSRF-Token": workspace.dataset.csrfToken,
       },
       body: JSON.stringify({
         id: highlight.id,
@@ -546,7 +546,7 @@ async function deleteOpenHighlight() {
       `${workspace.dataset.highlightsUrl}/${encodeURIComponent(highlight.id)}`,
       {
         method: "DELETE",
-        headers: {"X-CSRF-Token": window.ANKI_PAPERS_CSRF},
+        headers: {"X-CSRF-Token": workspace.dataset.csrfToken},
       },
     );
     if (!response.ok) throw new Error("Не удалось удалить выделение.");

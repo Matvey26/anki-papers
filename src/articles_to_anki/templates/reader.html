@@ -11,7 +11,9 @@
   data-highlights-url="{{ url_for('article_highlights', document_id=document['id']) }}"
   data-worker-url="{{ url_for('static', filename='vendor/pdfjs/pdf.worker.min.mjs') }}"
   data-initial-page="{{ page_number }}"
+  data-csrf-token="{{ csrf_token() }}"
 >
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <a class="viewer-back" href="{{ url_for('dashboard') }}" aria-label="Вернуться в библиотеку">← Библиотека</a>
   <div id="pdf-status" class="pdf-status">Открываем PDF…</div>
   <div id="pdf-viewer" class="pdf-viewer" aria-label="{{ document['name'] }}"></div>
@@ -23,7 +25,4 @@
   </div>
 </div>
 {% endblock %}
-{% block scripts %}
-<script>window.ANKI_PAPERS_CSRF = {{ csrf_token()|tojson }};</script>
-<script type="module" src="{{ url_for('static', filename='reader.js') }}"></script>
-{% endblock %}
+{% block scripts %}<script type="module" src="{{ url_for('static', filename='reader.js') }}"></script>{% endblock %}

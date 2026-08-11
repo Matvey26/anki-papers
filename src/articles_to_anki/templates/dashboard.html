@@ -15,6 +15,13 @@
   <div><strong>{{ new_csv }}</strong><span>новых карточек</span></div>
 </section>
 
+{% if anki_account %}
+<a class="sync-summary" href="{{ url_for('settings') }}">
+  <strong>AnkiWeb</strong>
+  <span>{% if queued_sync and queued_sync['state'] == 'running' %}синхронизация{% elif queued_sync %}ожидает{% elif anki_account['state'] == 'needs_reconnect' %}нужно переподключить AnkiWeb{% elif anki_account['last_added_count'] %}добавлено {{ anki_account['last_added_count'] }}{% else %}{{ anki_account['state'] }}{% endif %}</span>
+</a>
+{% endif %}
+
 <section>
   <h2>Статьи</h2>
   {% if documents %}

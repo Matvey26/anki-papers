@@ -13,6 +13,7 @@
       <a class="brand" href="{{ url_for('dashboard') }}">Anki Papers</a>
       <nav>
         <a href="{{ url_for('dashboard') }}">Библиотека</a>
+        <a href="{{ url_for('settings') }}">Настройки</a>
         <span>{{ session.get('username') }}</span>
         <form action="{{ url_for('logout') }}" method="post">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

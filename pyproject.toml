@@ -9,6 +9,8 @@ description = "Extract hand-highlighted vocabulary from PDFs and create Anki car
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "argon2-cffi>=25.1,<26",
+  "cryptography>=45,<47",
   "Flask>=3.1,<4",
   "numpy>=1.26,<3",
   "pdfplumber>=0.11,<1",
@@ -27,6 +29,7 @@ dev = [
 
 [project.scripts]
 articles-to-anki = "articles_to_anki.cli:main"
+anki-papers-admin = "articles_to_anki.admin:main"
 anki-papers-web = "articles_to_anki.webapp:main"
 
 [tool.setuptools.packages.find]
@@ -44,3 +47,6 @@ articles_to_anki = [
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+  "integration: tests using official disposable Anki sync server",
+]

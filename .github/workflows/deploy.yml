@@ -21,8 +21,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: python -m pip install -e '.[dev]'
+      - run: python -m pip install -e '.[dev]' -e ./sync-worker
       - run: pytest -q
+      - run: RUN_ANKI_SYNC_INTEGRATION=1 pytest -q tests/test_anki_integration.py
+      - run: python -m pip check
 
   deploy:
     runs-on: ubuntu-latest
@@ -35,6 +37,8 @@ jobs:
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
       APP_SECRET: ${{ secrets.APP_SECRET }}
+      ANKI_CREDENTIAL_KEY: ${{ secrets.ANKI_CREDENTIAL_KEY }}
+      ANKIWEB_ALLOWED_USERS: risesduckness
     steps:
       - uses: actions/checkout@v5
       - name: Install SSH tools
@@ -45,6 +49,7 @@ jobs:
           test -n "$SERVER_IP"
           test -n "$SERVER_USER"
           test -n "$SERVER_PASSWORD"
+          test -n "$ANKI_CREDENTIAL_KEY"
           export SSHPASS="$SERVER_PASSWORD"
           mkdir -p "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
@@ -60,9 +65,11 @@ jobs:
             printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY"
             printf 'OPENROUTER_MODEL=%s\n' "$OPENROUTER_MODEL"
             printf 'APP_SECRET=%s\n' "$APP_SECRET"
+            printf 'ANKI_CREDENTIAL_KEY=%s\n' "$ANKI_CREDENTIAL_KEY"
+            printf 'ANKIWEB_ALLOWED_USERS=%s\n' "$ANKIWEB_ALLOWED_USERS"
           } | sshpass -e ssh "$SERVER_USER@$SERVER_IP" \
             'umask 077; cat > "$HOME/anki-papers/.env"'
-      - name: Install and restart Python process
+      - name: Back up, install, and restart services
         run: |
           set -euo pipefail
           export SSHPASS="$SERVER_PASSWORD"
@@ -87,51 +94,67 @@ jobs:
             run_root apt-get install -y "$venv_package"
             python3 -m venv --clear .venv
           fi
+          run_root apt-get update
+          run_root apt-get install -y caddy
           if command -v ufw >/dev/null 2>&1; then
-            run_root ufw allow 8000/tcp
+            run_root ufw allow 80/tcp
+            run_root ufw allow 443/tcp
+            run_root ufw --force delete allow 8000/tcp || true
           fi
           mkdir -p "$data_dir"
           chmod 700 "$data_dir"
+          backup_dir="$data_dir/backups/$(date -u +%Y%m%dT%H%M%SZ)"
+          mkdir -p "$backup_dir"
+          chmod 700 "$backup_dir"
+          BACKUP_DIR="$backup_dir" DATA_DIR="$data_dir" python3 - <<'PY'
+          import os
+          import shutil
+          import sqlite3
+          from pathlib import Path
+
+          data = Path(os.environ["DATA_DIR"])
+          backup = Path(os.environ["BACKUP_DIR"])
+          database = data / "app.sqlite3"
+          if database.exists():
+              source = sqlite3.connect(database)
+              destination = sqlite3.connect(backup / "app.sqlite3")
+              with destination:
+                  source.backup(destination)
+              destination.close()
+              source.close()
+          for pattern in ("uploads/**/*.apkg", "anki_mirrors/*.enc"):
+              for source_path in data.glob(pattern):
+                  relative = source_path.relative_to(data)
+                  destination_path = backup / relative
+                  destination_path.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(source_path, destination_path)
+          PY
+          run_root systemctl stop anki-papers.service 2>/dev/null || true
+          run_root systemctl stop anki-papers-web.service 2>/dev/null || true
+          run_root systemctl stop anki-papers-sync-worker.service 2>/dev/null || true
           .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install .
+          .venv/bin/python -m pip install . ./sync-worker
+          .venv/bin/python -m pip check
           .venv/bin/python -c 'from articles_to_anki.webapp import create_app; create_app()'
 
-          if test -f app.pid; then
-            old_pid="$(cat app.pid)"
-            if kill -0 "$old_pid" 2>/dev/null && \
-               ps -p "$old_pid" -o command= | grep -q 'articles_to_anki.webapp'; then
-              kill "$old_pid"
-              for _ in 1 2 3 4 5; do
-                kill -0 "$old_pid" 2>/dev/null || break
-                sleep 1
-              done
-            fi
-          fi
-
-          service_file="$app_dir/.anki-papers.service"
-          {
-            printf '%s\n' '[Unit]'
-            printf '%s\n' 'Description=Anki Papers web application'
-            printf '%s\n' 'After=network.target'
-            printf '\n'
-            printf '%s\n' '[Service]'
-            printf '%s\n' 'Type=simple'
-            printf 'User=%s\n' "$current_user"
-            printf 'WorkingDirectory=%s\n' "$app_dir"
-            printf 'Environment=ANKI_PAPERS_DATA_DIR=%s\n' "$data_dir"
-            printf 'ExecStart=%s/.venv/bin/python -m articles_to_anki.webapp --host 0.0.0.0 --port 8000\n' "$app_dir"
-            printf '%s\n' 'Restart=always'
-            printf '%s\n' 'RestartSec=3'
-            printf '%s\n' 'UMask=0077'
-            printf '\n'
-            printf '%s\n' '[Install]'
-            printf '%s\n' 'WantedBy=multi-user.target'
-          } > "$service_file"
-          run_root install -m 0644 "$service_file" /etc/systemd/system/anki-papers.service
+          for unit in anki-papers-web anki-papers-sync-worker; do
+            rendered="$app_dir/.$unit.service"
+            sed \
+              -e "s|__APP_DIR__|$app_dir|g" \
+              -e "s|__DATA_DIR__|$data_dir|g" \
+              -e "/^\[Service\]/a User=$current_user" \
+              "deploy/$unit.service" > "$rendered"
+            run_root install -m 0644 "$rendered" "/etc/systemd/system/$unit.service"
+          done
+          run_root install -d -o caddy -g caddy -m 0750 /var/log/caddy
+          run_root install -m 0644 deploy/Caddyfile /etc/caddy/Caddyfile
+          run_root systemctl disable --now anki-papers.service 2>/dev/null || true
           run_root systemctl daemon-reload
-          run_root systemctl enable anki-papers.service
-          run_root systemctl restart anki-papers.service
-          run_root systemctl is-active --quiet anki-papers.service
+          run_root systemctl enable anki-papers-web.service anki-papers-sync-worker.service caddy.service
+          run_root systemctl restart anki-papers-web.service anki-papers-sync-worker.service caddy.service
+          run_root systemctl is-active --quiet anki-papers-web.service
+          run_root systemctl is-active --quiet anki-papers-sync-worker.service
+          run_root systemctl is-active --quiet caddy.service
           unset DEPLOY_PASSWORD_B64
 
           .venv/bin/python - <<'PY'
@@ -153,3 +176,26 @@ jobs:
               raise SystemExit(f"health check failed after retries: {last_error}")
           PY
           REMOTE
+      - name: Verify production HTTPS and worker heartbeat
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import time
+          from urllib.error import URLError
+          from urllib.request import urlopen
+
+          urls = (
+              "https://151-241-221-199.sslip.io/health",
+              "https://151-241-221-199.sslip.io/health/worker",
+          )
+          last_error = None
+          for _ in range(20):
+              try:
+                  if all(urlopen(url, timeout=8).status == 200 for url in urls):
+                      break
+              except URLError as exc:
+                  last_error = exc
+              time.sleep(3)
+          else:
+              raise SystemExit(f"production health check failed: {last_error}")
+          PY

@@ -1,0 +1,19 @@
+[Unit]
+Description=Anki Papers headless Anki sync worker
+After=network-online.target anki-papers-web.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=__APP_DIR__/.env
+Environment=ANKI_PAPERS_DATA_DIR=__DATA_DIR__
+ExecStart=__APP_DIR__/.venv/bin/anki-papers-sync-worker --data-dir __DATA_DIR__
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

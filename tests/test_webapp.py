@@ -10,10 +10,11 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Highlight, Text
 from pypdf.generic import ArrayObject, DecodedStreamObject, FloatObject
 
-import articles_to_anki.webapp as webapp_module
 import articles_to_anki.apkg as apkg_module
+import articles_to_anki.webapp as webapp_module
 from articles_to_anki.extract import ExtractedHighlight
 from articles_to_anki.models import EnrichedItem
+from articles_to_anki.security import claim_token_digest
 from articles_to_anki.webapp import create_app, make_target_context
 
 
@@ -49,10 +50,16 @@ def make_app(tmp_path: Path, **config):
 
 
 def identify(client, username: str = "reader"):
-    token = csrf(client.get("/login"))
+    password = "correct horse battery staple"
+    token = csrf(client.get("/register"))
     return client.post(
-        "/login",
-        data={"csrf_token": token, "username": username},
+        "/register",
+        data={
+            "csrf_token": token,
+            "username": username,
+            "password": password,
+            "password_confirmation": password,
+        },
         follow_redirects=True,
     )
 
@@ -448,40 +455,148 @@ def test_import_failure_is_silent_and_does_not_leave_dead_highlight(
         assert database.execute("SELECT COUNT(*) FROM deleted_highlights").fetchone()[0] == 1
 
 
-def test_existing_username_logs_into_same_profile_without_password(tmp_path: Path) -> None:
+def test_existing_passwordless_profile_requires_one_time_claim(tmp_path: Path) -> None:
     app = make_app(tmp_path)
-    first = app.test_client()
-    auth_page = first.get("/register")
-    assert 'name="password"' not in auth_page.text
-    assert "профиль создастся автоматически" in auth_page.text
-    response = identify(first, "same-user")
-    first.post(
-        "/upload/pdf",
-        data={"csrf_token": csrf(response), "file": (pdf_bytes(), "saved.pdf")},
-        content_type="multipart/form-data",
-    )
-
-    second = app.test_client()
-    response = identify(second, "SAME-user")
-    assert "saved.pdf" in response.text
-    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
-        assert database.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
-
-
-def test_existing_database_drops_obsolete_password_hash(tmp_path: Path) -> None:
-    app = make_app(tmp_path)
-    identify(app.test_client(), "old-user")
     with sqlite3.connect(tmp_path / "app.sqlite3") as database:
         database.execute(
-            "ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT 'old-hash'"
+            "INSERT INTO users(username, created_at) VALUES ('same-user', '2026-01-01')"
+        )
+        user_id = database.execute(
+            "SELECT id FROM users WHERE username = 'same-user'"
+        ).fetchone()[0]
+        database.execute(
+            """INSERT INTO account_claim_tokens
+               (id, user_id, token_hash, expires_at, created_at)
+               VALUES ('claim-1', ?, ?, '2099-01-01', '2026-01-01')""",
+            (user_id, claim_token_digest("one-time-secret")),
+        )
+
+    client = app.test_client()
+    login = client.get("/login")
+    rejected = client.post(
+        "/login",
+        data={"csrf_token": csrf(login), "username": "same-user", "password": "anything-long"},
+        follow_redirects=True,
+    )
+    assert "claim-код" in rejected.text
+    claim = client.get("/claim")
+    claimed = client.post(
+        "/claim",
+        data={
+            "csrf_token": csrf(claim),
+            "username": "SAME-user",
+            "claim_code": "one-time-secret",
+            "password": "new secure password",
+            "password_confirmation": "new secure password",
+        },
+        follow_redirects=True,
+    )
+    assert "Библиотека" in claimed.text
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        assert database.execute(
+            "SELECT used_at IS NOT NULL FROM account_claim_tokens"
+        ).fetchone()[0] == 1
+
+
+def test_existing_database_adds_nullable_password_hash(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        database.execute(
+            """CREATE TABLE users (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+               created_at TEXT NOT NULL)"""
+        )
+        database.execute(
+            "INSERT INTO users(username, created_at) VALUES ('old-user', '2026-01-01')"
         )
 
     make_app(tmp_path)
     with sqlite3.connect(tmp_path / "app.sqlite3") as database:
         columns = {row[1] for row in database.execute("PRAGMA table_info(users)")}
         username = database.execute("SELECT username FROM users").fetchone()[0]
-    assert "password_hash" not in columns
+    assert "password_hash" in columns
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        password_hash = database.execute("SELECT password_hash FROM users").fetchone()[0]
     assert username == "old-user"
+    assert password_hash is None
+
+
+def test_legacy_passwordless_session_is_forced_to_claim(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        database.execute(
+            "INSERT INTO users(username, created_at) VALUES ('legacy', '2026-01-01')"
+        )
+        user_id = database.execute("SELECT id FROM users").fetchone()[0]
+    client = app.test_client()
+    with client.session_transaction() as browser_session:
+        browser_session["user_id"] = user_id
+        browser_session["username"] = "legacy"
+    response = client.get("/dashboard", follow_redirects=True)
+    assert "Claim-код" in response.text
+    with client.session_transaction() as browser_session:
+        assert "user_id" not in browser_session
+
+
+def test_registration_requires_long_password_and_secure_cookie(tmp_path: Path) -> None:
+    app = make_app(tmp_path, SESSION_COOKIE_SECURE=True)
+    client = app.test_client()
+    page = client.get("/register")
+    rejected = client.post(
+        "/register",
+        data={
+            "csrf_token": csrf(page),
+            "username": "secure-user",
+            "password": "too-short",
+            "password_confirmation": "too-short",
+        },
+        follow_redirects=True,
+    )
+    assert "не менее 12" in rejected.text
+    page = client.get("/register")
+    accepted = client.post(
+        "/register",
+        data={
+            "csrf_token": csrf(page),
+            "username": "secure-user",
+            "password": "long secure password",
+            "password_confirmation": "long secure password",
+        },
+    )
+    cookie = accepted.headers["Set-Cookie"]
+    assert "Secure" in cookie
+    assert "HttpOnly" in cookie
+    assert "SameSite=Lax" in cookie
+
+
+def test_login_rate_limit_uses_username_or_ip(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(webapp_module.time, "sleep", lambda _seconds: None)
+    app = make_app(tmp_path)
+    identify(app.test_client(), "rate-user")
+    attacker = app.test_client()
+    for _ in range(8):
+        page = attacker.get("/login")
+        attacker.post(
+            "/login",
+            data={
+                "csrf_token": csrf(page),
+                "username": "rate-user",
+                "password": "incorrect password",
+            },
+        )
+    page = attacker.get("/login")
+    limited = attacker.post(
+        "/login",
+        data={
+            "csrf_token": csrf(page),
+            "username": "different-user",
+            "password": "incorrect password",
+        },
+    )
+    assert limited.status_code == 429
 
 
 def test_existing_database_gets_read_at_migration(tmp_path: Path) -> None:
@@ -492,6 +607,75 @@ def test_existing_database_gets_read_at_migration(tmp_path: Path) -> None:
     with sqlite3.connect(tmp_path / "app.sqlite3") as database:
         columns = {row[1] for row in database.execute("PRAGMA table_info(documents)")}
     assert "read_at" in columns
+
+
+def test_legacy_card_schema_migration_preserves_data_and_note_link_fk(
+    tmp_path: Path,
+) -> None:
+    app = make_app(tmp_path)
+    identify(app.test_client(), "migration-user")
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        user_id = database.execute("SELECT id FROM users").fetchone()[0]
+        database.execute(
+            """INSERT INTO documents
+               (id, user_id, kind, name, stored_path, page_count, size, created_at)
+               VALUES ('doc', ?, 'pdf', 'paper.pdf', '/tmp/paper.pdf', 1, 1, '2026-01-01')""",
+            (user_id,),
+        )
+        database.execute(
+            """INSERT INTO cards
+               (id, user_id, document_id, target, target_normalized, sentence, page,
+                translations_json, replacement, alternatives_json, created_at)
+               VALUES ('legacy-card', ?, 'doc', 'robust', 'robust', 'A robust test.', 1,
+                       '["надёжный"]', 'надёжный', '["strong"]', '2026-01-01')""",
+            (user_id,),
+        )
+        database.commit()
+        database.execute("PRAGMA foreign_keys = OFF")
+        database.executescript(
+            """
+            DROP TABLE card_highlights;
+            DROP TABLE anki_note_links;
+            ALTER TABLE cards RENAME TO cards_current;
+            CREATE TABLE cards (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                target TEXT NOT NULL,
+                target_normalized TEXT NOT NULL,
+                sentence TEXT NOT NULL,
+                page INTEGER NOT NULL,
+                translations_json TEXT NOT NULL,
+                replacement TEXT NOT NULL,
+                alternatives_json TEXT NOT NULL,
+                csv_exported_at TEXT,
+                apkg_exported_at TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, target_normalized)
+            );
+            INSERT INTO cards
+            SELECT id, user_id, document_id, target, target_normalized, sentence, page,
+                   translations_json, replacement, alternatives_json, csv_exported_at,
+                   apkg_exported_at, created_at FROM cards_current;
+            DROP TABLE cards_current;
+            CREATE TABLE card_highlights (
+                card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+                highlight_id TEXT NOT NULL REFERENCES highlights(id) ON DELETE CASCADE,
+                PRIMARY KEY(card_id, highlight_id)
+            );
+            """
+        )
+        database.commit()
+
+    make_app(tmp_path)
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        assert database.execute(
+            "SELECT target, sentence FROM cards WHERE id = 'legacy-card'"
+        ).fetchone() == ("robust", "A robust test.")
+        link_targets = {
+            row[2] for row in database.execute("PRAGMA foreign_key_list(anki_note_links)")
+        }
+        assert "cards" in link_targets
 
 
 def test_uploaded_pdf_highlights_are_imported_automatically(

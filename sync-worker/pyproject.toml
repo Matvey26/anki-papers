@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anki-papers-sync-worker"
+version = "0.1.0"
+description = "AGPL headless Anki sync worker for Anki Papers"
+requires-python = ">=3.11"
+license = {text = "AGPL-3.0-or-later"}
+dependencies = [
+  "anki==26.5",
+  "cryptography>=45,<47",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+anki-papers-sync-worker = "anki_papers_sync_worker.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

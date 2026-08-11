@@ -149,3 +149,10 @@ button:disabled { cursor: not-allowed; opacity: .5; }
   .pdf-viewer { padding: 8px 0; gap: 10px; }
   .viewer-back { top: 7px; left: 7px; }
 }
+.auth-links, .settings-actions { display: flex; gap: 1rem; flex-wrap: wrap; }
+.settings-section { margin: 2rem 0; }
+.settings-form { display: grid; gap: 1rem; max-width: 36rem; }
+.settings-form label { display: grid; gap: .4rem; }
+.sync-state, .sync-summary { display: flex; gap: .8rem; flex-wrap: wrap; align-items: center; padding: 1rem; border: 1px solid var(--line, #d8d8d8); border-radius: 12px; }
+.sync-summary { margin: 1rem 0 2rem; text-decoration: none; color: inherit; }
+.job-list { line-height: 1.8; }
