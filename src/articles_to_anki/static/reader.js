@@ -10,6 +10,7 @@ const highlightDelete = document.querySelector("#highlight-delete");
 const selectionPopover = document.querySelector("#selection-popover");
 const selectionTranslation = document.querySelector("#selection-translation");
 const selectionAction = document.querySelector("#selection-action");
+const viewerBack = document.querySelector(".viewer-back");
 const readToggle = document.querySelector("#read-toggle");
 const readToggleLabel = document.querySelector("#read-toggle-label");
 const pageStates = new Map();
@@ -228,8 +229,9 @@ async function renderTextLayer(state) {
 }
 
 async function renderCanvas(state, requestedRatio = desiredRenderRatio()) {
-  const maximumByArea = Math.sqrt(24_000_000 / (state.viewport.width * state.viewport.height));
-  const ratio = Math.max(1, Math.min(6, maximumByArea, requestedRatio));
+  const maximumPixels = readerZoom() > 1 ? 64_000_000 : 24_000_000;
+  const maximumByArea = Math.sqrt(maximumPixels / (state.viewport.width * state.viewport.height));
+  const ratio = Math.max(1, Math.min(12, maximumByArea, requestedRatio));
   if (state.renderedRatio >= ratio - 0.15) return;
   state.requestedRatio = Math.max(state.requestedRatio, ratio);
   if (state.renderPromise) return state.renderPromise;
@@ -264,7 +266,7 @@ async function renderCanvas(state, requestedRatio = desiredRenderRatio()) {
 
 function desiredRenderRatio() {
   const zoom = window.visualViewport?.scale || 1;
-  return Math.min(6, (window.devicePixelRatio || 1) * zoom);
+  return Math.min(12, (window.devicePixelRatio || 1) * zoom);
 }
 
 function scheduleQualityRefresh() {
@@ -353,17 +355,31 @@ function visualBounds() {
   };
 }
 
+function readerZoom() {
+  const visualZoom = window.visualViewport?.scale || 1;
+  const outerToInner = window.outerWidth && window.innerWidth
+    ? window.outerWidth / window.innerWidth
+    : 1;
+  const desktopZoom = outerToInner > 1.25 ? outerToInner : 1;
+  return Math.max(1, visualZoom, desktopZoom);
+}
+
 function updateOverlayScale(element) {
-  const zoom = window.visualViewport?.scale || 1;
-  element.style.setProperty("--reader-control-scale", String(Math.max(0.6, 1 / zoom)));
+  element.style.setProperty("--reader-control-scale", String(1 / readerZoom()));
+}
+
+function updateReaderControlScales() {
+  for (const element of [viewerBack, selectionPopover, popover]) {
+    if (element) updateOverlayScale(element);
+  }
 }
 
 function positionOverlay(element, anchor, centered = false) {
   if (!anchor || element.hidden) return;
   const bounds = visualBounds();
-  const gap = 10;
+  const gap = 10 / readerZoom();
   updateOverlayScale(element);
-  element.style.maxWidth = `${Math.max(150, bounds.width - gap * 2)}px`;
+  element.style.maxWidth = `${Math.max(0, bounds.width - gap * 2)}px`;
   const width = element.offsetWidth;
   const height = element.offsetHeight;
   const preferredLeft = centered
@@ -749,8 +765,16 @@ function repositionOpenOverlays() {
   }
 }
 
-window.visualViewport?.addEventListener("resize", repositionOpenOverlays, {passive: true});
-window.visualViewport?.addEventListener("scroll", repositionOpenOverlays, {passive: true});
+function refreshZoomDependentUi() {
+  updateReaderControlScales();
+  scheduleQualityRefresh();
+  repositionOpenOverlays();
+}
+
+updateReaderControlScales();
+window.visualViewport?.addEventListener("resize", refreshZoomDependentUi, {passive: true});
+window.visualViewport?.addEventListener("scroll", refreshZoomDependentUi, {passive: true});
+window.addEventListener("resize", refreshZoomDependentUi, {passive: true});
 window.addEventListener("scroll", () => {
   hideTranslation();
   hideSelectionAction();

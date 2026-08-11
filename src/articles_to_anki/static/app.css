@@ -121,7 +121,7 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .pdf-page.ready::after { display: none; }
 .pdf-page.failed::after { content: "Страница не загрузилась"; position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); }
 @keyframes loading { to { background-position-x: -220%; } }
-.viewer-back { position: fixed; top: 11px; left: 11px; z-index: 20; padding: 8px 11px; border: 1px solid rgba(255,255,255,.25); border-radius: 7px; background: rgba(25,25,25,.86); color: white; font-size: 13px; backdrop-filter: blur(8px); }
+.viewer-back { --reader-control-scale: 1; position: fixed; top: 11px; left: 11px; z-index: 20; padding: calc(8px * var(--reader-control-scale)) calc(11px * var(--reader-control-scale)); border: 1px solid rgba(255,255,255,.25); border-radius: calc(7px * var(--reader-control-scale)); background: rgba(25,25,25,.86); color: white; font-size: calc(13px * var(--reader-control-scale)); backdrop-filter: blur(8px); }
 .pdf-status { position: fixed; top: 50%; left: 50%; z-index: 20; padding: 10px 13px; border-radius: 7px; background: #171717; color: white; transform: translate(-50%, -50%); }
 .page-number { position: absolute; right: 8px; bottom: 5px; z-index: 5; color: #777; font-size: 10px; pointer-events: none; user-select: none; }
 .highlight-layer { position: absolute; inset: 0; z-index: 4; pointer-events: none; }
