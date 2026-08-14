@@ -99,7 +99,7 @@ Workflow `.github/workflows/deploy.yml` на каждый push в `main`:
 6. проверяет HTTPS `/health` и `/health/worker`.
 
 GitHub Actions нужны секреты `SERVER_IP`, `SERVER_USER`, `SERVER_PASSWORD`,
-`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `APP_SECRET` и
+`OPENROUTER_API_KEY`, `APP_SECRET` и
 `ANKI_CREDENTIAL_KEY`. Сервисы работают от существующего `SERVER_USER`,
 запускаются после reboot и пишут логи в journald:
 `sudo journalctl -u anki-papers-web -u anki-papers-sync-worker`. Каталог `~/anki-papers/data/` хранит SQLite,
@@ -131,7 +131,7 @@ CLI извлекает слова и выражения, поверх котор
 - Проверка вертикального «разлива» отбрасывает жёлтые блоки исходных схем и
   таблиц, которые не являются мазками маркера.
 - Переносы с дефисом склеиваются, пунктуация предложения сохраняется.
-- Переводы и подсказки создаёт `google/gemma-4-26b-a4b-it` через OpenRouter.
+- Переводы и подсказки создаёт `openai/gpt-5.6-luna` через OpenRouter.
   Ответ запрашивается в режиме strict `json_schema`; схема генерируется
   Pydantic, проходит response healing и повторно валидируется Pydantic перед
   записью CSV. Модель обязана сначала объяснить выбранное по полному
@@ -148,8 +148,8 @@ python -m pip install -e '.[dev]'
 articles-to-anki /Users/matvey/Downloads/v2.pdf --debug
 ```
 
-По умолчанию цели отправляются по одной: для Gemma это устойчивее длинных
-пакетов, а каждый успешный ответ немедленно попадает в кеш.
+По умолчанию цели отправляются по одной, а каждый успешный ответ немедленно
+попадает в кеш.
 Карточки перемешиваются непосредственно перед записью CSV. Случайное зерно
 сохраняется в `run.json`; для воспроизводимого порядка передайте, например,
 `--shuffle-seed 42`.
@@ -158,7 +158,7 @@ articles-to-anki /Users/matvey/Downloads/v2.pdf --debug
 
 ```dotenv
 OPENROUTER_API_KEY=sk-or-v1-...
-OPENROUTER_MODEL=google/gemma-4-26b-a4b-it
+OPENROUTER_MODEL=openai/gpt-5.6-luna
 ```
 
 `.env` исключён из Git. Для проверки распознавания без API:

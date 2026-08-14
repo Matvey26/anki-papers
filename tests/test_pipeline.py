@@ -134,6 +134,7 @@ def test_openrouter_payload_uses_strict_pydantic_json_schema() -> None:
 
 
 def test_luna_payload_omits_unsupported_temperature() -> None:
+    assert enrich_module.DEFAULT_MODEL == "openai/gpt-5.6-luna"
     payload = build_openrouter_payload(
         [
             EnrichmentRequestItem(
@@ -142,7 +143,7 @@ def test_luna_payload_omits_unsupported_temperature() -> None:
                 sentence="The system retained the cached values.",
             )
         ],
-        "openai/gpt-5.6-luna-pro",
+        "openai/gpt-5.6-luna",
     )
     assert "temperature" not in payload
     assert payload["response_format"]["type"] == "json_schema"
@@ -169,7 +170,11 @@ def test_enrichment_retries_five_times_with_varied_requests(monkeypatch) -> None
     )
 
     with pytest.raises(RuntimeError, match="after 5 attempts"):
-        enrich_targets([target], api_key="test-key")
+        enrich_targets(
+            [target],
+            api_key="test-key",
+            model="google/gemma-4-26b-a4b-it",
+        )
 
     assert len(payloads) == 5
     assert [payload["temperature"] for payload in payloads] == [

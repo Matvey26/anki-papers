@@ -19,7 +19,7 @@ from .models import (
 )
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "google/gemma-4-26b-a4b-it"
+DEFAULT_MODEL = "openai/gpt-5.6-luna"
 CACHE_VERSION = "v4"
 RETRY_TEMPERATURES = (0.2, 0.1, 0.3, 0.0, 0.25)
 RETRY_INSTRUCTIONS = (
@@ -165,7 +165,7 @@ def build_openrouter_payload(
         },
         "provider": {"require_parameters": True},
     }
-    if model.startswith("openai/gpt-5.6-luna-pro"):
+    if model.startswith("openai/gpt-5.6-luna"):
         # Luna's OpenRouter endpoint supports strict structured output but not
         # temperature; require_parameters would otherwise reject all providers.
         payload.pop("temperature")

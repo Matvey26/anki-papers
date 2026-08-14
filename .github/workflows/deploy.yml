@@ -35,7 +35,7 @@ jobs:
       SERVER_USER: ${{ secrets.SERVER_USER }}
       SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+      OPENROUTER_MODEL: openai/gpt-5.6-luna
       APP_SECRET: ${{ secrets.APP_SECRET }}
       ANKI_CREDENTIAL_KEY: ${{ secrets.ANKI_CREDENTIAL_KEY }}
       ANKIWEB_ALLOWED_USERS: risesduckness
