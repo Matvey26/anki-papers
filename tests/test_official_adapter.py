@@ -90,3 +90,25 @@ def test_reconciled_legacy_note_gets_stable_sync_tags(tmp_path: Path) -> None:
         "direction::meaning",
     ]
     collection.close()
+
+
+def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -> None:
+    collection = Collection(str(tmp_path / "collection.anki2"))
+    card = {
+        "id": "sense-1", "semantic": True, "lemma": "overcome",
+        "part_of_speech": "verb", "sense_definition_en": "deal successfully with a difficulty",
+        "translations": ["преодолеть"], "contexts": [
+            {"id": "a", "source": "user_pdf", "target": "overcame", "sentence": "She overcame the limitation.", "replacement": "преодолела"},
+            {"id": "b", "source": "llm_generated", "target": "overcome", "sentence": "Teams must overcome hidden assumptions.", "replacement": "преодолеть"},
+        ],
+    }
+    note = OfficialAnkiAdapter._add_note(collection, card, "meaning", 1)
+    assert note.note_type()["name"] == "Anki Papers Semantic"
+    assert "sessionStorage" in note.fields[0]
+    assert "overcame" in note.fields[0]
+    card["contexts"].append(
+        {"id": "c", "source": "llm_generated", "target": "Overcoming", "sentence": "Overcoming noise required repeated trials.", "replacement": "преодоление"}
+    )
+    OfficialAnkiAdapter._update_semantic_note(collection, note, card, "meaning")
+    assert "Overcoming" in note.fields[0]
+    collection.close()

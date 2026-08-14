@@ -15,11 +15,15 @@ from .models import (
     EnrichedItem,
     EnrichmentBatch,
     EnrichmentRequestItem,
+    SemanticAnalysis,
+    SemanticCandidate,
+    SemanticMatchResponse,
     TargetContext,
 )
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "openai/gpt-5.6-luna"
+DEFAULT_SEMANTIC_MODEL = "openai/gpt-5.6-luna"
 CACHE_VERSION = "v4"
 RETRY_TEMPERATURES = (0.2, 0.1, 0.3, 0.0, 0.25)
 RETRY_INSTRUCTIONS = (
@@ -61,6 +65,31 @@ context_explanation_ru, translations_ru, replacement_ru, forbidden_alternatives_
 rename any property. The near-synonym list is ALWAYS stored under the literal property name
 forbidden_alternatives_en; never rename it to near_synonyms or anything else.
 Return every input id once and only once. Follow the supplied JSON Schema exactly.
+"""
+
+SEMANTIC_SYSTEM_PROMPT = """\
+You are building high-quality English-to-Russian vocabulary cards for an advanced learner.
+Analyse ONE highlighted target in its full sentence. Return a canonical English lemma, one
+coarse part_of_speech (noun, verb, adjective, adverb, phrase, or other), and a short English
+definition of exactly the sense used here. Do not merge derivational relatives: analyse/analysis,
+effective/effectiveness, and compute/computation are different lexemes. Treat phrasal verbs and
+fixed multiword expressions as whole lemmas. Preserve irregular verb families under their lemma.
+
+Give 1-4 Russian translations for this sense, and replacement_ru in grammatical form for this
+specific source sentence. Then create exactly one NEW, realistic B2-or-harder academic context.
+It must use a natural inflected surface form of the same lemma, be self-contained, be different
+in syntax or collocation from the source sentence, and not claim to quote a real paper. Put that
+exact form in generated_surface. Never invent citations, statistics, named studies, authors, or
+URLs. generated_translation_ru must translate generated_surface in that generated sentence.
+Return JSON only and follow the schema exactly.
+"""
+
+SEMANTIC_MATCH_PROMPT = """\
+Decide whether the analysed source lexical sense is exactly the same learnable sense as one of
+the supplied candidates. Same spelling is not enough; same lemma alone is not enough. Part of
+speech and sense must agree. Different senses, ambiguous homographs, and derivational relatives
+must not be merged. Return card_id only for a confident exact match; otherwise return null.
+Explain decision briefly in Russian. Return JSON only and follow the schema exactly.
 """
 
 
@@ -269,6 +298,83 @@ def _post_json(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
             f"OpenRouter HTTP {exc.code}: {error_body[:1000]}"
         ) from exc
     return json.loads(body)
+
+
+def analyse_semantic_context(
+    target: str,
+    sentence: str,
+    *,
+    api_key: str,
+    model: str = DEFAULT_SEMANTIC_MODEL,
+) -> SemanticAnalysis:
+    """Classify a lexical sense and create one explicitly synthetic extra context."""
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SEMANTIC_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps({"target": target, "sentence": sentence}, ensure_ascii=False)},
+        ],
+        "max_tokens": 900,
+        "stream": False,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "semantic_context_analysis",
+                "strict": True,
+                "schema": SemanticAnalysis.model_json_schema(),
+            },
+        },
+        "provider": {"require_parameters": True},
+    }
+    if not model.startswith("openai/gpt-5.6-luna"):
+        payload["temperature"] = 0.2
+    result = _post_json(payload, api_key)
+    content = result["choices"][0]["message"]["content"]
+    if not isinstance(content, str):
+        raise RuntimeError("OpenRouter returned non-text semantic analysis.")
+    analysis = SemanticAnalysis.model_validate_json(content)
+    if analysis.generated_surface.casefold() not in analysis.generated_sentence.casefold():
+        raise RuntimeError("Generated surface is absent from generated sentence.")
+    return analysis
+
+
+def select_semantic_match(
+    analysis: SemanticAnalysis,
+    candidates: list[SemanticCandidate],
+    *,
+    api_key: str,
+    model: str = DEFAULT_SEMANTIC_MODEL,
+) -> str | None:
+    """LLM-only merge decision. No lexical similarity or silent fallback."""
+    if not candidates:
+        return None
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SEMANTIC_MATCH_PROMPT},
+            {"role": "user", "content": json.dumps({"source": analysis.model_dump(), "candidates": [item.model_dump() for item in candidates]}, ensure_ascii=False)},
+        ],
+        "max_tokens": 500,
+        "stream": False,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "semantic_match", "strict": True, "schema": SemanticMatchResponse.model_json_schema()},
+        },
+        "provider": {"require_parameters": True},
+    }
+    if not model.startswith("openai/gpt-5.6-luna"):
+        payload["temperature"] = 0.0
+    result = _post_json(payload, api_key)
+    content = result["choices"][0]["message"]["content"]
+    if not isinstance(content, str):
+        raise RuntimeError("OpenRouter returned non-text semantic match.")
+    response = SemanticMatchResponse.model_validate_json(content)
+    candidate_ids = {item.id for item in candidates}
+    if response.match.card_id is not None and response.match.card_id not in candidate_ids:
+        raise RuntimeError("OpenRouter selected a non-candidate semantic card.")
+    return response.match.card_id
+
+
 
 
 def _cache_key(model: str, target: TargetContext) -> str:

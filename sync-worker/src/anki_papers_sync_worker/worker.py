@@ -317,6 +317,11 @@ class SyncWorker:
                 "translations": json.loads(row["translations_json"]),
                 "alternatives": json.loads(row["alternatives_json"]),
                 "document_name": row["document_name"], "page": row["page"],
+                "semantic": bool(row["semantic_version"]),
+                "lemma": row["lemma"],
+                "part_of_speech": row["part_of_speech"],
+                "sense_definition_en": row["sense_definition_en"],
+                "contexts": json.loads(row["contexts_json"] or "[]"),
             }
             for row in rows
         ]

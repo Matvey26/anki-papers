@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ class PermanentSyncError(RuntimeError):
 
 
 MANAGED_NOTETYPE_NAME = "Anki Papers"
+SEMANTIC_NOTETYPE_NAME = "Anki Papers Semantic"
 
 
 @dataclass(frozen=True)
@@ -215,6 +217,8 @@ class OfficialAnkiAdapter:
                     existing += 1
                 if note is not None:
                     if add:
+                        if card.get("semantic"):
+                            self._update_semantic_note(collection, note, card, direction)
                         self._ensure_sync_tags(collection, note, card["id"], direction)
                     used_note_ids.add(int(note.id))
                     links.append(
@@ -292,7 +296,11 @@ class OfficialAnkiAdapter:
         from anki.decks import DeckId
         from anki.utils import base91
 
-        notetype = OfficialAnkiAdapter._managed_notetype(collection)
+        notetype = (
+            OfficialAnkiAdapter._semantic_notetype(collection)
+            if card.get("semantic")
+            else OfficialAnkiAdapter._managed_notetype(collection)
+        )
         note = collection.new_note(notetype)
         note.guid = base91(
             int.from_bytes(
@@ -308,6 +316,15 @@ class OfficialAnkiAdapter:
         return note
 
     @staticmethod
+    def _update_semantic_note(collection: Any, note: Any, card: dict[str, Any], direction: str) -> None:
+        front, back = _card_sides(card, direction)
+        if list(note.fields[:2]) == [front, back]:
+            return
+        note.fields[0] = front
+        note.fields[1] = back
+        collection.update_note(note)
+
+    @staticmethod
     def _managed_notetype(collection: Any) -> Any:
         notetype = collection.models.by_name(MANAGED_NOTETYPE_NAME)
         if notetype is not None:
@@ -317,6 +334,24 @@ class OfficialAnkiAdapter:
             return notetype
 
         notetype = collection.models.new(MANAGED_NOTETYPE_NAME)
+        collection.models.add_field(notetype, collection.models.new_field("Front"))
+        collection.models.add_field(notetype, collection.models.new_field("Back"))
+        template = collection.models.new_template("Card 1")
+        template["qfmt"] = "{{Front}}"
+        template["afmt"] = '{{FrontSide}}<hr id="answer">{{Back}}'
+        collection.models.add_template(notetype, template)
+        collection.models.add(notetype)
+        return notetype
+
+    @staticmethod
+    def _semantic_notetype(collection: Any) -> Any:
+        notetype = collection.models.by_name(SEMANTIC_NOTETYPE_NAME)
+        if notetype is not None:
+            names = [field["name"] for field in notetype["flds"]]
+            if names[:2] != ["Front", "Back"] or not notetype["tmpls"]:
+                raise PermanentSyncError("semantic_notetype_invalid")
+            return notetype
+        notetype = collection.models.new(SEMANTIC_NOTETYPE_NAME)
         collection.models.add_field(notetype, collection.models.new_field("Front"))
         collection.models.add_field(notetype, collection.models.new_field("Back"))
         template = collection.models.new_template("Card 1")
@@ -348,6 +383,8 @@ class OfficialAnkiAdapter:
 
 
 def _card_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
+    if card.get("semantic"):
+        return _semantic_sides(card, direction)
     translations = card["translations"]
     alternatives = card["alternatives"]
     if direction == "meaning":
@@ -361,6 +398,43 @@ def _card_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
             html.escape(value) for value in alternatives
         ) + "</small>"
     return front, f"<b>{html.escape(card['target'])}</b>"
+
+
+def _semantic_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
+    contexts = card.get("contexts") or []
+    if not contexts:
+        raise PermanentSyncError("semantic_card_without_contexts")
+    values = []
+    for context in contexts:
+        target = str(context["target"])
+        sentence = str(context["sentence"])
+        values.append({
+            "front": _replace_target(sentence, target, html.escape(target)),
+            "recall": _replace_target(sentence, target, "<b>[...]</b>", raw=True),
+            "translation": html.escape(str(context["replacement"])),
+            "source": str(context["source"]),
+        })
+    payload = html.escape(json.dumps(values, ensure_ascii=False), quote=True)
+    side = "front" if direction == "meaning" else "recall"
+    key = html.escape(str(card["id"]), quote=True)
+    front = _semantic_front_html(payload, key, side)
+    lemma = html.escape(str(card["lemma"]))
+    if direction == "meaning":
+        translations = "<br>".join(f"• {html.escape(str(item))}" for item in card["translations"])
+        return front, f"<b>{lemma}</b><br>{translations}<br><small>{html.escape(str(card['sense_definition_en']))}</small>"
+    return front, f"<b>{lemma}</b>"
+
+
+def _semantic_front_html(payload: str, key: str, side: str) -> str:
+    return (
+        f'<div class="anki-papers-semantic" data-key="{key}" data-side="{side}" data-contexts="{payload}"></div>'
+        '<script>(function(){var root=document.currentScript.previousElementSibling,items=JSON.parse(root.dataset.contexts),'
+        'key="anki-papers-context:"+root.dataset.key+":"+root.dataset.side,stored=null;'
+        'try{stored=JSON.parse(sessionStorage.getItem(key)||"null")}catch(e){}var now=Date.now(),'
+        'index=stored&&stored.until>now?stored.index:Math.floor(Math.random()*items.length);'
+        'try{sessionStorage.setItem(key,JSON.stringify({index:index,until:now+120000}))}catch(e){}'
+        'var item=items[index];root.innerHTML=item[root.dataset.side]+"<br><small>"+item.translation+" · "+item.source+"</small>";})();</script>'
+    )
 
 
 def _replace_target(sentence: str, target: str, replacement: str, raw: bool = False) -> str:

@@ -106,3 +106,50 @@ class EnrichedItem(StrictModel):
 
 class EnrichmentBatch(StrictModel):
     items: list[EnrichedItem]
+
+
+class SemanticAnalysis(StrictModel):
+    """LLM result used to group contexts into one learnable lexical sense."""
+
+    lemma: str = Field(min_length=1, max_length=100)
+    part_of_speech: str = Field(min_length=1, max_length=32)
+    sense_definition_en: str = Field(min_length=3, max_length=300)
+    translations_ru: list[str] = Field(min_length=1, max_length=4)
+    replacement_ru: str = Field(min_length=1, max_length=100)
+    generated_sentence: str = Field(min_length=12, max_length=500)
+    generated_surface: str = Field(min_length=1, max_length=100)
+    generated_translation_ru: str = Field(min_length=1, max_length=100)
+
+    @field_validator("lemma", "part_of_speech", "sense_definition_en", "generated_sentence", "generated_surface")
+    @classmethod
+    def stripped_english(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator("translations_ru")
+    @classmethod
+    def russian_translations(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not any("а" <= char.casefold() <= "я" or char.casefold() == "ё" for char in value) for value in cleaned):
+            raise ValueError("translations must contain Cyrillic")
+        if len({value.casefold() for value in cleaned}) != len(cleaned):
+            raise ValueError("translations must be unique")
+        return cleaned
+
+
+class SemanticCandidate(StrictModel):
+    id: str
+    lemma: str
+    part_of_speech: str
+    sense_definition_en: str
+
+
+class SemanticMatch(StrictModel):
+    card_id: str | None = None
+    rationale_ru: str = Field(min_length=1, max_length=300)
+
+
+class SemanticMatchResponse(StrictModel):
+    match: SemanticMatch

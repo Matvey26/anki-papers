@@ -50,9 +50,15 @@ from pypdf.generic import (
 )
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from .enrich import DEFAULT_MODEL, enrich_targets, load_env_file
+from .enrich import (
+    DEFAULT_SEMANTIC_MODEL,
+    analyse_semantic_context,
+    enrich_targets,
+    load_env_file,
+    select_semantic_match,
+)
 from .extract import RECALL_PLACEHOLDER, extract_highlights
-from .models import TargetContext
+from .models import SemanticCandidate, TargetContext
 from .security import (
     claim_token_digest,
     encrypt_value,
@@ -1294,6 +1300,11 @@ def init_database(app: Flask) -> None:
                 translations_json TEXT NOT NULL,
                 replacement TEXT NOT NULL,
                 alternatives_json TEXT NOT NULL,
+                lemma TEXT,
+                part_of_speech TEXT,
+                sense_definition_en TEXT,
+                contexts_json TEXT,
+                semantic_version INTEGER NOT NULL DEFAULT 0,
                 csv_exported_at TEXT,
                 apkg_exported_at TEXT,
                 anki_synced_at TEXT,
@@ -1436,6 +1447,20 @@ def init_database(app: Flask) -> None:
         card_columns = {row[1] for row in connection.execute("PRAGMA table_info(cards)")}
         if "anki_synced_at" not in card_columns:
             connection.execute("ALTER TABLE cards ADD COLUMN anki_synced_at TEXT")
+        semantic_columns = {
+            "lemma": "TEXT",
+            "part_of_speech": "TEXT",
+            "sense_definition_en": "TEXT",
+            "contexts_json": "TEXT",
+            "semantic_version": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, declaration in semantic_columns.items():
+            if column not in card_columns:
+                connection.execute(f"ALTER TABLE cards ADD COLUMN {column} {declaration}")
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS idx_cards_semantic_lookup
+               ON cards(user_id, semantic_version, lemma, part_of_speech)"""
+        )
         account_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(anki_accounts)")
         }
@@ -1456,6 +1481,14 @@ def init_database(app: Flask) -> None:
         )
         connection.execute("DELETE FROM highlights WHERE status = 'failed'")
         migrate_cards_to_contexts(connection)
+        card_columns = {row[1] for row in connection.execute("PRAGMA table_info(cards)")}
+        for column, declaration in semantic_columns.items():
+            if column not in card_columns:
+                connection.execute(f"ALTER TABLE cards ADD COLUMN {column} {declaration}")
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS idx_cards_semantic_lookup
+               ON cards(user_id, semantic_version, lemma, part_of_speech)"""
+        )
         synchronize_card_highlights_by_context(connection)
         connection.execute("PRAGMA optimize")
         connection.commit()
@@ -1804,6 +1837,7 @@ def delete_highlight_rows(
     if not rows:
         return
     card_ids: set[str] = set()
+    removed_context_ids: dict[str, set[str]] = {}
     timestamp = now()
     for row in rows:
         linked = database.execute(
@@ -1811,6 +1845,8 @@ def delete_highlight_rows(
             (row["id"],),
         ).fetchall()
         card_ids.update(link["card_id"] for link in linked)
+        for link in linked:
+            removed_context_ids.setdefault(str(link["card_id"]), set()).add(str(row["id"]))
         database.execute(
             """INSERT OR IGNORE INTO deleted_highlights
                (highlight_id, user_id, document_id, created_at)
@@ -1823,6 +1859,11 @@ def delete_highlight_rows(
         )
 
     for card_id in card_ids:
+        card = database.execute(
+            "SELECT * FROM cards WHERE id = ? AND user_id = ?", (card_id, user_id)
+        ).fetchone()
+        if card is None:
+            continue
         replacement = database.execute(
             """SELECT highlights.* FROM highlights
                JOIN card_highlights ON card_highlights.highlight_id = highlights.id
@@ -1834,6 +1875,25 @@ def delete_highlight_rows(
             database.execute(
                 "DELETE FROM cards WHERE id = ? AND user_id = ?",
                 (card_id, user_id),
+            )
+        elif card["semantic_version"] == 1:
+            removed = removed_context_ids.get(card_id, set())
+            contexts = json.loads(card["contexts_json"] or "[]")
+            contexts = [
+                item for item in contexts
+                if str(item.get("id")) not in removed
+                and not any(str(item.get("id")) == f"generated:{context_id}" for context_id in removed)
+            ]
+            database.execute(
+                """UPDATE cards SET document_id = ?, target = ?, target_normalized = ?,
+                   sentence = ?, page = ?, contexts_json = ?, csv_exported_at = NULL,
+                   apkg_exported_at = NULL, anki_synced_at = NULL
+                   WHERE id = ? AND user_id = ?""",
+                (
+                    replacement["document_id"], card["target"], card["target_normalized"],
+                    replacement["sentence"], replacement["page"],
+                    json.dumps(contexts, ensure_ascii=False), card_id, user_id,
+                ),
             )
         else:
             database.execute(
@@ -1866,85 +1926,77 @@ def enrich_highlight_row(
     user_id: int,
     document_id: str,
 ) -> sqlite3.Row:
-    card_created = False
-    existing = database.execute(
-        """SELECT id, translations_json, replacement, alternatives_json
-           FROM cards
-           WHERE user_id = ? AND document_id = ? AND page = ?
-             AND target_normalized = ? AND sentence = ?""",
-        (
-            user_id,
-            document_id,
-            row["page"],
-            normalize_target(row["target"]),
-            row["sentence"],
-        ),
-    ).fetchone()
     timestamp = now()
-    if existing is None:
-        api_key = os.environ.get("OPENROUTER_API_KEY", "")
-        if not api_key:
-            raise MissingApiKeyError
-        context = make_target_context(
-            row["target"],
-            row["sentence"],
-            context_id=row["id"],
-            page=row["page"],
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        raise MissingApiKeyError
+    model = os.environ.get("OPENROUTER_SEMANTIC_MODEL", DEFAULT_SEMANTIC_MODEL)
+    analysis = analyse_semantic_context(
+        row["target"], row["sentence"], api_key=api_key, model=model
+    )
+    candidates = [
+        SemanticCandidate(
+            id=str(candidate["id"]),
+            lemma=str(candidate["lemma"]),
+            part_of_speech=str(candidate["part_of_speech"]),
+            sense_definition_en=str(candidate["sense_definition_en"]),
         )
-        enriched = enrich_targets(
-            [context],
-            api_key=api_key,
-            model=os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL),
-            cache_path=Path(app.config["DATA_DIR"])
-            / "highlight_cache"
-            / f"{row['id']}.json",
-        )[0]
-        translations = json.dumps(enriched.translations_ru, ensure_ascii=False)
-        replacement = enriched.replacement_ru
-        alternatives = json.dumps(
-            enriched.forbidden_alternatives_en,
-            ensure_ascii=False,
-        )
+        for candidate in database.execute(
+            """SELECT id, lemma, part_of_speech, sense_definition_en FROM cards
+               WHERE user_id = ? AND semantic_version = 1
+                 AND lemma = ? AND part_of_speech = ?
+               ORDER BY created_at LIMIT 30""",
+            (user_id, analysis.lemma.casefold(), analysis.part_of_speech.casefold()),
+        ).fetchall()
+    ]
+    matched_id = select_semantic_match(
+        analysis, candidates, api_key=api_key, model=model
+    )
+    translations = json.dumps(analysis.translations_ru, ensure_ascii=False)
+    replacement = analysis.replacement_ru
+    alternatives = "[]"
+    source_context = {
+        "id": str(row["id"]), "source": "user_pdf", "target": str(row["target"]),
+        "sentence": str(row["sentence"]), "replacement": replacement,
+        "translations": analysis.translations_ru,
+    }
+    generated_context = {
+        "id": f"generated:{row['id']}", "source": "llm_generated",
+        "target": analysis.generated_surface, "sentence": analysis.generated_sentence,
+        "replacement": analysis.generated_translation_ru,
+        "translations": analysis.translations_ru,
+    }
+    card_changed = True
+    if matched_id is not None:
+        existing = database.execute("SELECT * FROM cards WHERE id = ? AND user_id = ?", (matched_id, user_id)).fetchone()
+        if existing is None:
+            raise RuntimeError("Selected semantic card disappeared")
+        contexts = json.loads(existing["contexts_json"] or "[]")
+        known = {str(item.get("id")) for item in contexts if isinstance(item, dict)}
+        contexts.extend(item for item in (source_context, generated_context) if item["id"] not in known)
         database.execute(
-            """INSERT OR IGNORE INTO cards
+            """UPDATE cards SET contexts_json = ?, csv_exported_at = NULL,
+               apkg_exported_at = NULL, anki_synced_at = NULL WHERE id = ? AND user_id = ?""",
+            (json.dumps(contexts, ensure_ascii=False), existing["id"], user_id),
+        )
+    else:
+        card_id = str(uuid.uuid4())
+        database.execute(
+            """INSERT INTO cards
                (id, user_id, document_id, target, target_normalized, sentence, page,
-                translations_json, replacement, alternatives_json, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                translations_json, replacement, alternatives_json, lemma, part_of_speech,
+                sense_definition_en, contexts_json, semantic_version, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
             (
-                str(uuid.uuid4()),
-                user_id,
-                document_id,
-                row["target"],
-                normalize_target(row["target"]),
-                row["sentence"],
-                row["page"],
-                translations,
-                replacement,
-                alternatives,
-                timestamp,
+                card_id, user_id, document_id, analysis.lemma, normalize_target(analysis.lemma),
+                row["sentence"], row["page"], translations, replacement, alternatives,
+                analysis.lemma.casefold(), analysis.part_of_speech.casefold(),
+                analysis.sense_definition_en, json.dumps([source_context, generated_context], ensure_ascii=False), timestamp,
             ),
         )
-        card_created = True
-        existing = database.execute(
-            """SELECT id, translations_json, replacement, alternatives_json
-               FROM cards
-               WHERE user_id = ? AND document_id = ? AND page = ?
-                 AND target_normalized = ? AND sentence = ?""",
-            (
-                user_id,
-                document_id,
-                row["page"],
-                normalize_target(row["target"]),
-                row["sentence"],
-            ),
-        ).fetchone()
-    else:
-        translations = existing["translations_json"]
-        replacement = existing["replacement"]
-        alternatives = existing["alternatives_json"]
-
+        existing = database.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
     if existing is None:
-        raise RuntimeError("Card disappeared during enrichment")
+        raise RuntimeError("Semantic card disappeared during enrichment")
     database.execute(
         """INSERT OR IGNORE INTO card_highlights (card_id, highlight_id)
            VALUES (?, ?)""",
@@ -1958,7 +2010,7 @@ def enrich_highlight_row(
            WHERE id = ? AND user_id = ?""",
         (translations, replacement, alternatives, timestamp, row["id"], user_id),
     )
-    if card_created:
+    if card_changed:
         account = database.execute(
             "SELECT state FROM anki_accounts WHERE user_id = ?", (user_id,)
         ).fetchone()
@@ -2418,6 +2470,10 @@ def cards_to_csv(cards: list[sqlite3.Row]) -> bytes:
     writer = csv.DictWriter(stream, fieldnames=["Front", "Back", "Tags"], quoting=csv.QUOTE_ALL)
     writer.writeheader()
     for card in cards:
+        if card["semantic_version"] == 1:
+            for row in semantic_card_rows(card):
+                writer.writerow(row)
+            continue
         translations = json.loads(card["translations_json"])
         alternatives = json.loads(card["alternatives_json"])
         front = emphasize_target(card["sentence"], card["target"], html.escape(card["target"]))
@@ -2433,6 +2489,52 @@ def cards_to_csv(cards: list[sqlite3.Row]) -> bytes:
             {"Front": recall, "Back": f"<b>{html.escape(card['target'])}</b>", "Tags": f"{common} card::recall"}
         )
     return ("\ufeff" + stream.getvalue()).encode("utf-8")
+
+
+def semantic_card_rows(card: sqlite3.Row) -> list[dict[str, str]]:
+    """Two fields only: works in CSV and APKG Basic-like note types."""
+    contexts = json.loads(card["contexts_json"] or "[]")
+    if not contexts:
+        raise ValueError("Semantic card has no contexts")
+    rendered = []
+    for item in contexts:
+        target = str(item["target"])
+        sentence = str(item["sentence"])
+        rendered.append({
+            "front": emphasize_target(sentence, target, html.escape(target)),
+            "recall": emphasize_target(sentence, target, "<b>[...]</b>", replacement_is_html=True),
+            "answer": html.escape(target),
+            "translation": html.escape(str(item["replacement"])),
+            "source": str(item["source"]),
+        })
+    payload = html.escape(json.dumps(rendered, ensure_ascii=False), quote=True)
+    key = html.escape(str(card["id"]), quote=True)
+    front = _semantic_front_html(payload, key, "front")
+    recall = _semantic_front_html(payload, key, "recall")
+    translations = "<br>".join(f"• {html.escape(value)}" for value in json.loads(card["translations_json"]))
+    sense = html.escape(str(card["sense_definition_en"]))
+    lemma = html.escape(str(card["lemma"]))
+    lemma_tag = re.sub(r"[^A-Za-z0-9_:-]+", "_", str(card["lemma"])).strip("_") or "word"
+    common = f"anki_papers::{card['id']} semantic::v1 lemma::{lemma_tag}"
+    return [
+        {"Front": front, "Back": f"<b>{lemma}</b><br>{translations}<br><small>{sense}</small>", "Tags": f"{common} card::meaning"},
+        {"Front": recall, "Back": f"<b>{lemma}</b>", "Tags": f"{common} card::recall"},
+    ]
+
+
+def _semantic_front_html(payload: str, key: str, side: str) -> str:
+    # sessionStorage keeps question and answer on same context in clients that reload the page.
+    return (
+        f'<div class="anki-papers-semantic" data-key="{key}" data-side="{side}" '
+        f'data-contexts="{payload}"></div><script>(function(){{'
+        'var root=document.currentScript.previousElementSibling,items=JSON.parse(root.dataset.contexts),'
+        'key="anki-papers-context:"+root.dataset.key+":"+root.dataset.side,stored=null;'
+        'try{stored=JSON.parse(sessionStorage.getItem(key)||"null")}catch(e){}'
+        'var now=Date.now(),index=stored&&stored.until>now?stored.index:Math.floor(Math.random()*items.length);'
+        'try{sessionStorage.setItem(key,JSON.stringify({index:index,until:now+120000}))}catch(e){}'
+        'var item=items[index];root.innerHTML=item[root.dataset.side]+"<br><small>"+item.translation+" · "+item.source+"</small>";'
+        '})();</script>'
+    )
 
 
 def emphasize_target(sentence: str, target: str, replacement: str, *, replacement_is_html: bool = False) -> str:

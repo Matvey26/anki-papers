@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import re
 import sqlite3
 import uuid
@@ -13,7 +14,7 @@ from pypdf.generic import ArrayObject, DecodedStreamObject, FloatObject
 import articles_to_anki.apkg as apkg_module
 import articles_to_anki.webapp as webapp_module
 from articles_to_anki.extract import ExtractedHighlight
-from articles_to_anki.models import EnrichedItem
+from articles_to_anki.models import EnrichedItem, SemanticAnalysis
 from articles_to_anki.security import claim_token_digest
 from articles_to_anki.webapp import create_app, make_target_context
 
@@ -82,6 +83,26 @@ def install_fake_enrichment(monkeypatch) -> None:
         ]
 
     monkeypatch.setattr(webapp_module, "enrich_targets", fake_enrich)
+
+    def fake_semantic(target, sentence, **_kwargs):
+        assert target == "robust"
+        return SemanticAnalysis(
+            lemma="robust",
+            part_of_speech="adjective",
+            sense_definition_en="reliable and resilient in operation",
+            translations_ru=["надёжный", "устойчивый"],
+            replacement_ru="надёжный",
+            generated_sentence="The method remained robust under a substantial distribution shift.",
+            generated_surface="robust",
+            generated_translation_ru="устойчивым",
+        )
+
+    monkeypatch.setattr(webapp_module, "analyse_semantic_context", fake_semantic)
+    monkeypatch.setattr(
+        webapp_module,
+        "select_semantic_match",
+        lambda _analysis, candidates, **_kwargs: candidates[0].id if candidates else None,
+    )
 
 
 def test_register_upload_add_and_export_only_new_cards(
@@ -262,7 +283,7 @@ def test_users_cannot_open_each_others_documents(tmp_path: Path) -> None:
     ).status_code == 404
 
 
-def test_same_word_in_different_contexts_creates_separate_cards(
+def test_same_word_in_same_sense_merges_contexts(
     tmp_path: Path, monkeypatch
 ) -> None:
     install_fake_enrichment(monkeypatch)
@@ -296,9 +317,11 @@ def test_same_word_in_different_contexts_creates_separate_cards(
         assert response.status_code == 200
 
     with sqlite3.connect(tmp_path / "app.sqlite3") as database:
-        assert database.execute(
-            "SELECT COUNT(*) FROM cards WHERE target_normalized = 'robust'"
-        ).fetchone()[0] == 2
+        card = database.execute(
+            "SELECT contexts_json, semantic_version FROM cards WHERE target_normalized = 'robust'"
+        ).fetchone()
+        assert card[1] == 1
+        assert len(json.loads(card[0])) == 4
 
 
 def test_highlight_is_enriched_saved_and_downloaded_in_pdf(
