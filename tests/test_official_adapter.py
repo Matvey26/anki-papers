@@ -106,6 +106,10 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
     assert note.note_type()["name"] == "Anki Papers Semantic"
     assert "sessionStorage" in note.fields[0]
     assert "overcame" in note.fields[0]
+    assert (
+        'data-contexts="' in note.fields[0]
+        and '>She <b>overcame</b> the limitation.<br><small>' in note.fields[0]
+    )
     card["contexts"].append(
         {"id": "c", "source": "llm_generated", "target": "Overcoming", "sentence": "Overcoming noise required repeated trials.", "replacement": "преодоление"}
     )

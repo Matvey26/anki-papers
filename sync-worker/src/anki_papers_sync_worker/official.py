@@ -412,12 +412,12 @@ def _semantic_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
             "front": _replace_target(sentence, target, html.escape(target)),
             "recall": _replace_target(sentence, target, "<b>[...]</b>", raw=True),
             "translation": html.escape(str(context["replacement"])),
-            "source": str(context["source"]),
+            "source": html.escape(str(context["source"])),
         })
     payload = html.escape(json.dumps(values, ensure_ascii=False), quote=True)
     side = "front" if direction == "meaning" else "recall"
     key = html.escape(str(card["id"]), quote=True)
-    front = _semantic_front_html(payload, key, side)
+    front = _semantic_front_html(payload, key, side, values[0])
     lemma = html.escape(str(card["lemma"]))
     if direction == "meaning":
         translations = "<br>".join(f"• {html.escape(str(item))}" for item in card["translations"])
@@ -425,13 +425,24 @@ def _semantic_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
     return front, f"<b>{lemma}</b>"
 
 
-def _semantic_front_html(payload: str, key: str, side: str) -> str:
+def _semantic_front_html(
+    payload: str,
+    key: str,
+    side: str,
+    fallback: dict[str, str],
+) -> str:
+    fallback_html = (
+        f'{fallback[side]}<br><small>{fallback["translation"]} · '
+        f'{fallback["source"]}</small>'
+    )
     return (
-        f'<div class="anki-papers-semantic" data-key="{key}" data-side="{side}" data-contexts="{payload}"></div>'
+        f'<div class="anki-papers-semantic" data-key="{key}" data-side="{side}" '
+        f'data-contexts="{payload}">{fallback_html}</div>'
         '<script>(function(){var root=document.currentScript.previousElementSibling,items=JSON.parse(root.dataset.contexts),'
         'key="anki-papers-context:"+root.dataset.key+":"+root.dataset.side,stored=null;'
         'try{stored=JSON.parse(sessionStorage.getItem(key)||"null")}catch(e){}var now=Date.now(),'
-        'index=stored&&stored.until>now?stored.index:Math.floor(Math.random()*items.length);'
+        'valid=stored&&stored.until>now&&Number.isInteger(stored.index)&&stored.index>=0&&'
+        'stored.index<items.length,index=valid?stored.index:Math.floor(Math.random()*items.length);'
         'try{sessionStorage.setItem(key,JSON.stringify({index:index,until:now+120000}))}catch(e){}'
         'var item=items[index];root.innerHTML=item[root.dataset.side]+"<br><small>"+item.translation+" · "+item.source+"</small>";})();</script>'
     )

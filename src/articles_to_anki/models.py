@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -108,11 +110,21 @@ class EnrichmentBatch(StrictModel):
     items: list[EnrichedItem]
 
 
+SemanticPartOfSpeech = Literal[
+    "noun",
+    "verb",
+    "adjective",
+    "adverb",
+    "phrase",
+    "other",
+]
+
+
 class SemanticAnalysis(StrictModel):
     """LLM result used to group contexts into one learnable lexical sense."""
 
     lemma: str = Field(min_length=1, max_length=100)
-    part_of_speech: str = Field(min_length=1, max_length=32)
+    part_of_speech: SemanticPartOfSpeech
     sense_definition_en: str = Field(min_length=3, max_length=300)
     translations_ru: list[str] = Field(min_length=1, max_length=4)
     replacement_ru: str = Field(min_length=1, max_length=100)
@@ -120,7 +132,7 @@ class SemanticAnalysis(StrictModel):
     generated_surface: str = Field(min_length=1, max_length=100)
     generated_translation_ru: str = Field(min_length=1, max_length=100)
 
-    @field_validator("lemma", "part_of_speech", "sense_definition_en", "generated_sentence", "generated_surface")
+    @field_validator("lemma", "sense_definition_en", "generated_sentence", "generated_surface")
     @classmethod
     def stripped_english(cls, value: str) -> str:
         value = value.strip()
@@ -138,17 +150,32 @@ class SemanticAnalysis(StrictModel):
             raise ValueError("translations must be unique")
         return cleaned
 
+    @field_validator("replacement_ru", "generated_translation_ru")
+    @classmethod
+    def russian_replacements(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not any(
+            "а" <= char.casefold() <= "я" or char.casefold() == "ё"
+            for char in cleaned
+        ):
+            raise ValueError("replacement must contain Cyrillic")
+        return cleaned
+
 
 class SemanticCandidate(StrictModel):
     id: str
     lemma: str
-    part_of_speech: str
+    part_of_speech: SemanticPartOfSpeech
     sense_definition_en: str
 
 
 class SemanticMatch(StrictModel):
-    card_id: str | None = None
-    rationale_ru: str = Field(min_length=1, max_length=300)
+    card_id: str | None
+    rationale_ru: str = Field(
+        min_length=1,
+        max_length=300,
+        pattern=r".*[А-Яа-яЁё].*",
+    )
 
 
 class SemanticMatchResponse(StrictModel):

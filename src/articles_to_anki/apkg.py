@@ -97,11 +97,41 @@ def merge(source: Path, destination: Path, csv_paths: list[Path], combined_csv: 
             max_note_id = connection.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM notes").fetchone()[0]
             base_id = max(int(time.time() * 1000), max_card_id, max_note_id)
             existing_identities = set()
-            for fields, tags in connection.execute("SELECT flds, tags FROM notes"):
+            semantic_notes: dict[tuple[str, str], tuple[int, str, str]] = {}
+            for note_id, fields, tags in connection.execute(
+                "SELECT id, flds, tags FROM notes ORDER BY id"
+            ):
                 front, _, back = fields.partition("\x1f")
                 existing_identities.update(card_identities(front, back, tags))
+                semantic_key = semantic_note_key(tags)
+                if semantic_key is not None and semantic_key not in semantic_notes:
+                    semantic_notes[semantic_key] = (int(note_id), fields, tags)
             rows_to_add: list[dict[str, str]] = []
+            pending_semantic_keys: set[tuple[str, str]] = set()
             for row in rows:
+                semantic_key = semantic_note_key(row["Tags"])
+                if semantic_key is not None and semantic_key in semantic_notes:
+                    note_id, old_fields, old_tags = semantic_notes[semantic_key]
+                    fields = row["Front"] + "\x1f" + row["Back"]
+                    tags = _merge_tags(old_tags, row["Tags"])
+                    if fields != old_fields or tags != old_tags:
+                        connection.execute(
+                            """UPDATE notes SET mod = ?, usn = -1, tags = ?, flds = ?,
+                               sfld = ?, csum = ? WHERE id = ?""",
+                            (
+                                now_seconds,
+                                tags,
+                                fields,
+                                plain_text(row["Front"]),
+                                checksum(row["Front"]),
+                                note_id,
+                            ),
+                        )
+                    continue
+                if semantic_key is not None:
+                    if semantic_key in pending_semantic_keys:
+                        continue
+                    pending_semantic_keys.add(semantic_key)
                 identities = card_identities(row["Front"], row["Back"], row["Tags"])
                 if identities & existing_identities:
                     continue
@@ -165,6 +195,32 @@ def merge(source: Path, destination: Path, csv_paths: list[Path], combined_csv: 
 
 def _normalized_front(value: str) -> str:
     return " ".join(plain_text(value).casefold().split())
+
+
+def semantic_note_key(tags: str) -> tuple[str, str] | None:
+    tag_set = set(tags.split())
+    if "semantic::v1" not in tag_set:
+        return None
+    site_tag = next(
+        (tag for tag in tag_set if tag.startswith("anki_papers::")),
+        "",
+    )
+    direction = next(
+        (
+            value
+            for value in ("meaning", "recall")
+            if f"card::{value}" in tag_set or f"direction::{value}" in tag_set
+        ),
+        "",
+    )
+    if not site_tag or not direction:
+        return None
+    return site_tag.removeprefix("anki_papers::"), direction
+
+
+def _merge_tags(existing: str, incoming: str) -> str:
+    merged = list(dict.fromkeys([*existing.split(), *incoming.split()]))
+    return f" {' '.join(merged)} "
 
 
 def managed_identities(source: Path) -> set[tuple[str, ...]]:

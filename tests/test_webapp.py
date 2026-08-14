@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import io
 import json
 import re
@@ -169,6 +170,10 @@ def test_register_upload_add_and_export_only_new_cards(
     assert exported.status_code == 200
     assert exported.data.startswith(b"\xef\xbb\xbf")
     assert exported.data.count(b"card::") == 2
+    rows = list(
+        csv.DictReader(io.StringIO(exported.data.decode("utf-8-sig")))
+    )
+    assert '>This is a <b>robust</b> result.<br><small>' in rows[0]["Front"]
 
     no_new = client.post("/export/csv", data={"csrf_token": token}, follow_redirects=True)
     assert "Новых карточек для CSV нет" in no_new.text

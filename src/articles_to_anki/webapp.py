@@ -2505,12 +2505,12 @@ def semantic_card_rows(card: sqlite3.Row) -> list[dict[str, str]]:
             "recall": emphasize_target(sentence, target, "<b>[...]</b>", replacement_is_html=True),
             "answer": html.escape(target),
             "translation": html.escape(str(item["replacement"])),
-            "source": str(item["source"]),
+            "source": html.escape(str(item["source"])),
         })
     payload = html.escape(json.dumps(rendered, ensure_ascii=False), quote=True)
     key = html.escape(str(card["id"]), quote=True)
-    front = _semantic_front_html(payload, key, "front")
-    recall = _semantic_front_html(payload, key, "recall")
+    front = _semantic_front_html(payload, key, "front", rendered[0])
+    recall = _semantic_front_html(payload, key, "recall", rendered[0])
     translations = "<br>".join(f"• {html.escape(value)}" for value in json.loads(card["translations_json"]))
     sense = html.escape(str(card["sense_definition_en"]))
     lemma = html.escape(str(card["lemma"]))
@@ -2522,15 +2522,25 @@ def semantic_card_rows(card: sqlite3.Row) -> list[dict[str, str]]:
     ]
 
 
-def _semantic_front_html(payload: str, key: str, side: str) -> str:
+def _semantic_front_html(
+    payload: str,
+    key: str,
+    side: str,
+    fallback: dict[str, str],
+) -> str:
     # sessionStorage keeps question and answer on same context in clients that reload the page.
+    fallback_html = (
+        f'{fallback[side]}<br><small>{fallback["translation"]} · '
+        f'{fallback["source"]}</small>'
+    )
     return (
         f'<div class="anki-papers-semantic" data-key="{key}" data-side="{side}" '
-        f'data-contexts="{payload}"></div><script>(function(){{'
+        f'data-contexts="{payload}">{fallback_html}</div><script>(function(){{'
         'var root=document.currentScript.previousElementSibling,items=JSON.parse(root.dataset.contexts),'
         'key="anki-papers-context:"+root.dataset.key+":"+root.dataset.side,stored=null;'
         'try{stored=JSON.parse(sessionStorage.getItem(key)||"null")}catch(e){}'
-        'var now=Date.now(),index=stored&&stored.until>now?stored.index:Math.floor(Math.random()*items.length);'
+        'var now=Date.now(),valid=stored&&stored.until>now&&Number.isInteger(stored.index)&&'
+        'stored.index>=0&&stored.index<items.length,index=valid?stored.index:Math.floor(Math.random()*items.length);'
         'try{sessionStorage.setItem(key,JSON.stringify({index:index,until:now+120000}))}catch(e){}'
         'var item=items[index];root.innerHTML=item[root.dataset.side]+"<br><small>"+item.translation+" · "+item.source+"</small>";'
         '})();</script>'

@@ -13,7 +13,12 @@ import zstandard
 from articles_to_anki.apkg import merge
 
 
-def collection_bytes(path: Path) -> bytes:
+def collection_bytes(
+    path: Path,
+    *,
+    existing_tags: str = " old ",
+    existing_fields: str = "Existing front\x1fold back",
+) -> bytes:
     database = sqlite3.connect(path)
     database.executescript(
         """
@@ -35,8 +40,10 @@ def collection_bytes(path: Path) -> bytes:
     decks = json.dumps({"200": {"name": "Default"}})
     database.execute("INSERT INTO col VALUES (1, 1, ?, ?)", (models, decks))
     database.execute("INSERT INTO decks VALUES (200)")
+    existing_front = existing_fields.partition("\x1f")[0]
     database.execute(
-        "INSERT INTO notes VALUES (1, 'old', 100, 1, 0, ' old ', 'Existing front\x1fold back', 'Existing front', 1, 0, '')"
+        "INSERT INTO notes VALUES (1, 'old', 100, 1, 0, ?, ?, ?, 1, 0, '')",
+        (existing_tags, existing_fields, existing_front),
     )
     database.execute(
         "INSERT INTO cards VALUES (1, 1, 200, 0, 1, 0, 2, 2, 42, 10, 2500, 4, 0, 0, 0, 0, 0, '{}')"
@@ -117,6 +124,53 @@ def test_merge_supports_zstd_without_content_size(tmp_path: Path) -> None:
     database = read_collection(destination, "collection.anki21b", tmp_path)
     assert database.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 2
     assert database.execute("SELECT due FROM cards WHERE id = 1").fetchone()[0] == 42
+    database.close()
+
+
+def test_semantic_refresh_preserves_schedule_and_manual_tags(tmp_path: Path) -> None:
+    source = tmp_path / "source.apkg"
+    write_apkg(
+        source,
+        "collection.anki21b",
+        collection_bytes(
+            tmp_path / "source.sqlite",
+            existing_tags=(
+                " custom::keep anki_papers::sense-1 semantic::v1 "
+                "card::meaning "
+            ),
+            existing_fields="Old semantic front\x1fOld semantic back",
+        ),
+    )
+    cards = tmp_path / "semantic.csv"
+    with cards.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["Front", "Back", "Tags"])
+        writer.writeheader()
+        writer.writerow(
+            {
+                "Front": "New semantic front with another context",
+                "Back": "New semantic back",
+                "Tags": (
+                    "anki_papers::sense-1 semantic::v1 lemma::robust "
+                    "card::meaning"
+                ),
+            }
+        )
+
+    destination = tmp_path / "destination.apkg"
+    merge(source, destination, [cards], tmp_path / "combined.csv")
+
+    database = read_collection(destination, "collection.anki21b", tmp_path)
+    fields, tags = database.execute(
+        "SELECT flds, tags FROM notes WHERE id = 1"
+    ).fetchone()
+    schedule = database.execute(
+        "SELECT type, queue, due, ivl, factor, reps, lapses FROM cards WHERE id = 1"
+    ).fetchone()
+    assert fields == "New semantic front with another context\x1fNew semantic back"
+    assert {"custom::keep", "semantic::v1", "lemma::robust"} <= set(tags.split())
+    assert schedule == (2, 2, 42, 10, 2500, 4, 0)
+    assert database.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 1
+    assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 1
     database.close()
 
 

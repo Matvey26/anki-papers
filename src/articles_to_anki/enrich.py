@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -333,7 +334,10 @@ def analyse_semantic_context(
     if not isinstance(content, str):
         raise RuntimeError("OpenRouter returned non-text semantic analysis.")
     analysis = SemanticAnalysis.model_validate_json(content)
-    if analysis.generated_surface.casefold() not in analysis.generated_sentence.casefold():
+    if not _contains_exact_surface(
+        analysis.generated_sentence,
+        analysis.generated_surface,
+    ):
         raise RuntimeError("Generated surface is absent from generated sentence.")
     return analysis
 
@@ -375,6 +379,12 @@ def select_semantic_match(
     return response.match.card_id
 
 
+def _contains_exact_surface(sentence: str, surface: str) -> bool:
+    return re.search(
+        rf"(?<!\w){re.escape(surface)}(?!\w)",
+        sentence,
+        flags=re.IGNORECASE,
+    ) is not None
 
 
 def _cache_key(model: str, target: TargetContext) -> str:

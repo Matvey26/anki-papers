@@ -22,6 +22,8 @@ from pydantic import ValidationError
 from articles_to_anki.models import (
     EnrichedItem,
     EnrichmentRequestItem,
+    SemanticAnalysis,
+    SemanticMatchResponse,
     TargetContext,
 )
 
@@ -221,6 +223,51 @@ def test_enrichment_rejects_non_russian_replacement_and_duplicates() -> None:
             replacement_ru="сохранила",
             forbidden_alternatives_en=["saved", "kept"],
         )
+
+
+def test_semantic_analysis_rejects_loose_pos_and_non_russian_replacements() -> None:
+    values = {
+        "lemma": "robust",
+        "part_of_speech": "adjective",
+        "sense_definition_en": "able to remain reliable under difficult conditions",
+        "translations_ru": ["надёжный", "устойчивый"],
+        "replacement_ru": "надёжным",
+        "generated_sentence": "The estimator remained robust under heavy noise.",
+        "generated_surface": "robust",
+        "generated_translation_ru": "устойчивым",
+    }
+    assert SemanticAnalysis(**values).part_of_speech == "adjective"
+    with pytest.raises(ValidationError):
+        SemanticAnalysis(**{**values, "part_of_speech": "adj"})
+    with pytest.raises(ValidationError):
+        SemanticAnalysis(**{**values, "replacement_ru": "reliable"})
+    with pytest.raises(ValidationError):
+        SemanticAnalysis(**{**values, "generated_translation_ru": "stable"})
+
+
+def test_generated_surface_must_be_a_complete_word_or_phrase() -> None:
+    assert enrich_module._contains_exact_surface(
+        "The estimator remained robust under heavy noise.",
+        "robust",
+    )
+    assert enrich_module._contains_exact_surface(
+        "The team ruled out a measurement error.",
+        "ruled out",
+    )
+    assert not enrich_module._contains_exact_surface(
+        "The estimator's robustness improved.",
+        "robust",
+    )
+
+
+def test_semantic_match_schema_requires_nullable_card_id() -> None:
+    schema = SemanticMatchResponse.model_json_schema()
+    match_schema = schema["$defs"]["SemanticMatch"]
+    assert "card_id" in match_schema["required"]
+    assert {item["type"] for item in match_schema["properties"]["card_id"]["anyOf"]} == {
+        "string",
+        "null",
+    }
 
 
 def test_csv_cards_are_shuffled_reproducibly(tmp_path) -> None:
