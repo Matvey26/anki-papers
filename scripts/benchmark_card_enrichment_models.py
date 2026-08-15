@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -156,7 +157,11 @@ _transport_state = threading.local()
 
 def _counted_transport(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
     _transport_state.calls = getattr(_transport_state, "calls", 0) + 1
-    response = _transport(payload, api_key)
+    request_payload = deepcopy(payload)
+    reasoning_effort = getattr(_transport_state, "reasoning_effort", None)
+    if reasoning_effort is not None:
+        request_payload["reasoning"] = {"effort": reasoning_effort}
+    response = _transport(request_payload, api_key)
     metadata = {
         key: response[key]
         for key in ("id", "model", "provider", "usage")
@@ -186,12 +191,15 @@ def run_model(
     model_id: str,
     *,
     api_key: str,
+    reasoning_effort: str | None,
 ) -> dict[str, Any]:
     model_result: dict[str, Any] = {
         "model_name": model_name,
         "model_id": model_id,
+        "reasoning_effort": reasoning_effort,
         "cases": [],
     }
+    _transport_state.reasoning_effort = reasoning_effort
     for case in CASES:
         context = make_target_context(
             case["target"],
@@ -245,6 +253,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--suite", choices=("old", "new", "all"), default="all")
+    parser.add_argument("--model", action="append", dest="selected_models")
+    parser.add_argument("--reasoning-effort")
     args = parser.parse_args()
 
     models = {
@@ -252,6 +262,11 @@ def main() -> None:
         "new": NEW_MODELS,
         "all": MODELS,
     }[args.suite]
+    if args.selected_models:
+        unknown = sorted(set(args.selected_models) - models.keys())
+        if unknown:
+            raise SystemExit(f"Unknown models for {args.suite} suite: {unknown}")
+        models = {name: models[name] for name in args.selected_models}
 
     load_env_file(args.env_file)
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
@@ -277,6 +292,7 @@ def main() -> None:
             "response_format": probe["response_format"]["type"],
             "require_parameters": probe["provider"]["require_parameters"],
             "suite": args.suite,
+            "reasoning_effort": args.reasoning_effort,
         },
         "models": [],
     }
@@ -285,7 +301,13 @@ def main() -> None:
 
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
         futures = {
-            executor.submit(run_model, name, model_id, api_key=api_key): name
+            executor.submit(
+                run_model,
+                name,
+                model_id,
+                api_key=api_key,
+                reasoning_effort=args.reasoning_effort,
+            ): name
             for name, model_id in models.items()
         }
         for future in as_completed(futures):
