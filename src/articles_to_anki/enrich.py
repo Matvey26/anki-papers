@@ -16,6 +16,7 @@ from .models import (
     EnrichedItem,
     EnrichmentBatch,
     EnrichmentRequestItem,
+    RecallDistractors,
     SemanticAnalysis,
     SemanticCandidate,
     SemanticMatch,
@@ -96,6 +97,25 @@ URLs. generated_translation_ru must translate ONLY generated_surface, not the su
 sentence. It must be a compact Russian phrase in the exact grammatical form needed when inserted
 into the otherwise English generated_sentence. Never translate, repeat, or summarize the full
 generated_sentence in generated_translation_ru.
+
+Build recall distractors separately for the source and generated contexts. Judge every candidate
+with this exact procedure: copy the full sentence, replace only the highlighted surface, change
+nothing else, then read the resulting literal sentence as a native editor would. Do not silently
+repair a neighboring verb, preposition, article, determiner, agreement, punctuation, or word
+order. Do not judge a candidate by imagining a different construction in which it could work.
+- valid_substitutes_en has a strict entry test: the literal substituted sentence must already be
+  natural and idiomatic as written, preserve the candidate's syntactic role and inflection, and
+  express substantially the same contextual meaning. These are other compact English answers
+  that genuinely fit, but are not the target answer this card is testing.
+- meaning_related_non_substitutes_en contains tempting compact English answers from the same
+  semantic neighborhood that fail that literal test because their grammatical form, syntactic
+  role, required preposition, or collocation does not fit this exact sentence. A dictionary
+  synonym that works only after editing surrounding text belongs here, not in valid_substitutes_en.
+Put each candidate in exactly one category. Never include the context's target itself, spelling or
+case variants, Russian words, antonyms, unrelated associations, explanations, or full sentences.
+Start every list empty. Add only defensible candidates; there is no quota and an empty list is
+valid. source_distractors must be judged against target and sentence. generated_distractors must
+be judged independently against generated_surface and generated_sentence.
 Return JSON only and follow the schema exactly.
 """
 
@@ -362,7 +382,25 @@ def analyse_semantic_context(
         analysis.generated_surface,
     ):
         raise RuntimeError("Generated surface is absent from generated sentence.")
+    _validate_recall_distractors(target, analysis.source_distractors)
+    _validate_recall_distractors(
+        analysis.generated_surface,
+        analysis.generated_distractors,
+    )
     return analysis
+
+
+def _validate_recall_distractors(
+    target: str,
+    distractors: RecallDistractors,
+) -> None:
+    normalized_target = " ".join(target.casefold().split())
+    values = (
+        distractors.valid_substitutes_en
+        + distractors.meaning_related_non_substitutes_en
+    )
+    if any(" ".join(value.casefold().split()) == normalized_target for value in values):
+        raise RuntimeError("Recall distractors must not contain the target itself.")
 
 
 def select_semantic_match(

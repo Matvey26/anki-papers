@@ -125,6 +125,54 @@ SemanticPartOfSpeech = Literal[
 ]
 
 
+class RecallDistractors(StrictModel):
+    valid_substitutes_en: list[str] = Field(
+        min_length=0,
+        max_length=4,
+        description=(
+            "Other English answers that naturally replace exactly the highlighted span, "
+            "preserve its grammar/collocation and contextual meaning, but are not the target "
+            "this recall card is testing. Empty is valid."
+        ),
+    )
+    meaning_related_non_substitutes_en: list[str] = Field(
+        min_length=0,
+        max_length=4,
+        description=(
+            "Tempting English answers from the same semantic neighborhood that cannot replace "
+            "the exact highlighted span without breaking grammar, syntactic form, or "
+            "collocation. Never include antonyms or unrelated words. Empty is valid."
+        ),
+    )
+
+    @field_validator(
+        "valid_substitutes_en",
+        "meaning_related_non_substitutes_en",
+    )
+    @classmethod
+    def unique_english_distractors(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        normalized = [value.casefold() for value in cleaned]
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("recall distractors must be unique")
+        if any(
+            not value or not any("a" <= char <= "z" for char in value.casefold())
+            for value in cleaned
+        ):
+            raise ValueError("recall distractors must contain English letters")
+        return cleaned
+
+    @model_validator(mode="after")
+    def categories_must_not_overlap(self) -> RecallDistractors:
+        valid = {value.casefold() for value in self.valid_substitutes_en}
+        invalid = {
+            value.casefold() for value in self.meaning_related_non_substitutes_en
+        }
+        if valid & invalid:
+            raise ValueError("recall distractor categories must not overlap")
+        return self
+
+
 class SemanticAnalysis(StrictModel):
     """LLM result used to group contexts into one learnable lexical sense."""
 
@@ -144,6 +192,8 @@ class SemanticAnalysis(StrictModel):
             "grammatical form required by generated_sentence; never a sentence translation."
         ),
     )
+    source_distractors: RecallDistractors
+    generated_distractors: RecallDistractors
 
     @field_validator("lemma", "sense_definition_en", "generated_sentence", "generated_surface")
     @classmethod

@@ -27,6 +27,7 @@ from articles_to_anki.extract import (
 from articles_to_anki.models import (
     EnrichedItem,
     EnrichmentRequestItem,
+    RecallDistractors,
     SemanticAnalysis,
     SemanticCandidate,
     SemanticMatchResponse,
@@ -188,6 +189,14 @@ def test_semantic_deepseek_payloads_disable_reasoning(monkeypatch) -> None:
         generated_sentence="The committee acknowledged the limitation before proceeding.",
         generated_surface="acknowledged",
         generated_translation_ru="признал",
+        source_distractors={
+            "valid_substitutes_en": ["accepted"],
+            "meaning_related_non_substitutes_en": ["acceptance"],
+        },
+        generated_distractors={
+            "valid_substitutes_en": ["recognized"],
+            "meaning_related_non_substitutes_en": ["recognition"],
+        },
     )
 
     def fake_request(payload, _api_key):
@@ -333,6 +342,14 @@ def test_semantic_analysis_rejects_loose_pos_and_non_russian_replacements() -> N
         "generated_sentence": "The estimator remained robust under heavy noise.",
         "generated_surface": "robust",
         "generated_translation_ru": "устойчивым",
+        "source_distractors": {
+            "valid_substitutes_en": [],
+            "meaning_related_non_substitutes_en": [],
+        },
+        "generated_distractors": {
+            "valid_substitutes_en": [],
+            "meaning_related_non_substitutes_en": [],
+        },
     }
     assert SemanticAnalysis(**values).part_of_speech == "adjective"
     assert SemanticAnalysis(**{**values, "family_key": " Robust "}).family_key == "robust"
@@ -350,6 +367,34 @@ def test_semantic_analysis_rejects_loose_pos_and_non_russian_replacements() -> N
                     "Оценка оставалась устойчивой даже при очень сильном внешнем шуме"
                 ),
             }
+        )
+
+
+def test_recall_distractor_categories_are_disjoint_and_allow_empty_lists() -> None:
+    assert RecallDistractors(
+        valid_substitutes_en=[],
+        meaning_related_non_substitutes_en=[],
+    ).valid_substitutes_en == []
+    with pytest.raises(ValidationError):
+        RecallDistractors(
+            valid_substitutes_en=["account"],
+            meaning_related_non_substitutes_en=["Account"],
+        )
+
+
+def test_recall_distractors_must_not_repeat_target() -> None:
+    distractors = RecallDistractors(
+        valid_substitutes_en=["account"],
+        meaning_related_non_substitutes_en=["thought"],
+    )
+    enrich_module._validate_recall_distractors("consideration", distractors)
+    with pytest.raises(RuntimeError, match="must not contain the target"):
+        enrich_module._validate_recall_distractors(
+            "take into account",
+            RecallDistractors(
+                valid_substitutes_en=[" Take  into   Account "],
+                meaning_related_non_substitutes_en=[],
+            ),
         )
 
 

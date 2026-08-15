@@ -99,7 +99,12 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
         "family_key": "overcome",
         "part_of_speech": "verb", "sense_definition_en": "deal successfully with a difficulty",
         "translations": ["преодолеть"], "contexts": [
-            {"id": "a", "source": "user_pdf", "target": "overcame", "sentence": "She overcame the limitation.", "replacement": "преодолела"},
+            {
+                "id": "a", "source": "user_pdf", "target": "overcame",
+                "sentence": "She overcame the limitation.", "replacement": "преодолела",
+                "valid_substitutes_en": ["surmounted"],
+                "meaning_related_non_substitutes_en": ["overcoming"],
+            },
             {
                 "id": "b",
                 "source": "llm_generated",
@@ -127,6 +132,8 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
     recall = OfficialAnkiAdapter._add_note(collection, card, "recall", 1)
     assert "[...]" not in recall.fields[0]
     assert "She <b>преодолела</b> the limitation." in recall.fields[0]
+    assert "Подходит, но не целевой ответ: surmounted" in recall.fields[0]
+    assert "Смысл близкий, но сюда не вставляется: overcoming" in recall.fields[0]
     assert (
         "Teams must &lt;b&gt;преодолеть&lt;/b&gt; hidden assumptions."
         in recall.fields[0]

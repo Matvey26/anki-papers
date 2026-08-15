@@ -2011,6 +2011,10 @@ def enrich_highlight_row(
         "translations": analysis.translations_ru, "lemma": analysis.lemma,
         "family_key": analysis.family_key, "part_of_speech": analysis.part_of_speech,
         "sense_definition_en": analysis.sense_definition_en,
+        "valid_substitutes_en": analysis.source_distractors.valid_substitutes_en,
+        "meaning_related_non_substitutes_en": (
+            analysis.source_distractors.meaning_related_non_substitutes_en
+        ),
     }
     generated_context = {
         "id": f"generated:{row['id']}", "source": "llm_generated",
@@ -2019,6 +2023,10 @@ def enrich_highlight_row(
         "translations": analysis.translations_ru, "lemma": analysis.lemma,
         "family_key": analysis.family_key, "part_of_speech": analysis.part_of_speech,
         "sense_definition_en": analysis.sense_definition_en,
+        "valid_substitutes_en": analysis.generated_distractors.valid_substitutes_en,
+        "meaning_related_non_substitutes_en": (
+            analysis.generated_distractors.meaning_related_non_substitutes_en
+        ),
     }
     card_changed = True
     if match.card_id is not None:
@@ -2592,7 +2600,7 @@ def semantic_card_rows(card: sqlite3.Row) -> list[dict[str, str]]:
                 target,
                 f"<b>{html.escape(replacement)}</b>",
                 replacement_is_html=True,
-            ),
+            ) + _semantic_recall_distractors_html(item),
             "answer": html.escape(target),
             "source": html.escape(str(item["source"])),
         })
@@ -2628,6 +2636,21 @@ def semantic_card_rows(card: sqlite3.Row) -> list[dict[str, str]]:
         {"Front": front, "Back": meaning_back, "Tags": f"{common} card::meaning"},
         {"Front": recall, "Back": recall_back, "Tags": f"{common} card::recall"},
     ]
+
+
+def _semantic_recall_distractors_html(context: dict[str, Any]) -> str:
+    valid = context.get("valid_substitutes_en") or []
+    non_substitutes = context.get("meaning_related_non_substitutes_en") or []
+    hints = []
+    if valid:
+        values = ", ".join(html.escape(str(value)) for value in valid)
+        hints.append(f"Подходит, но не целевой ответ: {values}")
+    if non_substitutes:
+        values = ", ".join(html.escape(str(value)) for value in non_substitutes)
+        hints.append(f"Смысл близкий, но сюда не вставляется: {values}")
+    if not hints:
+        return ""
+    return "<br><small>" + "<br>".join(hints) + "</small>"
 
 
 def _semantic_front_html(

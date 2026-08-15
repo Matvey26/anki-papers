@@ -421,7 +421,7 @@ def _semantic_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
                 target,
                 f"<b>{html.escape(replacement)}</b>",
                 raw=True,
-            ),
+            ) + _semantic_recall_distractors_html(context),
             "answer": html.escape(target),
             "source": html.escape(str(context["source"])),
         })
@@ -443,6 +443,21 @@ def _semantic_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
         values[0],
         "",
     )
+
+
+def _semantic_recall_distractors_html(context: dict[str, Any]) -> str:
+    valid = context.get("valid_substitutes_en") or []
+    non_substitutes = context.get("meaning_related_non_substitutes_en") or []
+    hints = []
+    if valid:
+        values = ", ".join(html.escape(str(value)) for value in valid)
+        hints.append(f"Подходит, но не целевой ответ: {values}")
+    if non_substitutes:
+        values = ", ".join(html.escape(str(value)) for value in non_substitutes)
+        hints.append(f"Смысл близкий, но сюда не вставляется: {values}")
+    if not hints:
+        return ""
+    return "<br><small>" + "<br>".join(hints) + "</small>"
 
 
 def _semantic_front_html(
