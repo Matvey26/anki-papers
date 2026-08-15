@@ -2012,8 +2012,8 @@ def enrich_highlight_row(
         "family_key": analysis.family_key, "part_of_speech": analysis.part_of_speech,
         "sense_definition_en": analysis.sense_definition_en,
         "valid_substitutes_en": analysis.source_distractors.valid_substitutes_en,
-        "meaning_related_non_substitutes_en": (
-            analysis.source_distractors.meaning_related_non_substitutes_en
+        "related_but_uninsertable_en": (
+            analysis.source_distractors.related_but_uninsertable_en
         ),
     }
     generated_context = {
@@ -2024,8 +2024,8 @@ def enrich_highlight_row(
         "family_key": analysis.family_key, "part_of_speech": analysis.part_of_speech,
         "sense_definition_en": analysis.sense_definition_en,
         "valid_substitutes_en": analysis.generated_distractors.valid_substitutes_en,
-        "meaning_related_non_substitutes_en": (
-            analysis.generated_distractors.meaning_related_non_substitutes_en
+        "related_but_uninsertable_en": (
+            analysis.generated_distractors.related_but_uninsertable_en
         ),
     }
     card_changed = True
@@ -2640,7 +2640,11 @@ def semantic_card_rows(card: sqlite3.Row) -> list[dict[str, str]]:
 
 def _semantic_recall_distractors_html(context: dict[str, Any]) -> str:
     valid = context.get("valid_substitutes_en") or []
-    non_substitutes = context.get("meaning_related_non_substitutes_en") or []
+    non_substitutes = (
+        context.get("related_but_uninsertable_en")
+        or context.get("meaning_related_non_substitutes_en")
+        or []
+    )
     hints = []
     if valid:
         values = ", ".join(html.escape(str(value)) for value in valid)

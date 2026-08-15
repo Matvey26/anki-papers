@@ -321,8 +321,8 @@ def make_contexts(
             "sentence": source.sentence,
             "replacement": analysis.replacement_ru,
             "valid_substitutes_en": analysis.source_distractors.valid_substitutes_en,
-            "meaning_related_non_substitutes_en": (
-                analysis.source_distractors.meaning_related_non_substitutes_en
+            "related_but_uninsertable_en": (
+                analysis.source_distractors.related_but_uninsertable_en
             ),
         },
         {
@@ -333,8 +333,8 @@ def make_contexts(
             "sentence": analysis.generated_sentence,
             "replacement": analysis.generated_translation_ru,
             "valid_substitutes_en": analysis.generated_distractors.valid_substitutes_en,
-            "meaning_related_non_substitutes_en": (
-                analysis.generated_distractors.meaning_related_non_substitutes_en
+            "related_but_uninsertable_en": (
+                analysis.generated_distractors.related_but_uninsertable_en
             ),
         },
     ]

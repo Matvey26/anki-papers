@@ -447,7 +447,11 @@ def _semantic_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
 
 def _semantic_recall_distractors_html(context: dict[str, Any]) -> str:
     valid = context.get("valid_substitutes_en") or []
-    non_substitutes = context.get("meaning_related_non_substitutes_en") or []
+    non_substitutes = (
+        context.get("related_but_uninsertable_en")
+        or context.get("meaning_related_non_substitutes_en")
+        or []
+    )
     hints = []
     if valid:
         values = ", ".join(html.escape(str(value)) for value in valid)

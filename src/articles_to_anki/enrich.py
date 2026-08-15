@@ -79,44 +79,29 @@ Return every input id once and only once. Follow the supplied JSON Schema exactl
 """
 
 SEMANTIC_SYSTEM_PROMPT = """\
-You are building high-quality English-to-Russian vocabulary cards for an advanced learner.
-Analyse ONE highlighted target in its full sentence. Return its canonical English lemma, one
-coarse part_of_speech (noun, verb, adjective, adverb, phrase, or other), and a short English
-definition of exactly the sense used here. Also return family_key: the lowercase canonical base
-of the learnable inflectional/derivational family. Examples: acquired and acquisition -> acquire;
-acknowledged and acknowledging -> acknowledge; recognition and recognizable -> recognize.
-Do not collapse unrelated words merely because they share spelling or an etymological root.
-Treat phrasal verbs and fixed multiword expressions as whole families.
+Build one advanced English-to-Russian vocabulary card from ONE highlighted target and its full
+sentence. Return its canonical lemma, coarse part_of_speech, and a short English definition of its
+exact contextual sense. family_key is the lowercase base shared by inflectional or derivational
+forms with the same semantic core. Spelling or etymology alone never joins unrelated meanings;
+treat fixed multiword expressions as units.
 
-Give 1-4 Russian translations for this sense, and replacement_ru in grammatical form for this
-specific source sentence. Then create exactly one NEW, realistic B2-or-harder academic context.
-It must use a natural inflected surface form of the same lemma, be self-contained, be different
-in syntax or collocation from the source sentence, and not claim to quote a real paper. Put that
-exact form in generated_surface. Never invent citations, statistics, named studies, authors, or
-URLs. generated_translation_ru must translate ONLY generated_surface, not the surrounding
-sentence. It must be a compact Russian phrase in the exact grammatical form needed when inserted
-into the otherwise English generated_sentence. Never translate, repeat, or summarize the full
-generated_sentence in generated_translation_ru.
+Give 1-4 precise Russian translations of the highlighted span. replacement_ru must translate only
+that span, preserving its contextual case, number, tense, and role without absorbing neighboring
+words. Create one self-contained, realistic B2+ academic sentence using a natural form of the same
+lemma in a different syntax or collocation. Put that exact form in generated_surface.
+generated_translation_ru follows the same span-only rule. Never invent sources or statistics.
 
-Build recall distractors separately for the source and generated contexts. Judge every candidate
-with this exact procedure: copy the full sentence, replace only the highlighted surface, change
-nothing else, then read the resulting literal sentence as a native editor would. Do not silently
-repair a neighboring verb, preposition, article, determiner, agreement, punctuation, or word
-order. Do not judge a candidate by imagining a different construction in which it could work.
-- valid_substitutes_en has a strict entry test: the literal substituted sentence must already be
-  natural and idiomatic as written, preserve the candidate's syntactic role and inflection, and
-  express substantially the same contextual meaning. These are other compact English answers
-  that genuinely fit, but are not the target answer this card is testing.
-- meaning_related_non_substitutes_en contains tempting compact English answers from the same
-  semantic neighborhood that fail that literal test because their grammatical form, syntactic
-  role, required preposition, or collocation does not fit this exact sentence. A dictionary
-  synonym that works only after editing surrounding text belongs here, not in valid_substitutes_en.
-Put each candidate in exactly one category. Never include the context's target itself, spelling or
-case variants, Russian words, antonyms, unrelated associations, explanations, or full sentences.
-Start every list empty. Add only defensible candidates; there is no quota and an empty list is
-valid. source_distractors must be judged against target and sentence. generated_distractors must
-be judged independently against generated_surface and generated_sentence.
-Return JSON only and follow the schema exactly.
+Build source_distractors and generated_distractors independently. For each candidate, literally
+replace only that context's highlighted surface and freeze all surrounding text:
+- valid_substitutes_en: the result is already natural, idiomatic, grammatical, and reasonably fits
+  the intended meaning, but the candidate is not the target answer.
+- related_but_uninsertable_en: a tempting related answer that fails exact insertion because
+  its form, syntactic role, preposition, or collocation does not fit. Semantic nuance alone never
+  puts a grammatically valid candidate here; omit candidates that change the claim too much.
+Never repair the sentence or test a different construction. Put a candidate in at most one list.
+Exclude the exact target and its spelling/case variants, Russian words, antonyms, unrelated items,
+explanations, and sentences. Start lists empty; add only defensible candidates, with no quota.
+Return only JSON matching the schema.
 """
 
 SEMANTIC_MATCH_PROMPT = """\
@@ -376,7 +361,7 @@ def analyse_semantic_context(
     content = result["choices"][0]["message"]["content"]
     if not isinstance(content, str):
         raise RuntimeError("OpenRouter returned non-text semantic analysis.")
-    analysis = SemanticAnalysis.model_validate_json(content)
+    analysis = SemanticAnalysis.model_validate_json(_strip_json_code_fence(content))
     if not _contains_exact_surface(
         analysis.generated_sentence,
         analysis.generated_surface,
@@ -397,7 +382,7 @@ def _validate_recall_distractors(
     normalized_target = " ".join(target.casefold().split())
     values = (
         distractors.valid_substitutes_en
-        + distractors.meaning_related_non_substitutes_en
+        + distractors.related_but_uninsertable_en
     )
     if any(" ".join(value.casefold().split()) == normalized_target for value in values):
         raise RuntimeError("Recall distractors must not contain the target itself.")
@@ -437,7 +422,9 @@ def select_semantic_match(
     content = result["choices"][0]["message"]["content"]
     if not isinstance(content, str):
         raise RuntimeError("OpenRouter returned non-text semantic match.")
-    response = SemanticMatchResponse.model_validate_json(content)
+    response = SemanticMatchResponse.model_validate_json(
+        _strip_json_code_fence(content)
+    )
     candidate_ids = {item.id for item in candidates}
     if response.match.card_id is not None and response.match.card_id not in candidate_ids:
         raise RuntimeError("OpenRouter selected a non-candidate semantic card.")
@@ -450,6 +437,12 @@ def _contains_exact_surface(sentence: str, surface: str) -> bool:
         sentence,
         flags=re.IGNORECASE,
     ) is not None
+
+
+def _strip_json_code_fence(content: str) -> str:
+    stripped = content.strip()
+    match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", stripped, flags=re.DOTALL)
+    return match.group(1) if match else stripped
 
 
 def _apply_model_generation_config(

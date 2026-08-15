@@ -131,11 +131,11 @@ class RecallDistractors(StrictModel):
         max_length=4,
         description=(
             "Other English answers that naturally replace exactly the highlighted span, "
-            "preserve its grammar/collocation and contextual meaning, but are not the target "
-            "this recall card is testing. Empty is valid."
+            "preserve its grammar/collocation and reasonably fit the contextual meaning, but "
+            "are not the target this recall card is testing. Empty is valid."
         ),
     )
-    meaning_related_non_substitutes_en: list[str] = Field(
+    related_but_uninsertable_en: list[str] = Field(
         min_length=0,
         max_length=4,
         description=(
@@ -147,7 +147,7 @@ class RecallDistractors(StrictModel):
 
     @field_validator(
         "valid_substitutes_en",
-        "meaning_related_non_substitutes_en",
+        "related_but_uninsertable_en",
     )
     @classmethod
     def unique_english_distractors(cls, values: list[str]) -> list[str]:
@@ -166,7 +166,7 @@ class RecallDistractors(StrictModel):
     def categories_must_not_overlap(self) -> RecallDistractors:
         valid = {value.casefold() for value in self.valid_substitutes_en}
         invalid = {
-            value.casefold() for value in self.meaning_related_non_substitutes_en
+            value.casefold() for value in self.related_but_uninsertable_en
         }
         if valid & invalid:
             raise ValueError("recall distractor categories must not overlap")

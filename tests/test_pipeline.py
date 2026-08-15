@@ -191,11 +191,11 @@ def test_semantic_deepseek_payloads_disable_reasoning(monkeypatch) -> None:
         generated_translation_ru="признал",
         source_distractors={
             "valid_substitutes_en": ["accepted"],
-            "meaning_related_non_substitutes_en": ["acceptance"],
+            "related_but_uninsertable_en": ["acceptance"],
         },
         generated_distractors={
             "valid_substitutes_en": ["recognized"],
-            "meaning_related_non_substitutes_en": ["recognition"],
+            "related_but_uninsertable_en": ["recognition"],
         },
     )
 
@@ -344,11 +344,11 @@ def test_semantic_analysis_rejects_loose_pos_and_non_russian_replacements() -> N
         "generated_translation_ru": "устойчивым",
         "source_distractors": {
             "valid_substitutes_en": [],
-            "meaning_related_non_substitutes_en": [],
+            "related_but_uninsertable_en": [],
         },
         "generated_distractors": {
             "valid_substitutes_en": [],
-            "meaning_related_non_substitutes_en": [],
+            "related_but_uninsertable_en": [],
         },
     }
     assert SemanticAnalysis(**values).part_of_speech == "adjective"
@@ -373,19 +373,19 @@ def test_semantic_analysis_rejects_loose_pos_and_non_russian_replacements() -> N
 def test_recall_distractor_categories_are_disjoint_and_allow_empty_lists() -> None:
     assert RecallDistractors(
         valid_substitutes_en=[],
-        meaning_related_non_substitutes_en=[],
+        related_but_uninsertable_en=[],
     ).valid_substitutes_en == []
     with pytest.raises(ValidationError):
         RecallDistractors(
             valid_substitutes_en=["account"],
-            meaning_related_non_substitutes_en=["Account"],
+            related_but_uninsertable_en=["Account"],
         )
 
 
 def test_recall_distractors_must_not_repeat_target() -> None:
     distractors = RecallDistractors(
         valid_substitutes_en=["account"],
-        meaning_related_non_substitutes_en=["thought"],
+        related_but_uninsertable_en=["thought"],
     )
     enrich_module._validate_recall_distractors("consideration", distractors)
     with pytest.raises(RuntimeError, match="must not contain the target"):
@@ -393,9 +393,15 @@ def test_recall_distractors_must_not_repeat_target() -> None:
             "take into account",
             RecallDistractors(
                 valid_substitutes_en=[" Take  into   Account "],
-                meaning_related_non_substitutes_en=[],
+                related_but_uninsertable_en=[],
             ),
         )
+
+
+def test_semantic_json_code_fence_is_removed_without_changing_json() -> None:
+    value = '{"lemma":"robust"}'
+    assert enrich_module._strip_json_code_fence(value) == value
+    assert enrich_module._strip_json_code_fence(f"```json\n{value}\n```") == value
 
 
 def test_generated_surface_must_be_a_complete_word_or_phrase() -> None:
