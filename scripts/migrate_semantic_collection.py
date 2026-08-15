@@ -157,7 +157,11 @@ def build_highlight_mapping(
             key=lambda source: (
                 (normalized(source.target), normalized(source.sentence))
                 == highlight_key,
-                -min(source.note_ids),
+                -(
+                    min(source.note_ids)
+                    if source.note_ids
+                    else 2**63 - 1
+                ),
             ),
             reverse=True,
         )

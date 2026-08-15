@@ -1594,6 +1594,15 @@ def migrate_cards_to_contexts(connection: sqlite3.Connection) -> None:
 
 def synchronize_card_highlights_by_context(connection: sqlite3.Connection) -> None:
     cards = connection.execute("SELECT * FROM cards").fetchall()
+    semantic_cards_by_highlight = {
+        str(row["highlight_id"]): row
+        for row in connection.execute(
+            """SELECT card_highlights.highlight_id, cards.*
+               FROM card_highlights
+               JOIN cards ON cards.id = card_highlights.card_id
+               WHERE cards.semantic_version = 1"""
+        ).fetchall()
+    }
     cards_by_context = {card_context_key(row): row for row in cards}
     cards_by_target = {
         (int(row["user_id"]), normalize_target(row["target"])): row
@@ -1605,7 +1614,9 @@ def synchronize_card_highlights_by_context(connection: sqlite3.Connection) -> No
     ).fetchall()
     for highlight in highlights:
         key = card_context_key(highlight)
-        card = cards_by_context.get(key)
+        card = semantic_cards_by_highlight.get(str(highlight["id"]))
+        if card is None:
+            card = cards_by_context.get(key)
         if card is None:
             template = cards_by_target.get((key[0], key[3]))
             card_id = str(uuid.uuid4())

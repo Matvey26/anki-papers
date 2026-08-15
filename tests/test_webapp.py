@@ -377,6 +377,14 @@ def test_same_word_in_same_sense_merges_contexts(
     assert "durable" not in rows[1]["Front"]
     assert "resilience" not in rows[1]["Front"]
 
+    restarted = make_app(tmp_path)
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 1
+        assert database.execute("SELECT COUNT(*) FROM card_highlights").fetchone()[0] == 2
+    restarted.extensions["highlight_executor"].shutdown(
+        wait=False, cancel_futures=True
+    )
+
 
 def test_lexical_family_merges_derivations_but_splits_polysemy(
     tmp_path: Path, monkeypatch
