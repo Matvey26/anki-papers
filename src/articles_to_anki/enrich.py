@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import json
 import os
 import re
 import time
 import urllib.error
 import urllib.request
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -84,7 +84,10 @@ specific source sentence. Then create exactly one NEW, realistic B2-or-harder ac
 It must use a natural inflected surface form of the same lemma, be self-contained, be different
 in syntax or collocation from the source sentence, and not claim to quote a real paper. Put that
 exact form in generated_surface. Never invent citations, statistics, named studies, authors, or
-URLs. generated_translation_ru must translate generated_surface in that generated sentence.
+URLs. generated_translation_ru must translate ONLY generated_surface, not the surrounding
+sentence. It must be a compact Russian phrase in the exact grammatical form needed when inserted
+into the otherwise English generated_sentence. Never translate, repeat, or summarize the full
+generated_sentence in generated_translation_ru.
 Return JSON only and follow the schema exactly.
 """
 

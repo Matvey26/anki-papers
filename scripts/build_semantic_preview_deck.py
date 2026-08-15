@@ -98,11 +98,27 @@ def source_label(tags: list[str]) -> str:
     return " · ".join(labels) if labels else "original_deck"
 
 
-def extract_source_contexts(collection_path: Path) -> list[SourceContext]:
+def extract_source_contexts(
+    collection_path: Path,
+    *,
+    source_deck_name: str | None = None,
+) -> list[SourceContext]:
     collection = Collection(str(collection_path))
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
     try:
-        for note_id in collection.find_notes(""):
+        if source_deck_name is None:
+            note_ids = collection.find_notes("")
+        else:
+            source_deck = collection.decks.by_name(source_deck_name)
+            if source_deck is None:
+                raise ValueError(f"Source deck does not exist: {source_deck_name}")
+            note_ids = sorted(
+                {
+                    int(collection.get_card(card_id).nid)
+                    for card_id in collection.find_cards(f"did:{source_deck['id']}")
+                }
+            )
+        for note_id in note_ids:
             note = collection.get_note(note_id)
             if len(note.fields) < 2:
                 continue
@@ -205,10 +221,13 @@ def analyse_contexts(
         raw_cache = json.loads(cache_path.read_text(encoding="utf-8"))
     else:
         raw_cache = {}
-    analyses: dict[str, SemanticAnalysis] = {
-        key: SemanticAnalysis.model_validate(value)
-        for key, value in raw_cache.items()
-    }
+    analyses: dict[str, SemanticAnalysis] = {}
+    for key, value in raw_cache.items():
+        try:
+            analyses[key] = SemanticAnalysis.model_validate(value)
+        except ValueError:
+            # Schema hardening intentionally invalidates stale provider output.
+            continue
     pending = [context for context in contexts if context.id not in analyses]
     if not pending:
         return analyses
@@ -422,6 +441,7 @@ def build_apkg(
     *,
     output_path: Path,
     deck_name: str,
+    guid_namespace: str = "semantic-preview-v1",
 ) -> None:
     collection_path = output_path.with_name("semantic-preview-build.anki2")
     collection_path.unlink(missing_ok=True)
@@ -448,7 +468,7 @@ def build_apkg(
                 note.guid = base91(
                     int.from_bytes(
                         hashlib.sha256(
-                            f"preview:{cluster['id']}:{direction}".encode()
+                            f"{guid_namespace}:{cluster['id']}:{direction}".encode()
                         ).digest()[:8],
                         "big",
                     )
@@ -592,6 +612,16 @@ def main() -> None:
         default="Anki Papers Semantic Dedup Preview — 2026-08-15",
     )
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--source-deck")
+    parser.add_argument(
+        "--guid-namespace",
+        default="semantic-preview-v1",
+        help="Change this when a preview must coexist with an older imported package.",
+    )
+    parser.add_argument(
+        "--output-name",
+        default="anki-papers-semantic-dedup-preview.apkg",
+    )
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -601,7 +631,10 @@ def main() -> None:
         raise SystemExit("OPENROUTER_API_KEY is missing")
     model = os.environ.get("OPENROUTER_SEMANTIC_MODEL", DEFAULT_SEMANTIC_MODEL)
 
-    contexts = extract_source_contexts(args.source.resolve())
+    contexts = extract_source_contexts(
+        args.source.resolve(),
+        source_deck_name=args.source_deck,
+    )
     write_json(
         args.output_dir / "source-contexts.json",
         [asdict(context) for context in contexts],
@@ -630,8 +663,13 @@ def main() -> None:
     }
     write_json(args.output_dir / "semantic-manifest.json", manifest)
     write_report(args.output_dir / "semantic-dedup-report.csv", clusters)
-    output_path = args.output_dir / "anki-papers-semantic-dedup-preview.apkg"
-    build_apkg(clusters, output_path=output_path, deck_name=args.deck_name)
+    output_path = args.output_dir / args.output_name
+    build_apkg(
+        clusters,
+        output_path=output_path,
+        deck_name=args.deck_name,
+        guid_namespace=args.guid_namespace,
+    )
     verification = verify_apkg(
         output_path,
         deck_name=args.deck_name,

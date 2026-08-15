@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import csv
 
+import pytest
+from pydantic import ValidationError
+
 import articles_to_anki.enrich as enrich_module
 from articles_to_anki.cli import _exclude_processed_targets, _load_excluded_targets
 from articles_to_anki.enrich import build_openrouter_payload, enrich_targets
 from articles_to_anki.export import write_anki_csv
 from articles_to_anki.extract import (
-    ExtractionConfig,
     RECALL_PLACEHOLDER,
+    ExtractionConfig,
     Token,
     _group_selected_tokens,
     _pdf_quad_to_region,
@@ -16,9 +19,6 @@ from articles_to_anki.extract import (
     is_sentence_end,
     render_sentence,
 )
-import pytest
-from pydantic import ValidationError
-
 from articles_to_anki.models import (
     EnrichedItem,
     EnrichmentRequestItem,
@@ -245,6 +245,15 @@ def test_semantic_analysis_rejects_loose_pos_and_non_russian_replacements() -> N
         SemanticAnalysis(**{**values, "replacement_ru": "reliable"})
     with pytest.raises(ValidationError):
         SemanticAnalysis(**{**values, "generated_translation_ru": "stable"})
+    with pytest.raises(ValidationError):
+        SemanticAnalysis(
+            **{
+                **values,
+                "generated_translation_ru": (
+                    "Оценка оставалась устойчивой даже при очень сильном внешнем шуме"
+                ),
+            }
+        )
 
 
 def test_generated_surface_must_be_a_complete_word_or_phrase() -> None:

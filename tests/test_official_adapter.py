@@ -100,7 +100,15 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
         "part_of_speech": "verb", "sense_definition_en": "deal successfully with a difficulty",
         "translations": ["преодолеть"], "contexts": [
             {"id": "a", "source": "user_pdf", "target": "overcame", "sentence": "She overcame the limitation.", "replacement": "преодолела"},
-            {"id": "b", "source": "llm_generated", "target": "overcome", "sentence": "Teams must overcome hidden assumptions.", "replacement": "преодолеть"},
+            {
+                "id": "b",
+                "source": "llm_generated",
+                "target": "overcome",
+                "sentence": "Teams must overcome hidden assumptions.",
+                "replacement": (
+                    "Команды должны преодолеть скрытые допущения до начала анализа"
+                ),
+            },
         ],
     }
     note = OfficialAnkiAdapter._add_note(collection, card, "meaning", 1)
@@ -111,8 +119,19 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
     assert "><b>overcame</b></div>" in note.fields[1]
     assert (
         'data-contexts="' in note.fields[0]
-        and '>She <b>overcame</b> the limitation.<br><small>' in note.fields[0]
+        and '>She <b>overcame</b> the limitation.</div><script>' in note.fields[0]
     )
+    assert "item.source" not in note.fields[0]
+    assert "item.translation" not in note.fields[0]
+    assert "family:" not in note.fields[1]
+    recall = OfficialAnkiAdapter._add_note(collection, card, "recall", 1)
+    assert "[...]" not in recall.fields[0]
+    assert "She <b>преодолела</b> the limitation." in recall.fields[0]
+    assert (
+        "Teams must &lt;b&gt;преодолеть&lt;/b&gt; hidden assumptions."
+        in recall.fields[0]
+    )
+    assert "llm_generated" in recall.fields[0]
     card["contexts"].append(
         {"id": "c", "source": "llm_generated", "target": "Overcoming", "sentence": "Overcoming noise required repeated trials.", "replacement": "преодоление"}
     )

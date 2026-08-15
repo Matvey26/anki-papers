@@ -2574,24 +2574,36 @@ def semantic_card_rows(card: sqlite3.Row) -> list[dict[str, str]]:
     contexts = json.loads(card["contexts_json"] or "[]")
     if not contexts:
         raise ValueError("Semantic card has no contexts")
+    translations_values = json.loads(card["translations_json"])
+    fallback_replacement = str(translations_values[0])
     rendered = []
     for item in contexts:
         target = str(item["target"])
         sentence = str(item["sentence"])
+        replacement = _compact_semantic_replacement(
+            str(item["replacement"]),
+            fallback=fallback_replacement,
+            english_surface=target,
+        )
         rendered.append({
             "front": emphasize_target(sentence, target, html.escape(target)),
-            "recall": emphasize_target(sentence, target, "<b>[...]</b>", replacement_is_html=True),
+            "recall": emphasize_target(
+                sentence,
+                target,
+                f"<b>{html.escape(replacement)}</b>",
+                replacement_is_html=True,
+            ),
             "answer": html.escape(target),
-            "translation": html.escape(str(item["replacement"])),
             "source": html.escape(str(item["source"])),
         })
     payload = html.escape(json.dumps(rendered, ensure_ascii=False), quote=True)
     key = html.escape(str(card["id"]), quote=True)
     front = _semantic_front_html(payload, key, "front", rendered[0])
     recall = _semantic_front_html(payload, key, "recall", rendered[0])
-    translations = "<br>".join(f"• {html.escape(value)}" for value in json.loads(card["translations_json"]))
+    translations = "<br>".join(
+        f"• {html.escape(value)}" for value in translations_values
+    )
     sense = html.escape(str(card["sense_definition_en"]))
-    family = html.escape(str(card["family_key"] or card["lemma"]))
     family_tag = re.sub(
         r"[^A-Za-z0-9_:-]+",
         "_",
@@ -2603,14 +2615,14 @@ def semantic_card_rows(card: sqlite3.Row) -> list[dict[str, str]]:
         key,
         "front",
         rendered[0],
-        f"<br><small>family: {family}</small><br>{translations}<br><small>{sense}</small>",
+        f"<br>{translations}<br><small>{sense}</small>",
     )
     recall_back = _semantic_back_html(
         payload,
         key,
         "recall",
         rendered[0],
-        f"<br><small>family: {family}</small>",
+        "",
     )
     return [
         {"Front": front, "Back": meaning_back, "Tags": f"{common} card::meaning"},
@@ -2625,10 +2637,7 @@ def _semantic_front_html(
     fallback: dict[str, str],
 ) -> str:
     # sessionStorage keeps question and answer on same context in clients that reload the page.
-    fallback_html = (
-        f'{fallback[side]}<br><small>{fallback["translation"]} · '
-        f'{fallback["source"]}</small>'
-    )
+    fallback_html = fallback[side]
     return (
         f'<div class="anki-papers-semantic" data-key="{key}" data-side="{side}" '
         f'data-contexts="{payload}">{fallback_html}</div><script>(function(){{'
@@ -2638,7 +2647,7 @@ def _semantic_front_html(
         'var now=Date.now(),valid=stored&&stored.until>now&&Number.isInteger(stored.index)&&'
         'stored.index>=0&&stored.index<items.length,index=valid?stored.index:Math.floor(Math.random()*items.length);'
         'try{sessionStorage.setItem(key,JSON.stringify({index:index,until:now+120000}))}catch(e){}'
-        'var item=items[index];root.innerHTML=item[root.dataset.side]+"<br><small>"+item.translation+" · "+item.source+"</small>";'
+        'var item=items[index];root.innerHTML=item[root.dataset.side];'
         '})();</script>'
     )
 
@@ -2669,6 +2678,23 @@ def emphasize_target(sentence: str, target: str, replacement: str, *, replacemen
         return html.escape(sentence)
     selected = replacement if replacement_is_html else f"<b>{replacement}</b>"
     return f"{html.escape(sentence[:match.start()])}{selected}{html.escape(sentence[match.end():])}"
+
+
+def _compact_semantic_replacement(
+    value: str,
+    *,
+    fallback: str,
+    english_surface: str,
+) -> str:
+    cleaned = " ".join(value.split())
+    words = re.findall(r"[A-Za-zА-Яа-яЁё0-9-]+", cleaned)
+    surface_words = re.findall(r"[A-Za-z0-9-]+", english_surface)
+    maximum_words = min(8, max(5, len(surface_words) * 2 + 1))
+    if len(words) > maximum_words or any(
+        mark in cleaned for mark in ("\n", ".", ";", "!", "?")
+    ):
+        return fallback
+    return cleaned or fallback
 
 
 def safe_download_name(value: str) -> str:

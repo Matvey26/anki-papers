@@ -405,25 +405,34 @@ def _semantic_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
     if not contexts:
         raise PermanentSyncError("semantic_card_without_contexts")
     values = []
+    fallback_replacement = str(card["translations"][0])
     for context in contexts:
         target = str(context["target"])
         sentence = str(context["sentence"])
+        replacement = _compact_semantic_replacement(
+            str(context["replacement"]),
+            fallback=fallback_replacement,
+            english_surface=target,
+        )
         values.append({
             "front": _replace_target(sentence, target, html.escape(target)),
-            "recall": _replace_target(sentence, target, "<b>[...]</b>", raw=True),
+            "recall": _replace_target(
+                sentence,
+                target,
+                f"<b>{html.escape(replacement)}</b>",
+                raw=True,
+            ),
             "answer": html.escape(target),
-            "translation": html.escape(str(context["replacement"])),
             "source": html.escape(str(context["source"])),
         })
     payload = html.escape(json.dumps(values, ensure_ascii=False), quote=True)
     side = "front" if direction == "meaning" else "recall"
     key = html.escape(str(card["id"]), quote=True)
     front = _semantic_front_html(payload, key, side, values[0])
-    family = html.escape(str(card.get("family_key") or card["lemma"]))
     if direction == "meaning":
         translations = "<br>".join(f"• {html.escape(str(item))}" for item in card["translations"])
         details = (
-            f"<br><small>family: {family}</small><br>{translations}<br><small>"
+            f"<br>{translations}<br><small>"
             f"{html.escape(str(card['sense_definition_en']))}</small>"
         )
         return front, _semantic_back_html(payload, key, side, values[0], details)
@@ -432,7 +441,7 @@ def _semantic_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
         key,
         side,
         values[0],
-        f"<br><small>family: {family}</small>",
+        "",
     )
 
 
@@ -442,10 +451,7 @@ def _semantic_front_html(
     side: str,
     fallback: dict[str, str],
 ) -> str:
-    fallback_html = (
-        f'{fallback[side]}<br><small>{fallback["translation"]} · '
-        f'{fallback["source"]}</small>'
-    )
+    fallback_html = fallback[side]
     return (
         f'<div class="anki-papers-semantic" data-key="{key}" data-side="{side}" '
         f'data-contexts="{payload}">{fallback_html}</div>'
@@ -455,7 +461,7 @@ def _semantic_front_html(
         'valid=stored&&stored.until>now&&Number.isInteger(stored.index)&&stored.index>=0&&'
         'stored.index<items.length,index=valid?stored.index:Math.floor(Math.random()*items.length);'
         'try{sessionStorage.setItem(key,JSON.stringify({index:index,until:now+120000}))}catch(e){}'
-        'var item=items[index];root.innerHTML=item[root.dataset.side]+"<br><small>"+item.translation+" · "+item.source+"</small>";})();</script>'
+        'var item=items[index];root.innerHTML=item[root.dataset.side];})();</script>'
     )
 
 
@@ -485,6 +491,23 @@ def _replace_target(sentence: str, target: str, replacement: str, raw: bool = Fa
         return html.escape(sentence)
     selected = replacement if raw else f"<b>{replacement}</b>"
     return html.escape(sentence[: match.start()]) + selected + html.escape(sentence[match.end() :])
+
+
+def _compact_semantic_replacement(
+    value: str,
+    *,
+    fallback: str,
+    english_surface: str,
+) -> str:
+    cleaned = " ".join(value.split())
+    words = re.findall(r"[A-Za-zА-Яа-яЁё0-9-]+", cleaned)
+    surface_words = re.findall(r"[A-Za-z0-9-]+", english_surface)
+    maximum_words = min(8, max(5, len(surface_words) * 2 + 1))
+    if len(words) > maximum_words or any(
+        mark in cleaned for mark in ("\n", ".", ";", "!", "?")
+    ):
+        return fallback
+    return cleaned or fallback
 
 
 def _plain(value: str) -> str:

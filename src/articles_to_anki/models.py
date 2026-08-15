@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -131,7 +132,14 @@ class SemanticAnalysis(StrictModel):
     replacement_ru: str = Field(min_length=1, max_length=100)
     generated_sentence: str = Field(min_length=12, max_length=500)
     generated_surface: str = Field(min_length=1, max_length=100)
-    generated_translation_ru: str = Field(min_length=1, max_length=100)
+    generated_translation_ru: str = Field(
+        min_length=1,
+        max_length=100,
+        description=(
+            "A compact Russian replacement for generated_surface only, in the exact "
+            "grammatical form required by generated_sentence; never a sentence translation."
+        ),
+    )
 
     @field_validator("lemma", "sense_definition_en", "generated_sentence", "generated_surface")
     @classmethod
@@ -169,6 +177,28 @@ class SemanticAnalysis(StrictModel):
         ):
             raise ValueError("replacement must contain Cyrillic")
         return cleaned
+
+    @model_validator(mode="after")
+    def replacements_are_compact_phrases(self) -> SemanticAnalysis:
+        for field_name, value, english_surface in (
+            ("replacement_ru", self.replacement_ru, self.lemma),
+            (
+                "generated_translation_ru",
+                self.generated_translation_ru,
+                self.generated_surface,
+            ),
+        ):
+            russian_words = re.findall(r"[A-Za-zА-Яа-яЁё0-9-]+", value)
+            english_words = re.findall(r"[A-Za-z0-9-]+", english_surface)
+            maximum_words = min(8, max(5, len(english_words) * 2 + 1))
+            if len(russian_words) > maximum_words:
+                raise ValueError(
+                    f"{field_name} must translate only the highlighted surface, "
+                    "not the full sentence"
+                )
+            if any(mark in value for mark in ("\n", ".", ";", "!", "?")):
+                raise ValueError(f"{field_name} must not contain sentence punctuation")
+        return self
 
 
 class SemanticCandidate(StrictModel):

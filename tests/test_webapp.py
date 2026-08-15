@@ -185,7 +185,7 @@ def test_register_upload_add_and_export_only_new_cards(
     rows = list(
         csv.DictReader(io.StringIO(exported.data.decode("utf-8-sig")))
     )
-    assert '>This is a <b>robust</b> result.<br><small>' in rows[0]["Front"]
+    assert '>This is a <b>robust</b> result.</div><script>' in rows[0]["Front"]
 
     no_new = client.post("/export/csv", data={"csrf_token": token}, follow_redirects=True)
     assert "Новых карточек для CSV нет" in no_new.text
@@ -497,6 +497,12 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
     assert "anki-papers-semantic-answer" in exported_rows[1]["Back"]
     assert "acquired" in exported_rows[1]["Back"]
     assert "acquisition" in exported_rows[1]["Back"]
+    assert "[...]" not in exported_rows[1]["Front"]
+    assert "приобрела" in exported_rows[1]["Front"]
+    assert "получение" in exported_rows[1]["Front"]
+    assert "item.source" not in exported_rows[1]["Front"]
+    assert "item.translation" not in exported_rows[1]["Front"]
+    assert "family:" not in exported_rows[1]["Back"]
 
 
 def test_highlight_is_enriched_saved_and_downloaded_in_pdf(
