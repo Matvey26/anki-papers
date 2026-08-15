@@ -190,12 +190,16 @@ def test_semantic_deepseek_payloads_disable_reasoning(monkeypatch) -> None:
         generated_surface="acknowledged",
         generated_translation_ru="признал",
         source_distractors={
+            "substitutes_en": ["accepted"],
+            "related_en": ["acceptance"],
             "valid_substitutes_en": ["accepted"],
-            "related_but_uninsertable_en": ["acceptance"],
+            "valid_related_en": ["acceptance"],
         },
         generated_distractors={
+            "substitutes_en": ["recognized"],
+            "related_en": ["recognition"],
             "valid_substitutes_en": ["recognized"],
-            "related_but_uninsertable_en": ["recognition"],
+            "valid_related_en": ["recognition"],
         },
     )
 
@@ -343,12 +347,16 @@ def test_semantic_analysis_rejects_loose_pos_and_non_russian_replacements() -> N
         "generated_surface": "robust",
         "generated_translation_ru": "устойчивым",
         "source_distractors": {
+            "substitutes_en": [],
+            "related_en": [],
             "valid_substitutes_en": [],
-            "related_but_uninsertable_en": [],
+            "valid_related_en": [],
         },
         "generated_distractors": {
+            "substitutes_en": [],
+            "related_en": [],
             "valid_substitutes_en": [],
-            "related_but_uninsertable_en": [],
+            "valid_related_en": [],
         },
     }
     assert SemanticAnalysis(**values).part_of_speech == "adjective"
@@ -370,30 +378,45 @@ def test_semantic_analysis_rejects_loose_pos_and_non_russian_replacements() -> N
         )
 
 
-def test_recall_distractor_categories_are_disjoint_and_allow_empty_lists() -> None:
+def test_recall_distractor_lists_allow_empty_values_and_cross_category_overlap() -> None:
     assert RecallDistractors(
+        substitutes_en=[],
+        related_en=[],
         valid_substitutes_en=[],
-        related_but_uninsertable_en=[],
+        valid_related_en=[],
     ).valid_substitutes_en == []
+    overlapping = RecallDistractors(
+        substitutes_en=["account"],
+        related_en=["Account"],
+        valid_substitutes_en=["account"],
+        valid_related_en=["Account"],
+    )
+    assert overlapping.valid_related_en == ["Account"]
     with pytest.raises(ValidationError):
         RecallDistractors(
-            valid_substitutes_en=["account"],
-            related_but_uninsertable_en=["Account"],
+            substitutes_en=["account", "Account"],
+            related_en=[],
+            valid_substitutes_en=[],
+            valid_related_en=[],
         )
 
 
 def test_recall_distractors_must_not_repeat_target() -> None:
     distractors = RecallDistractors(
+        substitutes_en=["account"],
+        related_en=["thought"],
         valid_substitutes_en=["account"],
-        related_but_uninsertable_en=["thought"],
+        valid_related_en=["thought"],
     )
     enrich_module._validate_recall_distractors("consideration", distractors)
     with pytest.raises(RuntimeError, match="must not contain the target"):
         enrich_module._validate_recall_distractors(
             "take into account",
             RecallDistractors(
+                substitutes_en=[" Take  into   Account "],
+                related_en=[],
                 valid_substitutes_en=[" Take  into   Account "],
-                related_but_uninsertable_en=[],
+                valid_related_en=[],
             ),
         )
 

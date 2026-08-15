@@ -102,8 +102,10 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
             {
                 "id": "a", "source": "user_pdf", "target": "overcame",
                 "sentence": "She overcame the limitation.", "replacement": "преодолела",
+                "substitutes_en": ["surmounted", "conquered"],
+                "related_en": ["surmounted", "overcoming"],
                 "valid_substitutes_en": ["surmounted"],
-                "meaning_related_non_substitutes_en": ["overcoming"],
+                "valid_related_en": ["surmounted", "overcoming"],
             },
             {
                 "id": "b",
@@ -133,7 +135,8 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
     assert "[...]" not in recall.fields[0]
     assert "She <b>преодолела</b> the limitation." in recall.fields[0]
     assert "Подходит, но не целевой ответ: surmounted" in recall.fields[0]
-    assert "Смысл близкий, но сюда не вставляется: overcoming" in recall.fields[0]
+    assert "Близко по смыслу: overcoming" in recall.fields[0]
+    assert "conquered" not in recall.fields[0]
     assert (
         "Teams must &lt;b&gt;преодолеть&lt;/b&gt; hidden assumptions."
         in recall.fields[0]

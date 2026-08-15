@@ -98,12 +98,16 @@ def install_fake_enrichment(monkeypatch) -> None:
             generated_surface="robust",
             generated_translation_ru="устойчивым",
             source_distractors={
+                "substitutes_en": ["strong", "durable"],
+                "related_en": ["strength", "resilience"],
                 "valid_substitutes_en": ["strong"],
-                "related_but_uninsertable_en": ["strength"],
+                "valid_related_en": ["strength"],
             },
             generated_distractors={
+                "substitutes_en": ["reliable"],
+                "related_en": ["reliability"],
                 "valid_substitutes_en": ["reliable"],
-                "related_but_uninsertable_en": ["reliability"],
+                "valid_related_en": ["reliability"],
             },
         )
 
@@ -349,8 +353,10 @@ def test_same_word_in_same_sense_merges_contexts(
         assert card[1] == 1
         contexts = json.loads(card[0])
         assert len(contexts) == 4
+        assert contexts[0]["substitutes_en"] == ["strong", "durable"]
+        assert contexts[0]["related_en"] == ["strength", "resilience"]
         assert contexts[0]["valid_substitutes_en"] == ["strong"]
-        assert contexts[0]["related_but_uninsertable_en"] == ["strength"]
+        assert contexts[0]["valid_related_en"] == ["strength"]
         full_card = database.execute(
             "SELECT * FROM cards WHERE target_normalized = 'robust'"
         ).fetchone()
@@ -360,7 +366,9 @@ def test_same_word_in_same_sense_merges_contexts(
         )
     )
     assert "Подходит, но не целевой ответ: strong" in rows[1]["Front"]
-    assert "Смысл близкий, но сюда не вставляется: strength" in rows[1]["Front"]
+    assert "Близко по смыслу: strength" in rows[1]["Front"]
+    assert "durable" not in rows[1]["Front"]
+    assert "resilience" not in rows[1]["Front"]
 
 
 def test_lexical_family_merges_derivations_but_splits_polysemy(
@@ -378,8 +386,8 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
             generated_sentence="The laboratory acquired a more precise sensor.",
             generated_surface="acquired",
             generated_translation_ru="приобрела",
-            source_distractors={"valid_substitutes_en": [], "related_but_uninsertable_en": []},
-            generated_distractors={"valid_substitutes_en": [], "related_but_uninsertable_en": []},
+            source_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
+            generated_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
         ),
         "acquisition": SemanticAnalysis(
             lemma="acquisition",
@@ -391,8 +399,8 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
             generated_sentence="Data acquisition requires careful calibration.",
             generated_surface="acquisition",
             generated_translation_ru="сбор",
-            source_distractors={"valid_substitutes_en": [], "related_but_uninsertable_en": []},
-            generated_distractors={"valid_substitutes_en": [], "related_but_uninsertable_en": []},
+            source_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
+            generated_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
         ),
         "recognize-identify": SemanticAnalysis(
             lemma="recognize",
@@ -404,8 +412,8 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
             generated_sentence="The model can recognize partially hidden symbols.",
             generated_surface="recognize",
             generated_translation_ru="распознавать",
-            source_distractors={"valid_substitutes_en": [], "related_but_uninsertable_en": []},
-            generated_distractors={"valid_substitutes_en": [], "related_but_uninsertable_en": []},
+            source_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
+            generated_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
         ),
         "recognize-admit": SemanticAnalysis(
             lemma="recognize",
@@ -417,8 +425,8 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
             generated_sentence="The review must recognize the study's limitations.",
             generated_surface="recognize",
             generated_translation_ru="признать",
-            source_distractors={"valid_substitutes_en": [], "related_but_uninsertable_en": []},
-            generated_distractors={"valid_substitutes_en": [], "related_but_uninsertable_en": []},
+            source_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
+            generated_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
         ),
     }
 

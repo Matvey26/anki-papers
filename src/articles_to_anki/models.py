@@ -126,6 +126,23 @@ SemanticPartOfSpeech = Literal[
 
 
 class RecallDistractors(StrictModel):
+    substitutes_en: list[str] = Field(
+        min_length=0,
+        max_length=12,
+        description=(
+            "Broad brainstorm of English words or phrases that can literally replace the "
+            "highlighted span while leaving a natural, meaningful sentence. Meaning may "
+            "shift and style may be imperfect."
+        ),
+    )
+    related_en: list[str] = Field(
+        min_length=0,
+        max_length=12,
+        description=(
+            "Broad brainstorm of the closest English semantic neighbors, regardless of "
+            "whether they fit the sentence's exact grammar or collocation."
+        ),
+    )
     valid_substitutes_en: list[str] = Field(
         min_length=0,
         max_length=4,
@@ -135,19 +152,21 @@ class RecallDistractors(StrictModel):
             "are not the target this recall card is testing. Empty is valid."
         ),
     )
-    related_but_uninsertable_en: list[str] = Field(
+    valid_related_en: list[str] = Field(
         min_length=0,
         max_length=4,
         description=(
-            "Tempting English answers from the same semantic neighborhood that cannot replace "
-            "the exact highlighted span without breaking grammar, syntactic form, or "
-            "collocation. Never include antonyms or unrelated words. Empty is valid."
+            "High-confidence English words or phrases closest to the highlighted meaning, "
+            "regardless of whether exact insertion fits the sentence. Never include antonyms "
+            "or distant associations. Empty is valid."
         ),
     )
 
     @field_validator(
+        "substitutes_en",
+        "related_en",
         "valid_substitutes_en",
-        "related_but_uninsertable_en",
+        "valid_related_en",
     )
     @classmethod
     def unique_english_distractors(cls, values: list[str]) -> list[str]:
@@ -161,17 +180,6 @@ class RecallDistractors(StrictModel):
         ):
             raise ValueError("recall distractors must contain English letters")
         return cleaned
-
-    @model_validator(mode="after")
-    def categories_must_not_overlap(self) -> RecallDistractors:
-        valid = {value.casefold() for value in self.valid_substitutes_en}
-        invalid = {
-            value.casefold() for value in self.related_but_uninsertable_en
-        }
-        if valid & invalid:
-            raise ValueError("recall distractor categories must not overlap")
-        return self
-
 
 class SemanticAnalysis(StrictModel):
     """LLM result used to group contexts into one learnable lexical sense."""

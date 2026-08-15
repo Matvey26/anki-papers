@@ -91,16 +91,21 @@ words. Create one self-contained, realistic B2+ academic sentence using a natura
 lemma in a different syntax or collocation. Put that exact form in generated_surface.
 generated_translation_ru follows the same span-only rule. Never invent sources or statistics.
 
-Build source_distractors and generated_distractors independently. For each candidate, literally
-replace only that context's highlighted surface and freeze all surrounding text:
-- valid_substitutes_en: the result is already natural, idiomatic, grammatical, and reasonably fits
-  the intended meaning, but the candidate is not the target answer.
-- related_but_uninsertable_en: a tempting related answer that fails exact insertion because
-  its form, syntactic role, preposition, or collocation does not fit. Semantic nuance alone never
-  puts a grammatically valid candidate here; omit candidates that change the claim too much.
-Never repair the sentence or test a different construction. Put a candidate in at most one list.
-Exclude the exact target and its spelling/case variants, Russian words, antonyms, unrelated items,
-explanations, and sentences. Start lists empty; add only defensible candidates, with no quota.
+Build source_distractors and generated_distractors independently in two stages. First brainstorm:
+- substitutes_en: as many defensible words or compact phrases as the schema allows that can replace
+  only the highlighted surface while all surrounding text stays frozen. The result must read as a
+  natural, meaningful sentence; a meaning shift or slight style mismatch is allowed.
+- related_en: as many close semantic neighbors as possible, whether or not exact insertion works.
+  Exclude distant associations, antonyms, and words needing major semantic qualifications.
+Then judge the visible subsets conservatively:
+- valid_substitutes_en: only high-confidence items from substitutes_en that pass literal insertion.
+- valid_related_en: only high-confidence items from related_en that are closest in meaning,
+  regardless of whether literal insertion works. Overlap between valid lists is allowed.
+Before adding any substitute, silently read the full literal result. In a fixed frame or strong
+collocation, accept only words established with the same neighbors; reject any candidate needing a
+different verb, preposition, determiner, or word order. Never repair the sentence or test a
+different construction. Exclude the target and spelling/case variants, Russian words,
+explanations, and sentences. Valid lists may be empty; quality beats count.
 Return only JSON matching the schema.
 """
 
@@ -381,8 +386,10 @@ def _validate_recall_distractors(
 ) -> None:
     normalized_target = " ".join(target.casefold().split())
     values = (
-        distractors.valid_substitutes_en
-        + distractors.related_but_uninsertable_en
+        distractors.substitutes_en
+        + distractors.related_en
+        + distractors.valid_substitutes_en
+        + distractors.valid_related_en
     )
     if any(" ".join(value.casefold().split()) == normalized_target for value in values):
         raise RuntimeError("Recall distractors must not contain the target itself.")

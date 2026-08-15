@@ -2011,10 +2011,10 @@ def enrich_highlight_row(
         "translations": analysis.translations_ru, "lemma": analysis.lemma,
         "family_key": analysis.family_key, "part_of_speech": analysis.part_of_speech,
         "sense_definition_en": analysis.sense_definition_en,
+        "substitutes_en": analysis.source_distractors.substitutes_en,
+        "related_en": analysis.source_distractors.related_en,
         "valid_substitutes_en": analysis.source_distractors.valid_substitutes_en,
-        "related_but_uninsertable_en": (
-            analysis.source_distractors.related_but_uninsertable_en
-        ),
+        "valid_related_en": analysis.source_distractors.valid_related_en,
     }
     generated_context = {
         "id": f"generated:{row['id']}", "source": "llm_generated",
@@ -2023,10 +2023,10 @@ def enrich_highlight_row(
         "translations": analysis.translations_ru, "lemma": analysis.lemma,
         "family_key": analysis.family_key, "part_of_speech": analysis.part_of_speech,
         "sense_definition_en": analysis.sense_definition_en,
+        "substitutes_en": analysis.generated_distractors.substitutes_en,
+        "related_en": analysis.generated_distractors.related_en,
         "valid_substitutes_en": analysis.generated_distractors.valid_substitutes_en,
-        "related_but_uninsertable_en": (
-            analysis.generated_distractors.related_but_uninsertable_en
-        ),
+        "valid_related_en": analysis.generated_distractors.valid_related_en,
     }
     card_changed = True
     if match.card_id is not None:
@@ -2640,18 +2640,23 @@ def semantic_card_rows(card: sqlite3.Row) -> list[dict[str, str]]:
 
 def _semantic_recall_distractors_html(context: dict[str, Any]) -> str:
     valid = context.get("valid_substitutes_en") or []
-    non_substitutes = (
-        context.get("related_but_uninsertable_en")
+    related = (
+        context.get("valid_related_en")
+        or context.get("related_but_uninsertable_en")
         or context.get("meaning_related_non_substitutes_en")
         or []
     )
+    valid_normalized = {str(value).casefold() for value in valid}
+    related = [
+        value for value in related if str(value).casefold() not in valid_normalized
+    ]
     hints = []
     if valid:
         values = ", ".join(html.escape(str(value)) for value in valid)
         hints.append(f"Подходит, но не целевой ответ: {values}")
-    if non_substitutes:
-        values = ", ".join(html.escape(str(value)) for value in non_substitutes)
-        hints.append(f"Смысл близкий, но сюда не вставляется: {values}")
+    if related:
+        values = ", ".join(html.escape(str(value)) for value in related)
+        hints.append(f"Близко по смыслу: {values}")
     if not hints:
         return ""
     return "<br><small>" + "<br>".join(hints) + "</small>"

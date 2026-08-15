@@ -320,10 +320,10 @@ def make_contexts(
             "target": source.target,
             "sentence": source.sentence,
             "replacement": analysis.replacement_ru,
+            "substitutes_en": analysis.source_distractors.substitutes_en,
+            "related_en": analysis.source_distractors.related_en,
             "valid_substitutes_en": analysis.source_distractors.valid_substitutes_en,
-            "related_but_uninsertable_en": (
-                analysis.source_distractors.related_but_uninsertable_en
-            ),
+            "valid_related_en": analysis.source_distractors.valid_related_en,
         },
         {
             **common,
@@ -332,10 +332,10 @@ def make_contexts(
             "target": analysis.generated_surface,
             "sentence": analysis.generated_sentence,
             "replacement": analysis.generated_translation_ru,
+            "substitutes_en": analysis.generated_distractors.substitutes_en,
+            "related_en": analysis.generated_distractors.related_en,
             "valid_substitutes_en": analysis.generated_distractors.valid_substitutes_en,
-            "related_but_uninsertable_en": (
-                analysis.generated_distractors.related_but_uninsertable_en
-            ),
+            "valid_related_en": analysis.generated_distractors.valid_related_en,
         },
     ]
 
