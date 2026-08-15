@@ -18,7 +18,7 @@ from articles_to_anki.enrich import (
 from articles_to_anki.models import EnrichmentRequestItem
 from articles_to_anki.webapp import make_target_context
 
-MODELS = {
+OLD_MODELS = {
     "DeepSeek V4 Flash 0731": "deepseek/deepseek-v4-flash-0731",
     "Qwen3 30B A3B Instruct 2507": "qwen/qwen3-30b-a3b-instruct-2507",
     "Qwen3.5 Flash": "qwen/qwen3.5-flash-02-23",
@@ -26,6 +26,17 @@ MODELS = {
     "Gemini 2.5 Flash-Lite": "google/gemini-2.5-flash-lite",
     "Gemma 4 31B": "google/gemma-4-31b-it",
 }
+
+NEW_MODELS = {
+    "DeepSeek V4 Flash 0731 :nitro": "deepseek/deepseek-v4-flash-0731:nitro",
+    "Gemma 3 27B": "google/gemma-3-27b-it",
+    "Mistral Small 3.2 24B": "mistralai/mistral-small-3.2-24b-instruct",
+    "Gemma 3 12B": "google/gemma-3-12b-it",
+    "Qwen3 32B dense": "qwen/qwen3-32b",
+    "Gemma 3 4B": "google/gemma-3-4b-it",
+}
+
+MODELS = {**OLD_MODELS, **NEW_MODELS}
 
 CASES = [
     {
@@ -145,7 +156,17 @@ _transport_state = threading.local()
 
 def _counted_transport(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
     _transport_state.calls = getattr(_transport_state, "calls", 0) + 1
-    return _transport(payload, api_key)
+    response = _transport(payload, api_key)
+    metadata = {
+        key: response[key]
+        for key in ("id", "model", "provider", "usage")
+        if key in response
+    }
+    _transport_state.responses = [
+        *getattr(_transport_state, "responses", []),
+        metadata,
+    ]
+    return response
 
 
 enrich_module._post_json = _counted_transport
@@ -179,6 +200,7 @@ def run_model(
             page=1,
         )
         _transport_state.calls = 0
+        _transport_state.responses = []
         started = time.monotonic()
         try:
             item = enrich_targets(
@@ -197,6 +219,7 @@ def run_model(
                 "api_calls": getattr(_transport_state, "calls", 0),
                 "error_type": type(exc).__name__,
                 "error": str(exc),
+                "response_metadata": getattr(_transport_state, "responses", []),
             }
         else:
             result = {
@@ -205,6 +228,7 @@ def run_model(
                 "elapsed_seconds": round(time.monotonic() - started, 3),
                 "api_calls": getattr(_transport_state, "calls", 0),
                 "output": item.model_dump(),
+                "response_metadata": getattr(_transport_state, "responses", []),
             }
         model_result["cases"].append(result)
         print(
@@ -220,7 +244,14 @@ def main() -> None:
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=6)
+    parser.add_argument("--suite", choices=("old", "new", "all"), default="all")
     args = parser.parse_args()
+
+    models = {
+        "old": OLD_MODELS,
+        "new": NEW_MODELS,
+        "all": MODELS,
+    }[args.suite]
 
     load_env_file(args.env_file)
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
@@ -229,7 +260,7 @@ def main() -> None:
 
     probe = build_openrouter_payload(
         [EnrichmentRequestItem(id="probe", target="probe", sentence="A probe.")],
-        next(iter(MODELS.values())),
+        next(iter(models.values())),
     )
     if probe.get("provider") != {"require_parameters": True}:
         raise RuntimeError("Production harness lost provider.require_parameters=true")
@@ -245,6 +276,7 @@ def main() -> None:
             "plugins": probe.get("plugins"),
             "response_format": probe["response_format"]["type"],
             "require_parameters": probe["provider"]["require_parameters"],
+            "suite": args.suite,
         },
         "models": [],
     }
@@ -254,11 +286,11 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
         futures = {
             executor.submit(run_model, name, model_id, api_key=api_key): name
-            for name, model_id in MODELS.items()
+            for name, model_id in models.items()
         }
         for future in as_completed(futures):
             report["models"].append(future.result())
-            report["models"].sort(key=lambda item: list(MODELS).index(item["model_name"]))
+            report["models"].sort(key=lambda item: list(models).index(item["model_name"]))
             write_json(args.output, report)
 
     print(args.output.resolve(), flush=True)
