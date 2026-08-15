@@ -38,6 +38,13 @@ def pdf_bytes(page_count: int = 1) -> io.BytesIO:
     return stream
 
 
+def test_semantic_family_retrieval_handles_common_stem_changes() -> None:
+    assert webapp_module.semantic_family_compatible("imply", "implication")
+    assert webapp_module.semantic_family_compatible("rely", "reliable")
+    assert webapp_module.semantic_family_compatible("acquire", "acquisition")
+    assert not webapp_module.semantic_family_compatible("train", "transfer")
+
+
 def make_app(tmp_path: Path, **config):
     return create_app(
         {

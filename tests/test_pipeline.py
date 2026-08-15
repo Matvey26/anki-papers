@@ -360,6 +360,10 @@ def test_semantic_analysis_rejects_loose_pos_and_non_russian_replacements() -> N
         },
     }
     assert SemanticAnalysis(**values).part_of_speech == "adjective"
+    assert (
+        SemanticAnalysis(**{**values, "part_of_speech": "preposition"}).part_of_speech
+        == "preposition"
+    )
     assert SemanticAnalysis(**{**values, "family_key": " Robust "}).family_key == "robust"
     with pytest.raises(ValidationError):
         SemanticAnalysis(**{**values, "part_of_speech": "adj"})
@@ -409,11 +413,20 @@ def test_recall_distractors_must_not_repeat_target() -> None:
         valid_related_en=["thought"],
     )
     enrich_module._validate_recall_distractors("consideration", distractors)
+    enrich_module._validate_recall_distractors(
+        "take into account",
+        RecallDistractors(
+            substitutes_en=[" Take  into   Account "],
+            related_en=[],
+            valid_substitutes_en=[],
+            valid_related_en=[],
+        ),
+    )
     with pytest.raises(RuntimeError, match="must not contain the target"):
         enrich_module._validate_recall_distractors(
             "take into account",
             RecallDistractors(
-                substitutes_en=[" Take  into   Account "],
+                substitutes_en=[],
                 related_en=[],
                 valid_substitutes_en=[" Take  into   Account "],
                 valid_related_en=[],

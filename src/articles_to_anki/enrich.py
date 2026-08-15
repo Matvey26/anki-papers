@@ -385,12 +385,9 @@ def _validate_recall_distractors(
     distractors: RecallDistractors,
 ) -> None:
     normalized_target = " ".join(target.casefold().split())
-    values = (
-        distractors.substitutes_en
-        + distractors.related_en
-        + distractors.valid_substitutes_en
-        + distractors.valid_related_en
-    )
+    # Broad lists are hidden scratch work and may legitimately contain the
+    # source form.  Only the curated lists reach the learner-facing card.
+    values = distractors.valid_substitutes_en + distractors.valid_related_en
     if any(" ".join(value.casefold().split()) == normalized_target for value in values):
         raise RuntimeError("Recall distractors must not contain the target itself.")
 

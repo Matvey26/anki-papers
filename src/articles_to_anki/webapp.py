@@ -53,7 +53,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from .enrich import (
     DEFAULT_SEMANTIC_MODEL,
     analyse_semantic_context,
-    enrich_targets,
+    enrich_targets,  # noqa: F401 - retained as a monkeypatch seam for callers/tests
     load_env_file,
     select_semantic_match,
 )
@@ -1958,7 +1958,24 @@ def merge_semantic_translations(*groups: list[str], limit: int = 8) -> list[str]
 
 
 def semantic_family_prefix(value: str) -> str:
-    return "".join(value.casefold().split())[:5]
+    compact = "".join(value.casefold().split())
+    if compact.endswith("y"):
+        compact = f"{compact[:-1]}i"
+    width = 4 if len(compact) <= 4 else 5
+    return compact[:width]
+
+
+def semantic_family_compatible(left: str, right: str) -> bool:
+    left_prefix = semantic_family_prefix(left)
+    right_prefix = semantic_family_prefix(right)
+    return bool(
+        left_prefix
+        and right_prefix
+        and (
+            left_prefix.startswith(right_prefix)
+            or right_prefix.startswith(left_prefix)
+        )
+    )
 
 
 def canonical_semantic_family(*values: str) -> str:
@@ -1989,16 +2006,26 @@ def enrich_highlight_row(
            WHERE user_id = ? AND semantic_version = 1
              AND (
                COALESCE(family_key, lemma) = ?
-               OR substr(replace(COALESCE(family_key, lemma), ' ', ''), 1, 5) = ?
+               OR substr(replace(COALESCE(family_key, lemma), ' ', ''), 1, 3) = ?
              )
-           ORDER BY created_at LIMIT 20""",
+           ORDER BY created_at LIMIT 100""",
         (
             user_id,
             analysis.family_key,
-            semantic_family_prefix(analysis.family_key),
+            semantic_family_prefix(analysis.family_key)[:3],
         ),
     ).fetchall()
     candidates = [semantic_candidate(candidate) for candidate in candidate_rows]
+    source_families = (analysis.family_key, analysis.lemma)
+    candidates = [
+        candidate
+        for candidate in candidates
+        if any(
+            semantic_family_compatible(source, existing)
+            for source in source_families
+            for existing in (candidate.family_key, *candidate.lemmas)
+        )
+    ][-20:]
     match = select_semantic_match(
         analysis, candidates, api_key=api_key, model=model
     )

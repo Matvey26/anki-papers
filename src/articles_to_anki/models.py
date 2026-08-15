@@ -120,6 +120,11 @@ SemanticPartOfSpeech = Literal[
     "verb",
     "adjective",
     "adverb",
+    "preposition",
+    "conjunction",
+    "pronoun",
+    "determiner",
+    "particle",
     "phrase",
     "other",
 ]
@@ -277,7 +282,7 @@ class SemanticMatch(StrictModel):
     merged_sense_definition_en: str | None
     rationale_ru: str = Field(
         min_length=1,
-        max_length=300,
+        max_length=2000,
         pattern=r".*[А-Яа-яЁё].*",
     )
 

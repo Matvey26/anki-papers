@@ -34,7 +34,7 @@ from articles_to_anki.models import SemanticAnalysis, SemanticCandidate, Semanti
 from articles_to_anki.webapp import (
     canonical_semantic_family,
     merge_semantic_translations,
-    semantic_family_prefix,
+    semantic_family_compatible,
 )
 
 BOLD_RE = re.compile(r"<b\b[^>]*>(.*?)</b>", re.IGNORECASE | re.DOTALL)
@@ -262,26 +262,18 @@ def analyse_contexts(
     return analyses
 
 
-def cluster_prefixes(cluster: dict[str, Any]) -> set[str]:
-    return {
-        semantic_family_prefix(value)
-        for value in [cluster["family_key"], *cluster["lemmas"]]
-        if value
-    }
-
-
 def candidate_clusters(
     analysis: SemanticAnalysis,
     clusters: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    source_prefixes = {
-        semantic_family_prefix(analysis.family_key),
-        semantic_family_prefix(analysis.lemma),
-    }
     candidates = [
         cluster
         for cluster in clusters
-        if source_prefixes & cluster_prefixes(cluster)
+        if any(
+            semantic_family_compatible(source, existing)
+            for source in (analysis.family_key, analysis.lemma)
+            for existing in (cluster["family_key"], *cluster["lemmas"])
+        )
     ]
     return candidates[-20:]
 
@@ -350,7 +342,20 @@ def build_clusters(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     clusters: list[dict[str, Any]] = []
     decisions: list[dict[str, Any]] = []
-    for index, source in enumerate(contexts, start=1):
+    if progress_path.is_file():
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        saved_clusters = progress.get("clusters")
+        saved_decisions = progress.get("decisions")
+        if isinstance(saved_clusters, list) and isinstance(saved_decisions, list):
+            expected_ids = [context.id for context in contexts[: len(saved_decisions)]]
+            saved_ids = [decision.get("source_context_id") for decision in saved_decisions]
+            if saved_ids != expected_ids:
+                raise RuntimeError("Semantic clustering progress does not match the source order")
+            clusters = saved_clusters
+            decisions = saved_decisions
+
+    completed = len(decisions)
+    for index, source in enumerate(contexts[completed:], start=completed + 1):
         analysis = analyses[source.id]
         possible = candidate_clusters(analysis, clusters)
         candidates = [semantic_candidate(cluster) for cluster in possible]
