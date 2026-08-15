@@ -228,6 +228,7 @@ def test_enrichment_rejects_non_russian_replacement_and_duplicates() -> None:
 def test_semantic_analysis_rejects_loose_pos_and_non_russian_replacements() -> None:
     values = {
         "lemma": "robust",
+        "family_key": "robust",
         "part_of_speech": "adjective",
         "sense_definition_en": "able to remain reliable under difficult conditions",
         "translations_ru": ["надёжный", "устойчивый"],
@@ -237,6 +238,7 @@ def test_semantic_analysis_rejects_loose_pos_and_non_russian_replacements() -> N
         "generated_translation_ru": "устойчивым",
     }
     assert SemanticAnalysis(**values).part_of_speech == "adjective"
+    assert SemanticAnalysis(**{**values, "family_key": " Robust "}).family_key == "robust"
     with pytest.raises(ValidationError):
         SemanticAnalysis(**{**values, "part_of_speech": "adj"})
     with pytest.raises(ValidationError):
@@ -263,7 +265,12 @@ def test_generated_surface_must_be_a_complete_word_or_phrase() -> None:
 def test_semantic_match_schema_requires_nullable_card_id() -> None:
     schema = SemanticMatchResponse.model_json_schema()
     match_schema = schema["$defs"]["SemanticMatch"]
-    assert "card_id" in match_schema["required"]
+    assert {
+        "card_id",
+        "relationship",
+        "merged_sense_definition_en",
+        "rationale_ru",
+    } <= set(match_schema["required"])
     assert {item["type"] for item in match_schema["properties"]["card_id"]["anyOf"]} == {
         "string",
         "null",

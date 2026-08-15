@@ -18,6 +18,7 @@ from .models import (
     EnrichmentRequestItem,
     SemanticAnalysis,
     SemanticCandidate,
+    SemanticMatch,
     SemanticMatchResponse,
     TargetContext,
 )
@@ -70,11 +71,13 @@ Return every input id once and only once. Follow the supplied JSON Schema exactl
 
 SEMANTIC_SYSTEM_PROMPT = """\
 You are building high-quality English-to-Russian vocabulary cards for an advanced learner.
-Analyse ONE highlighted target in its full sentence. Return a canonical English lemma, one
+Analyse ONE highlighted target in its full sentence. Return its canonical English lemma, one
 coarse part_of_speech (noun, verb, adjective, adverb, phrase, or other), and a short English
-definition of exactly the sense used here. Do not merge derivational relatives: analyse/analysis,
-effective/effectiveness, and compute/computation are different lexemes. Treat phrasal verbs and
-fixed multiword expressions as whole lemmas. Preserve irregular verb families under their lemma.
+definition of exactly the sense used here. Also return family_key: the lowercase canonical base
+of the learnable inflectional/derivational family. Examples: acquired and acquisition -> acquire;
+acknowledged and acknowledging -> acknowledge; recognition and recognizable -> recognize.
+Do not collapse unrelated words merely because they share spelling or an etymological root.
+Treat phrasal verbs and fixed multiword expressions as whole families.
 
 Give 1-4 Russian translations for this sense, and replacement_ru in grammatical form for this
 specific source sentence. Then create exactly one NEW, realistic B2-or-harder academic context.
@@ -86,11 +89,25 @@ Return JSON only and follow the schema exactly.
 """
 
 SEMANTIC_MATCH_PROMPT = """\
-Decide whether the analysed source lexical sense is exactly the same learnable sense as one of
-the supplied candidates. Same spelling is not enough; same lemma alone is not enough. Part of
-speech and sense must agree. Different senses, ambiguous homographs, and derivational relatives
-must not be merged. Return card_id only for a confident exact match; otherwise return null.
-Explain decision briefly in Russian. Return JSON only and follow the schema exactly.
+Decide whether the analysed source belongs on the same LEARNABLE CARD as one supplied candidate.
+Candidates share either family_key or a conservative morphological prefix. Reject false lexical
+relatives; spelling similarity alone is never enough.
+
+Use same_sense for inflectional variants or effectively interchangeable meanings. Use
+related_sense when the meanings share one clear central concept and seeing both contexts together
+helps the learner acquire a broader, richer meaning. Derivational relatives and part-of-speech
+changes may merge: acquire/acquired/acquisition and acknowledge/acknowledging are good examples
+when their contexts preserve the same semantic core.
+
+Use new_card when combining would teach two answers rather than enrich one concept. Polysemy must
+stay separate: recognize meaning "identify from prior knowledge" is different from recognize
+meaning "admit or acknowledge as true"; run physically, run a company, and run software are also
+different cards. Similar spelling, family_key, or topic never overrides this rule.
+
+For same_sense or related_sense, return the candidate card_id and a concise umbrella English
+definition that covers both the existing candidate and source while excluding incompatible senses.
+For new_card, card_id and merged_sense_definition_en must both be null. Explain briefly in Russian.
+Return JSON only and follow the schema exactly.
 """
 
 
@@ -348,10 +365,15 @@ def select_semantic_match(
     *,
     api_key: str,
     model: str = DEFAULT_SEMANTIC_MODEL,
-) -> str | None:
-    """LLM-only merge decision. No lexical similarity or silent fallback."""
+) -> SemanticMatch:
+    """Choose a compatible semantic cluster inside one lexical family."""
     if not candidates:
-        return None
+        return SemanticMatch(
+            card_id=None,
+            relationship="new_card",
+            merged_sense_definition_en=None,
+            rationale_ru="В этом лексическом семействе пока нет карточек.",
+        )
     payload = {
         "model": model,
         "messages": [
@@ -376,7 +398,7 @@ def select_semantic_match(
     candidate_ids = {item.id for item in candidates}
     if response.match.card_id is not None and response.match.card_id not in candidate_ids:
         raise RuntimeError("OpenRouter selected a non-candidate semantic card.")
-    return response.match.card_id
+    return response.match
 
 
 def _contains_exact_surface(sentence: str, surface: str) -> bool:

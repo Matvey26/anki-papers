@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class StrictModel(BaseModel):
@@ -124,6 +124,7 @@ class SemanticAnalysis(StrictModel):
     """LLM result used to group contexts into one learnable lexical sense."""
 
     lemma: str = Field(min_length=1, max_length=100)
+    family_key: str = Field(min_length=1, max_length=100)
     part_of_speech: SemanticPartOfSpeech
     sense_definition_en: str = Field(min_length=3, max_length=300)
     translations_ru: list[str] = Field(min_length=1, max_length=4)
@@ -139,6 +140,14 @@ class SemanticAnalysis(StrictModel):
         if not value:
             raise ValueError("must not be blank")
         return value
+
+    @field_validator("family_key")
+    @classmethod
+    def normalized_family_key(cls, value: str) -> str:
+        cleaned = " ".join(value.casefold().split())
+        if not any("a" <= char <= "z" for char in cleaned):
+            raise ValueError("family key must contain English letters")
+        return cleaned
 
     @field_validator("translations_ru")
     @classmethod
@@ -164,18 +173,30 @@ class SemanticAnalysis(StrictModel):
 
 class SemanticCandidate(StrictModel):
     id: str
-    lemma: str
-    part_of_speech: SemanticPartOfSpeech
+    family_key: str
+    lemmas: list[str] = Field(min_length=1, max_length=12)
+    parts_of_speech: list[SemanticPartOfSpeech] = Field(min_length=1, max_length=6)
     sense_definition_en: str
 
 
 class SemanticMatch(StrictModel):
     card_id: str | None
+    relationship: Literal["same_sense", "related_sense", "new_card"]
+    merged_sense_definition_en: str | None
     rationale_ru: str = Field(
         min_length=1,
         max_length=300,
         pattern=r".*[А-Яа-яЁё].*",
     )
+
+    @model_validator(mode="after")
+    def valid_merge_shape(self) -> SemanticMatch:
+        if self.relationship == "new_card":
+            if self.card_id is not None or self.merged_sense_definition_en is not None:
+                raise ValueError("new card must not select or rewrite an existing card")
+        elif self.card_id is None or not self.merged_sense_definition_en:
+            raise ValueError("semantic merge must select a card and return a definition")
+        return self
 
 
 class SemanticMatchResponse(StrictModel):

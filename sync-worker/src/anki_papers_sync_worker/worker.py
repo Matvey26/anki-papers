@@ -319,6 +319,7 @@ class SyncWorker:
                 "document_name": row["document_name"], "page": row["page"],
                 "semantic": bool(row["semantic_version"]),
                 "lemma": row["lemma"],
+                "family_key": row["family_key"],
                 "part_of_speech": row["part_of_speech"],
                 "sense_definition_en": row["sense_definition_en"],
                 "contexts": json.loads(row["contexts_json"] or "[]"),

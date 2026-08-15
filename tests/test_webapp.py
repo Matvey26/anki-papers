@@ -15,7 +15,7 @@ from pypdf.generic import ArrayObject, DecodedStreamObject, FloatObject
 import articles_to_anki.apkg as apkg_module
 import articles_to_anki.webapp as webapp_module
 from articles_to_anki.extract import ExtractedHighlight
-from articles_to_anki.models import EnrichedItem, SemanticAnalysis
+from articles_to_anki.models import EnrichedItem, SemanticAnalysis, SemanticMatch
 from articles_to_anki.security import claim_token_digest
 from articles_to_anki.webapp import create_app, make_target_context
 
@@ -89,6 +89,7 @@ def install_fake_enrichment(monkeypatch) -> None:
         assert target == "robust"
         return SemanticAnalysis(
             lemma="robust",
+            family_key="robust",
             part_of_speech="adjective",
             sense_definition_en="reliable and resilient in operation",
             translations_ru=["надёжный", "устойчивый"],
@@ -99,11 +100,22 @@ def install_fake_enrichment(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(webapp_module, "analyse_semantic_context", fake_semantic)
-    monkeypatch.setattr(
-        webapp_module,
-        "select_semantic_match",
-        lambda _analysis, candidates, **_kwargs: candidates[0].id if candidates else None,
-    )
+    def fake_match(analysis, candidates, **_kwargs):
+        if not candidates:
+            return SemanticMatch(
+                card_id=None,
+                relationship="new_card",
+                merged_sense_definition_en=None,
+                rationale_ru="Кандидатов пока нет.",
+            )
+        return SemanticMatch(
+            card_id=candidates[0].id,
+            relationship="same_sense",
+            merged_sense_definition_en=analysis.sense_definition_en,
+            rationale_ru="Это одно значение.",
+        )
+
+    monkeypatch.setattr(webapp_module, "select_semantic_match", fake_match)
 
 
 def test_register_upload_add_and_export_only_new_cards(
@@ -327,6 +339,164 @@ def test_same_word_in_same_sense_merges_contexts(
         ).fetchone()
         assert card[1] == 1
         assert len(json.loads(card[0])) == 4
+
+
+def test_lexical_family_merges_derivations_but_splits_polysemy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    analyses = {
+        "acquired": SemanticAnalysis(
+            lemma="acquire",
+            family_key="acquire",
+            part_of_speech="verb",
+            sense_definition_en="obtain or gain possession of something",
+            translations_ru=["приобрести", "получить"],
+            replacement_ru="приобрела",
+            generated_sentence="The laboratory acquired a more precise sensor.",
+            generated_surface="acquired",
+            generated_translation_ru="приобрела",
+        ),
+        "acquisition": SemanticAnalysis(
+            lemma="acquisition",
+            family_key="acquisition",
+            part_of_speech="noun",
+            sense_definition_en="the act or process of obtaining something",
+            translations_ru=["приобретение", "получение"],
+            replacement_ru="получение",
+            generated_sentence="Data acquisition requires careful calibration.",
+            generated_surface="acquisition",
+            generated_translation_ru="сбор",
+        ),
+        "recognize-identify": SemanticAnalysis(
+            lemma="recognize",
+            family_key="recognize",
+            part_of_speech="verb",
+            sense_definition_en="identify something from previous knowledge",
+            translations_ru=["распознать", "узнать"],
+            replacement_ru="распознать",
+            generated_sentence="The model can recognize partially hidden symbols.",
+            generated_surface="recognize",
+            generated_translation_ru="распознавать",
+        ),
+        "recognize-admit": SemanticAnalysis(
+            lemma="recognize",
+            family_key="recognize",
+            part_of_speech="verb",
+            sense_definition_en="admit or acknowledge that something is true",
+            translations_ru=["признать", "признавать"],
+            replacement_ru="признать",
+            generated_sentence="The review must recognize the study's limitations.",
+            generated_surface="recognize",
+            generated_translation_ru="признать",
+        ),
+    }
+
+    def fake_analysis(target, sentence, **_kwargs):
+        if target != "recognize":
+            return analyses[target]
+        key = "recognize-identify" if "face" in sentence else "recognize-admit"
+        return analyses[key]
+
+    def fake_match(analysis, candidates, **_kwargs):
+        if not candidates:
+            return SemanticMatch(
+                card_id=None,
+                relationship="new_card",
+                merged_sense_definition_en=None,
+                rationale_ru="Подходящей карточки пока нет.",
+            )
+        if analysis.family_key.startswith("acqui"):
+            return SemanticMatch(
+                card_id=candidates[0].id,
+                relationship="related_sense",
+                merged_sense_definition_en="obtain something or the process of obtaining it",
+                rationale_ru="Формы разделяют смысловое ядро получения.",
+            )
+        return SemanticMatch(
+            card_id=None,
+            relationship="new_card",
+            merged_sense_definition_en=None,
+            rationale_ru="Значения распознавания и признания различаются.",
+        )
+
+    monkeypatch.setattr(webapp_module, "analyse_semantic_context", fake_analysis)
+    monkeypatch.setattr(webapp_module, "select_semantic_match", fake_match)
+    app = make_app(tmp_path)
+    client = app.test_client()
+    dashboard = identify(client)
+    client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(dashboard), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+    )
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        document_id = database.execute(
+            "SELECT id FROM documents WHERE kind = 'pdf'"
+        ).fetchone()[0]
+    reader = client.get(f"/article/{document_id}")
+    highlights = (
+        ("acquired", "The team acquired a useful dataset."),
+        ("acquisition", "The acquisition of data took several weeks."),
+        ("recognize", "Humans recognize a familiar face quickly."),
+        ("recognize", "We recognize that the estimate is uncertain."),
+    )
+    for index, (target, sentence) in enumerate(highlights):
+        response = client.post(
+            f"/api/article/{document_id}/highlights",
+            json={
+                "id": str(uuid.uuid4()),
+                "target": target,
+                "sentence": sentence,
+                "page": 1,
+                "rects": [
+                    {
+                        "x1": 80,
+                        "y1": 180 + index * 20,
+                        "x2": 140,
+                        "y2": 195 + index * 20,
+                    }
+                ],
+            },
+            headers={"X-CSRF-Token": csrf(reader)},
+        )
+        assert response.status_code == 200
+
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        database.row_factory = sqlite3.Row
+        cards = database.execute(
+            "SELECT * FROM cards ORDER BY created_at"
+        ).fetchall()
+    acquire_cards = [card for card in cards if card["family_key"] == "acquire"]
+    recognize_cards = [card for card in cards if card["family_key"] == "recognize"]
+    assert len(cards) == 3
+    assert len(acquire_cards) == 1
+    assert len(recognize_cards) == 2
+    acquire_contexts = json.loads(acquire_cards[0]["contexts_json"])
+    assert {context["lemma"] for context in acquire_contexts} == {
+        "acquire",
+        "acquisition",
+    }
+    assert json.loads(acquire_cards[0]["translations_json"]) == [
+        "приобрести",
+        "получить",
+        "приобретение",
+        "получение",
+    ]
+    assert acquire_cards[0]["sense_definition_en"] == (
+        "obtain something or the process of obtaining it"
+    )
+    exported_rows = list(
+        csv.DictReader(
+            io.StringIO(
+                webapp_module.cards_to_csv(acquire_cards).decode("utf-8-sig")
+            )
+        )
+    )
+    assert len(exported_rows) == 2
+    assert "anki-papers-semantic-answer" in exported_rows[1]["Back"]
+    assert "acquired" in exported_rows[1]["Back"]
+    assert "acquisition" in exported_rows[1]["Back"]
 
 
 def test_highlight_is_enriched_saved_and_downloaded_in_pdf(

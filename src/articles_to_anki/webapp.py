@@ -1301,6 +1301,7 @@ def init_database(app: Flask) -> None:
                 replacement TEXT NOT NULL,
                 alternatives_json TEXT NOT NULL,
                 lemma TEXT,
+                family_key TEXT,
                 part_of_speech TEXT,
                 sense_definition_en TEXT,
                 contexts_json TEXT,
@@ -1449,6 +1450,7 @@ def init_database(app: Flask) -> None:
             connection.execute("ALTER TABLE cards ADD COLUMN anki_synced_at TEXT")
         semantic_columns = {
             "lemma": "TEXT",
+            "family_key": "TEXT",
             "part_of_speech": "TEXT",
             "sense_definition_en": "TEXT",
             "contexts_json": "TEXT",
@@ -1458,8 +1460,8 @@ def init_database(app: Flask) -> None:
             if column not in card_columns:
                 connection.execute(f"ALTER TABLE cards ADD COLUMN {column} {declaration}")
         connection.execute(
-            """CREATE INDEX IF NOT EXISTS idx_cards_semantic_lookup
-               ON cards(user_id, semantic_version, lemma, part_of_speech)"""
+            """CREATE INDEX IF NOT EXISTS idx_cards_semantic_family_lookup
+               ON cards(user_id, semantic_version, family_key)"""
         )
         account_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(anki_accounts)")
@@ -1486,8 +1488,8 @@ def init_database(app: Flask) -> None:
             if column not in card_columns:
                 connection.execute(f"ALTER TABLE cards ADD COLUMN {column} {declaration}")
         connection.execute(
-            """CREATE INDEX IF NOT EXISTS idx_cards_semantic_lookup
-               ON cards(user_id, semantic_version, lemma, part_of_speech)"""
+            """CREATE INDEX IF NOT EXISTS idx_cards_semantic_family_lookup
+               ON cards(user_id, semantic_version, family_key)"""
         )
         synchronize_card_highlights_by_context(connection)
         connection.execute("PRAGMA optimize")
@@ -1918,6 +1920,54 @@ class MissingApiKeyError(RuntimeError):
     pass
 
 
+def semantic_candidate(card: sqlite3.Row) -> SemanticCandidate:
+    contexts = json.loads(card["contexts_json"] or "[]")
+    lemmas = [str(card["lemma"])]
+    parts_of_speech = [str(card["part_of_speech"])]
+    for context in contexts:
+        if not isinstance(context, dict):
+            continue
+        lemma = str(context.get("lemma") or "").strip()
+        part_of_speech = str(context.get("part_of_speech") or "").strip()
+        if lemma and lemma not in lemmas:
+            lemmas.append(lemma)
+        if part_of_speech and part_of_speech not in parts_of_speech:
+            parts_of_speech.append(part_of_speech)
+    return SemanticCandidate(
+        id=str(card["id"]),
+        family_key=str(card["family_key"] or card["lemma"]),
+        lemmas=lemmas[:12],
+        parts_of_speech=parts_of_speech[:6],
+        sense_definition_en=str(card["sense_definition_en"]),
+    )
+
+
+def merge_semantic_translations(*groups: list[str], limit: int = 8) -> list[str]:
+    merged: list[str] = []
+    normalized: set[str] = set()
+    for group in groups:
+        for value in group:
+            cleaned = value.strip()
+            key = cleaned.casefold()
+            if cleaned and key not in normalized:
+                merged.append(cleaned)
+                normalized.add(key)
+            if len(merged) == limit:
+                return merged
+    return merged
+
+
+def semantic_family_prefix(value: str) -> str:
+    return "".join(value.casefold().split())[:5]
+
+
+def canonical_semantic_family(*values: str) -> str:
+    cleaned = {" ".join(value.casefold().split()) for value in values if value.strip()}
+    if not cleaned:
+        raise ValueError("Semantic family cannot be empty")
+    return min(cleaned, key=lambda value: (len(value), value))
+
+
 def enrich_highlight_row(
     app: Flask,
     database: sqlite3.Connection,
@@ -1934,22 +1984,22 @@ def enrich_highlight_row(
     analysis = analyse_semantic_context(
         row["target"], row["sentence"], api_key=api_key, model=model
     )
-    candidates = [
-        SemanticCandidate(
-            id=str(candidate["id"]),
-            lemma=str(candidate["lemma"]),
-            part_of_speech=str(candidate["part_of_speech"]),
-            sense_definition_en=str(candidate["sense_definition_en"]),
-        )
-        for candidate in database.execute(
-            """SELECT id, lemma, part_of_speech, sense_definition_en FROM cards
-               WHERE user_id = ? AND semantic_version = 1
-                 AND lemma = ? AND part_of_speech = ?
-               ORDER BY created_at LIMIT 30""",
-            (user_id, analysis.lemma.casefold(), analysis.part_of_speech.casefold()),
-        ).fetchall()
-    ]
-    matched_id = select_semantic_match(
+    candidate_rows = database.execute(
+        """SELECT * FROM cards
+           WHERE user_id = ? AND semantic_version = 1
+             AND (
+               COALESCE(family_key, lemma) = ?
+               OR substr(replace(COALESCE(family_key, lemma), ' ', ''), 1, 5) = ?
+             )
+           ORDER BY created_at LIMIT 20""",
+        (
+            user_id,
+            analysis.family_key,
+            semantic_family_prefix(analysis.family_key),
+        ),
+    ).fetchall()
+    candidates = [semantic_candidate(candidate) for candidate in candidate_rows]
+    match = select_semantic_match(
         analysis, candidates, api_key=api_key, model=model
     )
     translations = json.dumps(analysis.translations_ru, ensure_ascii=False)
@@ -1958,39 +2008,67 @@ def enrich_highlight_row(
     source_context = {
         "id": str(row["id"]), "source": "user_pdf", "target": str(row["target"]),
         "sentence": str(row["sentence"]), "replacement": replacement,
-        "translations": analysis.translations_ru,
+        "translations": analysis.translations_ru, "lemma": analysis.lemma,
+        "family_key": analysis.family_key, "part_of_speech": analysis.part_of_speech,
+        "sense_definition_en": analysis.sense_definition_en,
     }
     generated_context = {
         "id": f"generated:{row['id']}", "source": "llm_generated",
         "target": analysis.generated_surface, "sentence": analysis.generated_sentence,
         "replacement": analysis.generated_translation_ru,
-        "translations": analysis.translations_ru,
+        "translations": analysis.translations_ru, "lemma": analysis.lemma,
+        "family_key": analysis.family_key, "part_of_speech": analysis.part_of_speech,
+        "sense_definition_en": analysis.sense_definition_en,
     }
     card_changed = True
-    if matched_id is not None:
-        existing = database.execute("SELECT * FROM cards WHERE id = ? AND user_id = ?", (matched_id, user_id)).fetchone()
+    if match.card_id is not None:
+        existing = database.execute(
+            "SELECT * FROM cards WHERE id = ? AND user_id = ?",
+            (match.card_id, user_id),
+        ).fetchone()
         if existing is None:
             raise RuntimeError("Selected semantic card disappeared")
         contexts = json.loads(existing["contexts_json"] or "[]")
         known = {str(item.get("id")) for item in contexts if isinstance(item, dict)}
         contexts.extend(item for item in (source_context, generated_context) if item["id"] not in known)
+        card_translations = merge_semantic_translations(
+            json.loads(existing["translations_json"]),
+            analysis.translations_ru,
+        )
+        family_key = canonical_semantic_family(
+            str(existing["family_key"] or existing["lemma"]),
+            analysis.family_key,
+        )
         database.execute(
-            """UPDATE cards SET contexts_json = ?, csv_exported_at = NULL,
+            """UPDATE cards SET target = ?, target_normalized = ?, family_key = ?,
+               contexts_json = ?, translations_json = ?,
+               sense_definition_en = ?, csv_exported_at = NULL,
                apkg_exported_at = NULL, anki_synced_at = NULL WHERE id = ? AND user_id = ?""",
-            (json.dumps(contexts, ensure_ascii=False), existing["id"], user_id),
+            (
+                family_key,
+                normalize_target(family_key),
+                family_key,
+                json.dumps(contexts, ensure_ascii=False),
+                json.dumps(card_translations, ensure_ascii=False),
+                match.merged_sense_definition_en,
+                existing["id"],
+                user_id,
+            ),
         )
     else:
         card_id = str(uuid.uuid4())
         database.execute(
             """INSERT INTO cards
-               (id, user_id, document_id, target, target_normalized, sentence, page,
-                translations_json, replacement, alternatives_json, lemma, part_of_speech,
-                sense_definition_en, contexts_json, semantic_version, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+                (id, user_id, document_id, target, target_normalized, sentence, page,
+                translations_json, replacement, alternatives_json, lemma, family_key,
+                part_of_speech, sense_definition_en, contexts_json, semantic_version, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
             (
-                card_id, user_id, document_id, analysis.lemma, normalize_target(analysis.lemma),
+                card_id, user_id, document_id, analysis.family_key,
+                normalize_target(analysis.family_key),
                 row["sentence"], row["page"], translations, replacement, alternatives,
-                analysis.lemma.casefold(), analysis.part_of_speech.casefold(),
+                analysis.lemma.casefold(), analysis.family_key,
+                analysis.part_of_speech.casefold(),
                 analysis.sense_definition_en, json.dumps([source_context, generated_context], ensure_ascii=False), timestamp,
             ),
         )
@@ -2513,12 +2591,30 @@ def semantic_card_rows(card: sqlite3.Row) -> list[dict[str, str]]:
     recall = _semantic_front_html(payload, key, "recall", rendered[0])
     translations = "<br>".join(f"• {html.escape(value)}" for value in json.loads(card["translations_json"]))
     sense = html.escape(str(card["sense_definition_en"]))
-    lemma = html.escape(str(card["lemma"]))
-    lemma_tag = re.sub(r"[^A-Za-z0-9_:-]+", "_", str(card["lemma"])).strip("_") or "word"
-    common = f"anki_papers::{card['id']} semantic::v1 lemma::{lemma_tag}"
+    family = html.escape(str(card["family_key"] or card["lemma"]))
+    family_tag = re.sub(
+        r"[^A-Za-z0-9_:-]+",
+        "_",
+        str(card["family_key"] or card["lemma"]),
+    ).strip("_") or "word"
+    common = f"anki_papers::{card['id']} semantic::v1 family::{family_tag}"
+    meaning_back = _semantic_back_html(
+        payload,
+        key,
+        "front",
+        rendered[0],
+        f"<br><small>family: {family}</small><br>{translations}<br><small>{sense}</small>",
+    )
+    recall_back = _semantic_back_html(
+        payload,
+        key,
+        "recall",
+        rendered[0],
+        f"<br><small>family: {family}</small>",
+    )
     return [
-        {"Front": front, "Back": f"<b>{lemma}</b><br>{translations}<br><small>{sense}</small>", "Tags": f"{common} card::meaning"},
-        {"Front": recall, "Back": f"<b>{lemma}</b>", "Tags": f"{common} card::recall"},
+        {"Front": front, "Back": meaning_back, "Tags": f"{common} card::meaning"},
+        {"Front": recall, "Back": recall_back, "Tags": f"{common} card::recall"},
     ]
 
 
@@ -2544,6 +2640,26 @@ def _semantic_front_html(
         'try{sessionStorage.setItem(key,JSON.stringify({index:index,until:now+120000}))}catch(e){}'
         'var item=items[index];root.innerHTML=item[root.dataset.side]+"<br><small>"+item.translation+" · "+item.source+"</small>";'
         '})();</script>'
+    )
+
+
+def _semantic_back_html(
+    payload: str,
+    key: str,
+    side: str,
+    fallback: dict[str, str],
+    details: str,
+) -> str:
+    return (
+        f'<div class="anki-papers-semantic-answer" data-key="{key}" data-side="{side}" '
+        f'data-contexts="{payload}"><b>{fallback["answer"]}</b></div>'
+        '<script>(function(){var root=document.currentScript.previousElementSibling,'
+        'items=JSON.parse(root.dataset.contexts),key="anki-papers-context:"+root.dataset.key+'
+        '":"+root.dataset.side,stored=null;try{stored=JSON.parse(sessionStorage.getItem(key)||"null")}'
+        'catch(e){}var valid=stored&&Number.isInteger(stored.index)&&stored.index>=0&&'
+        'stored.index<items.length,index=valid?stored.index:0;root.innerHTML="<b>"+'
+        'items[index].answer+"</b>";})();</script>'
+        f"{details}"
     )
 
 

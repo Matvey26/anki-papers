@@ -411,6 +411,7 @@ def _semantic_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
         values.append({
             "front": _replace_target(sentence, target, html.escape(target)),
             "recall": _replace_target(sentence, target, "<b>[...]</b>", raw=True),
+            "answer": html.escape(target),
             "translation": html.escape(str(context["replacement"])),
             "source": html.escape(str(context["source"])),
         })
@@ -418,11 +419,21 @@ def _semantic_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
     side = "front" if direction == "meaning" else "recall"
     key = html.escape(str(card["id"]), quote=True)
     front = _semantic_front_html(payload, key, side, values[0])
-    lemma = html.escape(str(card["lemma"]))
+    family = html.escape(str(card.get("family_key") or card["lemma"]))
     if direction == "meaning":
         translations = "<br>".join(f"• {html.escape(str(item))}" for item in card["translations"])
-        return front, f"<b>{lemma}</b><br>{translations}<br><small>{html.escape(str(card['sense_definition_en']))}</small>"
-    return front, f"<b>{lemma}</b>"
+        details = (
+            f"<br><small>family: {family}</small><br>{translations}<br><small>"
+            f"{html.escape(str(card['sense_definition_en']))}</small>"
+        )
+        return front, _semantic_back_html(payload, key, side, values[0], details)
+    return front, _semantic_back_html(
+        payload,
+        key,
+        side,
+        values[0],
+        f"<br><small>family: {family}</small>",
+    )
 
 
 def _semantic_front_html(
@@ -445,6 +456,26 @@ def _semantic_front_html(
         'stored.index<items.length,index=valid?stored.index:Math.floor(Math.random()*items.length);'
         'try{sessionStorage.setItem(key,JSON.stringify({index:index,until:now+120000}))}catch(e){}'
         'var item=items[index];root.innerHTML=item[root.dataset.side]+"<br><small>"+item.translation+" · "+item.source+"</small>";})();</script>'
+    )
+
+
+def _semantic_back_html(
+    payload: str,
+    key: str,
+    side: str,
+    fallback: dict[str, str],
+    details: str,
+) -> str:
+    return (
+        f'<div class="anki-papers-semantic-answer" data-key="{key}" data-side="{side}" '
+        f'data-contexts="{payload}"><b>{fallback["answer"]}</b></div>'
+        '<script>(function(){var root=document.currentScript.previousElementSibling,'
+        'items=JSON.parse(root.dataset.contexts),key="anki-papers-context:"+root.dataset.key+'
+        '":"+root.dataset.side,stored=null;try{stored=JSON.parse(sessionStorage.getItem(key)||"null")}'
+        'catch(e){}var valid=stored&&Number.isInteger(stored.index)&&stored.index>=0&&'
+        'stored.index<items.length,index=valid?stored.index:0;root.innerHTML="<b>"+'
+        'items[index].answer+"</b>";})();</script>'
+        f"{details}"
     )
 
 

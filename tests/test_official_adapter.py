@@ -96,6 +96,7 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
     collection = Collection(str(tmp_path / "collection.anki2"))
     card = {
         "id": "sense-1", "semantic": True, "lemma": "overcome",
+        "family_key": "overcome",
         "part_of_speech": "verb", "sense_definition_en": "deal successfully with a difficulty",
         "translations": ["преодолеть"], "contexts": [
             {"id": "a", "source": "user_pdf", "target": "overcame", "sentence": "She overcame the limitation.", "replacement": "преодолела"},
@@ -106,6 +107,8 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
     assert note.note_type()["name"] == "Anki Papers Semantic"
     assert "sessionStorage" in note.fields[0]
     assert "overcame" in note.fields[0]
+    assert "anki-papers-semantic-answer" in note.fields[1]
+    assert "><b>overcame</b></div>" in note.fields[1]
     assert (
         'data-contexts="' in note.fields[0]
         and '>She <b>overcame</b> the limitation.<br><small>' in note.fields[0]
@@ -115,4 +118,5 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
     )
     OfficialAnkiAdapter._update_semantic_note(collection, note, card, "meaning")
     assert "Overcoming" in note.fields[0]
+    assert "Overcoming" in note.fields[1]
     collection.close()
