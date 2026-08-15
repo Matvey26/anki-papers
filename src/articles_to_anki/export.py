@@ -59,18 +59,19 @@ def write_anki_csv(
             }
         )
 
-        alternatives = ", ".join(
-            html.escape(value)
-            for value in enrichment.forbidden_alternatives_en
-        )
         replacement = f"<b>{html.escape(enrichment.replacement_ru)}</b>"
         recall_front = target.recall_template_html.replace(
             RECALL_PLACEHOLDER, replacement
         )
-        recall_front += (
-            "<br><small>Нельзя использовать: "
-            f"{alternatives}</small>"
-        )
+        if enrichment.forbidden_alternatives_en:
+            alternatives = ", ".join(
+                html.escape(value)
+                for value in enrichment.forbidden_alternatives_en
+            )
+            recall_front += (
+                "<br><small>Нельзя использовать: "
+                f"{alternatives}</small>"
+            )
         card_rows.append(
             {
                 "Front": recall_front,

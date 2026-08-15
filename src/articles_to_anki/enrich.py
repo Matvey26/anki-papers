@@ -24,9 +24,10 @@ from .models import (
 )
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "openai/gpt-5.6-luna"
-DEFAULT_SEMANTIC_MODEL = "openai/gpt-5.6-luna"
-CACHE_VERSION = "v4"
+DEEPSEEK_MODEL_PREFIX = "deepseek/deepseek-v4-flash-0731"
+DEFAULT_MODEL = f"{DEEPSEEK_MODEL_PREFIX}:nitro"
+DEFAULT_SEMANTIC_MODEL = DEFAULT_MODEL
+CACHE_VERSION = "v5"
 RETRY_TEMPERATURES = (0.2, 0.1, 0.3, 0.0, 0.25)
 RETRY_INSTRUCTIONS = (
     "Retry independently. Re-read the sentence before choosing the target's exact sense.",
@@ -42,23 +43,30 @@ For every input item:
 2. First disambiguate the highlighted target from the FULL sentence. In
    context_explanation_ru, briefly explain in Russian which exact sense applies and name the
    nearby clue, collocation, or grammatical construction that establishes it.
-3. Give translations_ru as 2-5 UNIQUE Russian translations or close variants. EVERY option
-   must express the SAME meaning that the target has in this exact sentence and be acceptable
-   on the back of the card. Never include unrelated dictionary senses merely to add variety.
+3. Start translations_ru with the single best Russian answer for this occurrence. Add up to four
+   UNIQUE close variants only when each deserves the same score as a learner's answer in this
+   exact sentence. A related concept that merely preserves the sentence's general message is not
+   the same lexical meaning. Reject hypernyms, hyponyms, prerequisites, consequences, paraphrases,
+   and words with weaker or stronger commitment even when the full sentence remains plausible.
+   Quality is more important than quantity: one precise translation is a complete answer. Never
+   add a weaker translation or another dictionary sense to fill a list.
 4. Give replacement_ru in the exact Russian grammatical form that can replace the English
    target inside the otherwise English sentence. Preserve tense, number, and discourse role.
    Mentally substitute it into the full sentence and verify that the sentence's intended
    meaning remains intact. Do not add a comma, period, colon, semicolon, exclamation mark, or
    question mark after replacement_ru: punctuation adjacent to the target is already preserved.
-5. Give 2-6 UNIQUE, simpler English NEAR-SYNONYMS that a learner might guess in this exact
-   context but must not use. "Forbidden" means forbidden as the CARD ANSWER, not opposite in
-   meaning. First substitute each candidate for the target in the original sentence. Keep it
-   only if the resulting sentence remains grammatical and states substantially the SAME claim.
+5. forbidden_alternatives_en is NOT a thesaurus or association list. Start it as an empty list.
+   Consider at most 6 simpler English near-synonyms that a learner might use as the card answer.
+   Add a candidate only after literally replacing the exact target span with it while keeping
+   every other character of the sentence unchanged. The resulting sentence must be natural and
+   grammatical, preserve the target's syntactic role and collocation, and state substantially the
+   SAME claim. Reject a candidate if a native editor would need to change any neighboring
+   preposition, object, article, agreement, punctuation, or word order. A dictionary synonym is
+   invalid when it fits only after such an edit. For fixed constructions and strong collocations,
+   an empty list is normal and preferable to approximate alternatives.
    NEVER give antonyms, opposites, unrelated words, Russian words, the target itself, or trivial
-   spelling/case variants. For "thoroughly validated", valid alternatives include "fully",
-   "carefully", and "extensively"; "slightly", "partially", and "superficially" are invalid.
-   For "impede", valid alternatives include "hinder", "block", and "slow down";
-   "accelerate" is invalid because it reverses the meaning.
+   spelling/case variants. Reject candidates that negate, reverse, weaken, strengthen, broaden,
+   or narrow the original claim merely because they are topically related.
 6. Treat a multiword target as one expression.
 7. context_explanation_ru, every item in translations_ru, and replacement_ru MUST be written
    in Russian Cyrillic. Never leave the English target in replacement_ru.
@@ -201,7 +209,6 @@ def build_openrouter_payload(
                 ),
             },
         ],
-        "temperature": 0.2,
         "max_tokens": 2500,
         "stream": False,
         "plugins": [{"id": "response-healing"}],
@@ -215,10 +222,7 @@ def build_openrouter_payload(
         },
         "provider": {"require_parameters": True},
     }
-    if model.startswith("openai/gpt-5.6-luna"):
-        # Luna's OpenRouter endpoint supports strict structured output but not
-        # temperature; require_parameters would otherwise reject all providers.
-        payload.pop("temperature")
+    _apply_model_generation_config(payload, model=model, temperature=0.2)
     return payload
 
 
@@ -347,8 +351,7 @@ def analyse_semantic_context(
         },
         "provider": {"require_parameters": True},
     }
-    if not model.startswith("openai/gpt-5.6-luna"):
-        payload["temperature"] = 0.2
+    _apply_model_generation_config(payload, model=model, temperature=0.2)
     result = _post_json(payload, api_key)
     content = result["choices"][0]["message"]["content"]
     if not isinstance(content, str):
@@ -391,8 +394,7 @@ def select_semantic_match(
         },
         "provider": {"require_parameters": True},
     }
-    if not model.startswith("openai/gpt-5.6-luna"):
-        payload["temperature"] = 0.0
+    _apply_model_generation_config(payload, model=model, temperature=0.0)
     result = _post_json(payload, api_key)
     content = result["choices"][0]["message"]["content"]
     if not isinstance(content, str):
@@ -410,6 +412,18 @@ def _contains_exact_surface(sentence: str, surface: str) -> bool:
         sentence,
         flags=re.IGNORECASE,
     ) is not None
+
+
+def _apply_model_generation_config(
+    payload: dict[str, Any],
+    *,
+    model: str,
+    temperature: float,
+) -> None:
+    if not model.startswith("openai/gpt-5.6-luna"):
+        payload["temperature"] = temperature
+    if model.startswith(DEEPSEEK_MODEL_PREFIX):
+        payload["reasoning"] = {"effort": "none"}
 
 
 def _cache_key(model: str, target: TargetContext) -> str:

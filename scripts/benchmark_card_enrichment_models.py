@@ -288,6 +288,7 @@ def main() -> None:
             "max_tokens": probe["max_tokens"],
             "stream": probe["stream"],
             "temperature": probe.get("temperature"),
+            "reasoning": probe.get("reasoning"),
             "plugins": probe.get("plugins"),
             "response_format": probe["response_format"]["type"],
             "require_parameters": probe["provider"]["require_parameters"],

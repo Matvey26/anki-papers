@@ -7,7 +7,12 @@ from pydantic import ValidationError
 
 import articles_to_anki.enrich as enrich_module
 from articles_to_anki.cli import _exclude_processed_targets, _load_excluded_targets
-from articles_to_anki.enrich import build_openrouter_payload, enrich_targets
+from articles_to_anki.enrich import (
+    analyse_semantic_context,
+    build_openrouter_payload,
+    enrich_targets,
+    select_semantic_match,
+)
 from articles_to_anki.export import write_anki_csv
 from articles_to_anki.extract import (
     RECALL_PLACEHOLDER,
@@ -23,6 +28,7 @@ from articles_to_anki.models import (
     EnrichedItem,
     EnrichmentRequestItem,
     SemanticAnalysis,
+    SemanticCandidate,
     SemanticMatchResponse,
     TargetContext,
 )
@@ -129,14 +135,32 @@ def test_openrouter_payload_uses_strict_pydantic_json_schema() -> None:
     item_schema = response_format["json_schema"]["schema"]["$defs"]["EnrichedItem"]
     assert "context_explanation_ru" in item_schema["required"]
     assert "translations_ru" in item_schema["required"]
-    assert item_schema["properties"]["translations_ru"]["minItems"] == 2
+    assert item_schema["properties"]["translations_ru"]["minItems"] == 1
+    assert item_schema["properties"]["forbidden_alternatives_en"]["minItems"] == 0
     assert payload["provider"]["require_parameters"] is True
     assert payload["max_tokens"] == 2500
     assert payload["plugins"] == [{"id": "response-healing"}]
 
 
+def test_default_deepseek_payload_disables_reasoning() -> None:
+    assert enrich_module.DEFAULT_MODEL == "deepseek/deepseek-v4-flash-0731:nitro"
+    assert enrich_module.DEFAULT_SEMANTIC_MODEL == enrich_module.DEFAULT_MODEL
+    payload = build_openrouter_payload(
+        [
+            EnrichmentRequestItem(
+                id="abc",
+                target="retained",
+                sentence="The system retained the cached values.",
+            )
+        ],
+        enrich_module.DEFAULT_MODEL,
+    )
+    assert payload["reasoning"] == {"effort": "none"}
+    assert payload["temperature"] == 0.2
+    assert payload["provider"]["require_parameters"] is True
+
+
 def test_luna_payload_omits_unsupported_temperature() -> None:
-    assert enrich_module.DEFAULT_MODEL == "openai/gpt-5.6-luna"
     payload = build_openrouter_payload(
         [
             EnrichmentRequestItem(
@@ -150,6 +174,67 @@ def test_luna_payload_omits_unsupported_temperature() -> None:
     assert "temperature" not in payload
     assert payload["response_format"]["type"] == "json_schema"
     assert payload["provider"]["require_parameters"] is True
+
+
+def test_semantic_deepseek_payloads_disable_reasoning(monkeypatch) -> None:
+    payloads = []
+    analysis = SemanticAnalysis(
+        lemma="acknowledge",
+        family_key="acknowledge",
+        part_of_speech="verb",
+        sense_definition_en="accept that a fact or limitation is true",
+        translations_ru=["признать"],
+        replacement_ru="признала",
+        generated_sentence="The committee acknowledged the limitation before proceeding.",
+        generated_surface="acknowledged",
+        generated_translation_ru="признал",
+    )
+
+    def fake_request(payload, _api_key):
+        payloads.append(payload)
+        if payload["response_format"]["json_schema"]["name"] == "semantic_context_analysis":
+            content = analysis.model_dump_json()
+        else:
+            content = SemanticMatchResponse(
+                match={
+                    "card_id": "card-1",
+                    "relationship": "same_sense",
+                    "merged_sense_definition_en": analysis.sense_definition_en,
+                    "rationale_ru": "Значение и управление совпадают.",
+                }
+            ).model_dump_json()
+        return {"choices": [{"message": {"content": content}}]}
+
+    monkeypatch.setattr(enrich_module, "_post_json", fake_request)
+    result = analyse_semantic_context(
+        "acknowledged",
+        "The committee acknowledged the limitation.",
+        api_key="test-key",
+    )
+    select_semantic_match(
+        result,
+        [
+            SemanticCandidate(
+                id="card-1",
+                family_key="acknowledge",
+                lemmas=["acknowledge"],
+                parts_of_speech=["verb"],
+                sense_definition_en=analysis.sense_definition_en,
+            )
+        ],
+        api_key="test-key",
+    )
+
+    assert [payload["model"] for payload in payloads] == [
+        enrich_module.DEFAULT_SEMANTIC_MODEL,
+        enrich_module.DEFAULT_SEMANTIC_MODEL,
+    ]
+    assert [payload["reasoning"] for payload in payloads] == [
+        {"effort": "none"},
+        {"effort": "none"},
+    ]
+    assert [payload["temperature"] for payload in payloads] == [0.2, 0.0]
+    assert all(payload["provider"]["require_parameters"] for payload in payloads)
 
 
 def test_enrichment_retries_five_times_with_varied_requests(monkeypatch) -> None:
@@ -223,6 +308,18 @@ def test_enrichment_rejects_non_russian_replacement_and_duplicates() -> None:
             replacement_ru="сохранила",
             forbidden_alternatives_en=["saved", "kept"],
         )
+
+
+def test_enrichment_allows_one_precise_translation_and_no_alternatives() -> None:
+    item = EnrichedItem(
+        id="abc",
+        context_explanation_ru="У конструкции есть только один точный перевод.",
+        translations_ru=["учёт"],
+        replacement_ru="учёт",
+        forbidden_alternatives_en=[],
+    )
+    assert item.translations_ru == ["учёт"]
+    assert item.forbidden_alternatives_en == []
 
 
 def test_semantic_analysis_rejects_loose_pos_and_non_russian_replacements() -> None:
@@ -323,6 +420,33 @@ def test_csv_cards_are_shuffled_reproducibly(tmp_path) -> None:
     assert len(rows) == 8
     meaning_rows = [row for row in rows if "card::meaning" in row["Tags"]]
     assert all("<br>" in row["Back"] for row in meaning_rows)
+
+
+def test_export_omits_empty_forbidden_hint(tmp_path) -> None:
+    target = TargetContext(
+        id="id-1",
+        target="consideration",
+        sentence="We take balance into consideration.",
+        sentence_html="We take balance into <b>consideration</b>.",
+        recall_template_html=f"We take balance into {RECALL_PLACEHOLDER}.",
+        source_page=1,
+        highlight_coverage=1,
+    )
+    enrichment = EnrichedItem(
+        id="id-1",
+        context_explanation_ru="Здесь конструкция означает учёт фактора.",
+        translations_ru=["учёт"],
+        replacement_ru="учёт",
+        forbidden_alternatives_en=[],
+    )
+    destination = tmp_path / "cards.csv"
+
+    write_anki_csv(destination, [target], [enrichment], article_tag="test")
+
+    with destination.open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    recall = next(row for row in rows if "card::recall" in row["Tags"])
+    assert "Нельзя использовать" not in recall["Front"]
 
 
 def test_deduplication_skips_history_but_keeps_repeated_current_targets(tmp_path) -> None:

@@ -35,7 +35,8 @@ jobs:
       SERVER_USER: ${{ secrets.SERVER_USER }}
       SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      OPENROUTER_MODEL: openai/gpt-5.6-luna
+      OPENROUTER_MODEL: deepseek/deepseek-v4-flash-0731:nitro
+      OPENROUTER_SEMANTIC_MODEL: deepseek/deepseek-v4-flash-0731:nitro
       APP_SECRET: ${{ secrets.APP_SECRET }}
       ANKI_CREDENTIAL_KEY: ${{ secrets.ANKI_CREDENTIAL_KEY }}
       ANKIWEB_ALLOWED_USERS: risesduckness
@@ -64,6 +65,7 @@ jobs:
           {
             printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY"
             printf 'OPENROUTER_MODEL=%s\n' "$OPENROUTER_MODEL"
+            printf 'OPENROUTER_SEMANTIC_MODEL=%s\n' "$OPENROUTER_SEMANTIC_MODEL"
             printf 'APP_SECRET=%s\n' "$APP_SECRET"
             printf 'ANKI_CREDENTIAL_KEY=%s\n' "$ANKI_CREDENTIAL_KEY"
             printf 'ANKIWEB_ALLOWED_USERS=%s\n' "$ANKIWEB_ALLOWED_USERS"

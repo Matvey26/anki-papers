@@ -43,11 +43,13 @@ class EnrichedItem(StrictModel):
         ),
     )
     translations_ru: list[str] = Field(
-        min_length=2,
+        min_length=1,
         max_length=5,
         description=(
-            "Two to five distinct Russian translations that all express the target's "
-            "meaning in this exact sentence, never unrelated dictionary senses."
+            "The single best Russian answer followed by at most four equally precise close "
+            "variants for this exact occurrence. One precise translation is complete; never "
+            "add related concepts, paraphrases, prerequisites, consequences, hypernyms, "
+            "hyponyms, or weaker dictionary senses to increase the count."
         ),
     )
     replacement_ru: str = Field(
@@ -59,11 +61,13 @@ class EnrichedItem(StrictModel):
         ),
     )
     forbidden_alternatives_en: list[str] = Field(
-        min_length=2,
+        min_length=0,
         max_length=6,
         description=(
-            "Unique, simpler English near-synonyms that preserve the contextual meaning "
-            "but are not the target answer. Never antonyms or unrelated words."
+            "An exact-span substitution list, not a thesaurus: zero to six unique, simpler "
+            "English near-synonyms that produce a natural sentence when only the target span "
+            "is replaced and every other character stays unchanged. Empty is preferable to "
+            "any candidate requiring a surrounding edit or creating an awkward collocation."
         ),
     )
 
