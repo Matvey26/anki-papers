@@ -3,9 +3,9 @@ from __future__ import annotations
 import hashlib
 import html
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import pdfplumber
@@ -45,6 +45,8 @@ _ABBREVIATIONS = {
 }
 _LEADING_PUNCTUATION = "\"'“‘([{"
 _TRAILING_PUNCTUATION = "\"'”’)]},;:.!?"
+_FOOTNOTE_URL_RE = re.compile(r"^\s*\d*\s*(?:https?://|www\.)\S+\s*$", re.IGNORECASE)
+_MAX_CONTEXT_CHARS = 420
 
 
 @dataclass(slots=True)
@@ -549,7 +551,7 @@ def _context_for_group(
         (
             f"{source_name}\0{group.page_index}\0{group.start}\0"
             f"{group.target}\0{sentence}"
-        ).encode("utf-8")
+        ).encode()
     ).hexdigest()[:16]
     return TargetContext(
         id=digest,
@@ -586,6 +588,8 @@ def _extract_document_text(pdf_path: Path) -> DocumentText:
             stripped = line.strip()
             if not stripped or re.fullmatch(r"\d{1,3}", stripped):
                 continue
+            if _FOOTNOTE_URL_RE.fullmatch(stripped):
+                continue
             if not first_nonempty_seen:
                 hard_start = _looks_like_section_heading(stripped)
                 first_nonempty_seen = True
@@ -616,6 +620,136 @@ def _extract_document_text(pdf_path: Path) -> DocumentText:
         page_ranges=page_ranges,
         hard_page_starts=hard_page_starts,
     )
+
+
+def extract_document_text(pdf_path: str | Path) -> DocumentText:
+    """Extract cleaned, page-addressable prose for article-context mining."""
+    path = Path(pdf_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"PDF not found: {path}")
+    return _extract_document_text(path)
+
+
+def find_article_contexts(
+    document: DocumentText,
+    targets: Iterable[str],
+    *,
+    limit_per_target: int = 12,
+) -> list[TargetContext]:
+    """Find literal target occurrences without creating PDF highlights."""
+    found: list[TargetContext] = []
+    seen: set[tuple[str, str]] = set()
+    sentence_spans = list(_sentence_spans(document.text))
+    normalized_targets = list(
+        dict.fromkeys(" ".join(value.split()) for value in targets if value.strip())
+    )
+    raw_matches: list[tuple[int, int, str, re.Match[str]]] = []
+    for target in normalized_targets:
+        parts = [re.escape(part) for part in target.split()]
+        pattern = re.compile(
+            r"(?<![A-Za-z])" + r"\s+".join(parts) + r"(?![A-Za-z])",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(document.text):
+            raw_matches.append((match.start(), match.end(), target, match))
+    raw_matches.sort(key=lambda item: (item[0], -(item[1] - item[0]), item[2]))
+    selected_matches: list[tuple[int, int, str, re.Match[str]]] = []
+    counts: dict[str, int] = {}
+    for candidate in raw_matches:
+        start, end, target, _ = candidate
+        if counts.get(target, 0) >= limit_per_target:
+            continue
+        if any(start < other_end and end > other_start for other_start, other_end, *_ in selected_matches):
+            continue
+        selected_matches.append(candidate)
+        counts[target] = counts.get(target, 0) + 1
+
+    for _, _, _, match in selected_matches:
+        span = next(
+            (
+                (start, end)
+                for start, end in sentence_spans
+                if start <= match.start() < end
+            ),
+            None,
+        )
+        if span is None:
+            continue
+        sentence_start, sentence_end = span
+        sentence = document.text[sentence_start:sentence_end].strip()
+        relative_start = match.start() - sentence_start
+        relative_end = match.end() - sentence_start
+        sentence, relative_start, relative_end = _trim_context_window(
+            sentence,
+            relative_start,
+            relative_end,
+        )
+        surface = sentence[relative_start:relative_end]
+        key = (surface.casefold(), " ".join(sentence.casefold().split()))
+        if key in seen:
+            continue
+        seen.add(key)
+        page = _page_for_position(document, match.start())
+        before = sentence[:relative_start]
+        after = sentence[relative_end:]
+        digest = hashlib.sha256(
+            f"{page}\0{match.start()}\0{surface}\0{sentence}".encode()
+        ).hexdigest()[:16]
+        found.append(
+            TargetContext(
+                id=digest,
+                target=surface,
+                sentence=sentence,
+                sentence_html=(
+                    f"{html.escape(before)}<b>{html.escape(surface)}</b>"
+                    f"{html.escape(after)}"
+                ),
+                recall_template_html=(
+                    f"{html.escape(before)}{RECALL_PLACEHOLDER}{html.escape(after)}"
+                ),
+                source_page=page,
+                highlight_coverage=0,
+            )
+        )
+    return found
+
+
+def _page_for_position(document: DocumentText, position: int) -> int:
+    for page_index, (start, end) in enumerate(document.page_ranges):
+        if start <= position <= end:
+            return page_index + 1
+    return len(document.page_ranges)
+
+
+def _trim_context_window(
+    sentence: str,
+    target_start: int,
+    target_end: int,
+    *,
+    maximum: int = _MAX_CONTEXT_CHARS,
+) -> tuple[str, int, int]:
+    if len(sentence) <= maximum:
+        return sentence, target_start, target_end
+    target_width = target_end - target_start
+    available = max(40, maximum - target_width - 4)
+    left_budget = int(available * 0.45)
+    window_start = max(0, target_start - left_budget)
+    window_end = min(len(sentence), window_start + maximum)
+    if window_end == len(sentence):
+        window_start = max(0, window_end - maximum)
+    if window_start:
+        next_space = sentence.find(" ", window_start)
+        if 0 <= next_space < target_start:
+            window_start = next_space + 1
+    if window_end < len(sentence):
+        previous_space = sentence.rfind(" ", target_end, window_end)
+        if previous_space > target_end:
+            window_end = previous_space
+    prefix = "… " if window_start else ""
+    suffix = " …" if window_end < len(sentence) else ""
+    clipped = f"{prefix}{sentence[window_start:window_end].strip()}{suffix}"
+    adjusted_start = len(prefix) + target_start - window_start
+    return clipped, adjusted_start, adjusted_start + target_width
 
 
 def _looks_like_section_heading(line: str) -> bool:
@@ -679,6 +813,11 @@ def _context_from_document_text(
         sentence = document.text[sentence_start:sentence_end].strip()
     relative_start = match.start() - sentence_start
     relative_end = match.end() - sentence_start
+    sentence, relative_start, relative_end = _trim_context_window(
+        sentence,
+        relative_start,
+        relative_end,
+    )
     before = sentence[:relative_start]
     matched = sentence[relative_start:relative_end]
     after = sentence[relative_end:]

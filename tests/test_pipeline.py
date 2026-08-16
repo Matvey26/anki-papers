@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 import articles_to_anki.enrich as enrich_module
+import articles_to_anki.extract as extract_module
 from articles_to_anki.cli import _exclude_processed_targets, _load_excluded_targets
 from articles_to_anki.enrich import (
     analyse_semantic_context,
@@ -16,11 +18,15 @@ from articles_to_anki.enrich import (
 from articles_to_anki.export import write_anki_csv
 from articles_to_anki.extract import (
     RECALL_PLACEHOLDER,
+    DocumentText,
     ExtractionConfig,
     Token,
+    _context_from_document_text,
+    _extract_document_text,
     _group_selected_tokens,
     _pdf_quad_to_region,
     _rectangle_overlap_ratio,
+    find_article_contexts,
     is_sentence_end,
     render_sentence,
 )
@@ -92,6 +98,72 @@ def test_two_word_phrase_can_cross_a_line_wrap() -> None:
 
     assert len(groups) == 1
     assert groups[0].target == "along with"
+
+
+def test_cross_page_context_discards_footnote_urls_and_is_clipped(monkeypatch) -> None:
+    class FakePage:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        def extract_text(self) -> str:
+            return self.text
+
+    class FakeReader:
+        def __init__(self, _path: Path) -> None:
+            self.pages = [
+                FakePage(
+                    "• Open-source models include general models like DeepSeek-LLM, Qwen, "
+                    "and (4)\n5https://open.bigmodel.cn/dev/api#glm-4\n10"
+                ),
+                FakePage(
+                    "ChatGLM3 6B, as well as models with enhancements in mathematics "
+                    + "including many separately evaluated systems, " * 20
+                    + "which conclude the comparison."
+                ),
+            ]
+
+    monkeypatch.setattr(extract_module, "PdfReader", FakeReader)
+    document = _extract_document_text(Path("ignored.pdf"))
+    context = _context_from_document_text(document, "as well as", 1, 0)
+
+    assert context is not None
+    sentence, sentence_html, _ = context
+    assert "open.bigmodel.cn" not in sentence
+    assert len(sentence) <= 424
+    assert "<b>as well as</b>" in sentence_html
+
+
+def test_article_context_finds_unhighlighted_phrase() -> None:
+    sentence = (
+        "However, open-source models considerably trail behind in performance. "
+        "A separate result follows."
+    )
+    document = DocumentText(
+        text=sentence,
+        page_ranges=[(0, len(sentence))],
+        hard_page_starts=[False],
+    )
+
+    contexts = find_article_contexts(document, ["trail behind"])
+
+    assert len(contexts) == 1
+    assert contexts[0].target == "trail behind"
+    assert contexts[0].source_page == 1
+
+
+def test_article_context_prefers_longest_overlapping_phrase() -> None:
+    sentence = "The benchmark covers code tasks, as well as multilingual reasoning."
+    document = DocumentText(
+        text=sentence,
+        page_ranges=[(0, len(sentence))],
+        hard_page_starts=[False],
+    )
+
+    contexts = find_article_contexts(document, ["as well", "as well as"])
+
+    assert [(context.target, context.sentence) for context in contexts] == [
+        ("as well as", sentence)
+    ]
 
 
 def test_target_rendering_bolds_only_target_and_keeps_punctuation() -> None:

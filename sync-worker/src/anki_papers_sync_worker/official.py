@@ -401,7 +401,11 @@ def _card_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
 
 
 def _semantic_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
-    contexts = card.get("contexts") or []
+    contexts = [
+        context
+        for context in (card.get("contexts") or [])
+        if _semantic_context_enabled(context, direction)
+    ]
     if not contexts:
         raise PermanentSyncError("semantic_card_without_contexts")
     values = []
@@ -443,6 +447,11 @@ def _semantic_sides(card: dict[str, Any], direction: str) -> tuple[str, str]:
         values[0],
         "",
     )
+
+
+def _semantic_context_enabled(context: dict[str, Any], direction: str) -> bool:
+    directions = context.get("directions")
+    return not directions or direction in directions
 
 
 def _semantic_recall_distractors_html(context: dict[str, Any]) -> str:

@@ -6,6 +6,7 @@ import functools
 import html
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -15,6 +16,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +43,7 @@ from flask import (
 )
 from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Highlight
+from pypdf.errors import PdfReadError
 from pypdf.generic import (
     ArrayObject,
     ContentStream,
@@ -57,7 +60,12 @@ from .enrich import (
     load_env_file,
     select_semantic_match,
 )
-from .extract import RECALL_PLACEHOLDER, extract_highlights
+from .extract import (
+    RECALL_PLACEHOLDER,
+    extract_document_text,
+    extract_highlights,
+    find_article_contexts,
+)
 from .models import SemanticCandidate, TargetContext
 from .security import (
     claim_token_digest,
@@ -81,6 +89,16 @@ USERNAME_RE = re.compile(r"^[\w.\-]{3,32}$", re.UNICODE)
 WORD_RE = re.compile(r"^[\w]+(?:['’\-][\w]+)*$", re.UNICODE)
 HYPHENATED_LINE_BREAK_RE = re.compile(r"[-\u2010\u00ad]\s*\r?\n\s*")
 MAX_TARGET_WORDS = 3
+ARTICLE_CONTEXT_LIMIT = 4
+LOGGER = logging.getLogger(__name__)
+_ARTICLE_STOPWORDS = {
+    "about", "after", "also", "among", "and", "are", "because", "been", "before",
+    "being", "between", "both", "but", "can", "could", "does", "during", "each",
+    "for", "from", "had", "has", "have", "into", "its", "may", "more", "most",
+    "not", "only", "other", "our", "over", "same", "such", "than", "that", "the",
+    "their", "these", "they", "this", "through", "under", "using", "was", "were",
+    "when", "where", "which", "while", "with", "would",
+}
 
 
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
@@ -743,10 +761,27 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             highlight_rows,
             user_id=session["user_id"],
         )
+        changed_cards = remove_article_contexts_for_document(
+            get_database(),
+            session["user_id"],
+            document_id,
+        )
         get_database().execute(
             "DELETE FROM documents WHERE id = ? AND user_id = ?",
             (document_id, session["user_id"]),
         )
+        if changed_cards:
+            account = get_database().execute(
+                "SELECT state FROM anki_accounts WHERE user_id = ?",
+                (session["user_id"],),
+            ).fetchone()
+            if account is not None and account["state"] in {"connected", "syncing", "error"}:
+                enqueue_sync_job(
+                    get_database(),
+                    session["user_id"],
+                    "article_deleted",
+                    delay_seconds=0,
+                )
         get_database().commit()
 
         with app.extensions["highlight_jobs_lock"]:
@@ -1996,6 +2031,214 @@ def canonical_semantic_family(*values: str) -> str:
     return min(cleaned, key=lambda value: (len(value), value))
 
 
+def _article_words(value: str, *, targets: set[str]) -> set[str]:
+    target_words = {
+        token
+        for target in targets
+        for token in re.findall(r"[a-z]+", target.casefold())
+    }
+    return {
+        token
+        for token in re.findall(r"[a-z]+", value.casefold())
+        if len(token) >= 3
+        and token not in _ARTICLE_STOPWORDS
+        and token not in target_words
+    }
+
+
+def _article_context_score(
+    card: sqlite3.Row,
+    contexts: list[dict[str, Any]],
+    target: str,
+    sentence: str,
+    targets: set[str],
+) -> int | None:
+    if not _article_context_is_readable(sentence):
+        return None
+    target_word_count = len(re.findall(r"[A-Za-z]+", target))
+    anchor_text = " ".join(
+        [str(card["sense_definition_en"])]
+        + [
+            str(item.get("sentence") or "")
+            for item in contexts
+            if item.get("source") not in {"article_context", "llm_generated"}
+        ]
+    )
+    anchor_words = _article_words(anchor_text, targets=targets)
+    candidate_words = _article_words(sentence, targets=targets)
+    overlap = len(anchor_words & candidate_words)
+    if target_word_count >= 2:
+        return 100 + overlap
+    if overlap < 2:
+        return None
+    return overlap
+
+
+def _article_context_is_readable(sentence: str) -> bool:
+    cleaned = sentence.strip()
+    if len(cleaned) < 45 or cleaned.endswith(" .") or "|" in cleaned:
+        return False
+    if re.match(r"^(?:…\s*)?\d+\s+\d+(?:\.\d+)+\s+", cleaned):
+        return False
+    numeric_tokens = re.findall(r"(?<![A-Za-z])\d+(?:\.\d+)?%?", cleaned)
+    percentages = [value for value in numeric_tokens if value.endswith("%")]
+    if len(numeric_tokens) >= 8 or len(percentages) >= 3:
+        return False
+    if cleaned.startswith("…") and len(numeric_tokens) >= 4:
+        return False
+    if sum(unicodedata.category(char).startswith("S") for char in cleaned) >= 5:
+        return False
+    return True
+
+
+def refresh_article_contexts(
+    database: sqlite3.Connection,
+    user_id: int,
+    *,
+    card_ids: set[str] | None = None,
+) -> set[str]:
+    """Mine uploaded PDFs for extra meaning-only contexts without LLM calls."""
+    parameters: list[Any] = [user_id]
+    card_filter = ""
+    if card_ids is not None:
+        if not card_ids:
+            return set()
+        placeholders = ",".join("?" for _ in card_ids)
+        card_filter = f" AND id IN ({placeholders})"
+        parameters.extend(sorted(card_ids))
+    cards = database.execute(
+        f"""SELECT * FROM cards
+            WHERE user_id = ? AND semantic_version = 1{card_filter}
+            ORDER BY created_at""",
+        parameters,
+    ).fetchall()
+    documents = database.execute(
+        """SELECT id, name, source_path, stored_path FROM documents
+           WHERE user_id = ? AND kind = 'pdf' ORDER BY created_at""",
+        (user_id,),
+    ).fetchall()
+    parsed_documents = []
+    for document in documents:
+        path = Path(document["source_path"] or document["stored_path"])
+        if not path.is_file():
+            continue
+        try:
+            parsed_documents.append((document, extract_document_text(path)))
+        except (OSError, PdfReadError, RuntimeError, ValueError) as exc:
+            LOGGER.warning("Could not mine article contexts from %s: %s", path, exc)
+            continue
+
+    changed: set[str] = set()
+    for card in cards:
+        contexts = [
+            item
+            for item in json.loads(card["contexts_json"] or "[]")
+            if isinstance(item, dict)
+        ]
+        retained = [item for item in contexts if item.get("source") != "article_context"]
+        targets = {
+            " ".join(str(value).casefold().split())
+            for value in (
+                str(card["lemma"] or ""),
+                str(card["family_key"] or ""),
+                *(str(item.get("target") or "") for item in retained),
+            )
+            if value.strip()
+        }
+        known_sentences = {
+            " ".join(str(item.get("sentence") or "").casefold().split())
+            for item in retained
+        }
+        candidates: list[tuple[int, str, int, dict[str, Any]]] = []
+        for document, parsed in parsed_documents:
+            for occurrence in find_article_contexts(parsed, sorted(targets)):
+                sentence_key = " ".join(occurrence.sentence.casefold().split())
+                if sentence_key in known_sentences:
+                    continue
+                score = _article_context_score(
+                    card,
+                    retained,
+                    occurrence.target,
+                    occurrence.sentence,
+                    targets,
+                )
+                if score is None:
+                    continue
+                context = {
+                    "id": f"article:{document['id']}:{occurrence.id}",
+                    "source": "article_context",
+                    "document_id": str(document["id"]),
+                    "document_name": str(document["name"]),
+                    "page": occurrence.source_page,
+                    "directions": ["meaning"],
+                    "target": occurrence.target,
+                    "sentence": occurrence.sentence,
+                    "replacement": str(card["replacement"]),
+                    "lemma": str(card["lemma"]),
+                    "family_key": str(card["family_key"]),
+                    "part_of_speech": str(card["part_of_speech"]),
+                    "sense_definition_en": str(card["sense_definition_en"]),
+                }
+                candidates.append((score, str(document["id"]), occurrence.source_page, context))
+                known_sentences.add(sentence_key)
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2], item[3]["id"]))
+        selected = []
+        per_document: dict[str, int] = {}
+        for candidate in candidates:
+            document_id = candidate[1]
+            if per_document.get(document_id, 0) >= 2:
+                continue
+            selected.append(candidate[3])
+            per_document[document_id] = per_document.get(document_id, 0) + 1
+            if len(selected) == ARTICLE_CONTEXT_LIMIT:
+                break
+        updated = retained + selected
+        if updated == contexts:
+            continue
+        database.execute(
+            """UPDATE cards SET contexts_json = ?, csv_exported_at = NULL,
+               apkg_exported_at = NULL, anki_synced_at = NULL
+               WHERE id = ? AND user_id = ?""",
+            (json.dumps(updated, ensure_ascii=False), card["id"], user_id),
+        )
+        changed.add(str(card["id"]))
+    return changed
+
+
+def remove_article_contexts_for_document(
+    database: sqlite3.Connection,
+    user_id: int,
+    document_id: str,
+) -> set[str]:
+    changed: set[str] = set()
+    cards = database.execute(
+        """SELECT id, contexts_json FROM cards
+           WHERE user_id = ? AND semantic_version = 1""",
+        (user_id,),
+    ).fetchall()
+    for card in cards:
+        contexts = json.loads(card["contexts_json"] or "[]")
+        retained = [
+            item
+            for item in contexts
+            if not (
+                isinstance(item, dict)
+                and item.get("source") == "article_context"
+                and str(item.get("document_id")) == document_id
+            )
+        ]
+        if retained == contexts:
+            continue
+        database.execute(
+            """UPDATE cards SET contexts_json = ?, csv_exported_at = NULL,
+               apkg_exported_at = NULL, anki_synced_at = NULL
+               WHERE id = ? AND user_id = ?""",
+            (json.dumps(retained, ensure_ascii=False), card["id"], user_id),
+        )
+        changed.add(str(card["id"]))
+    return changed
+
+
 def enrich_highlight_row(
     app: Flask,
     database: sqlite3.Connection,
@@ -2003,6 +2246,7 @@ def enrich_highlight_row(
     *,
     user_id: int,
     document_id: str,
+    mine_article_contexts: bool = True,
 ) -> sqlite3.Row:
     timestamp = now()
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
@@ -2134,6 +2378,12 @@ def enrich_highlight_row(
            WHERE id = ? AND user_id = ?""",
         (translations, replacement, alternatives, timestamp, row["id"], user_id),
     )
+    if mine_article_contexts:
+        refresh_article_contexts(
+            database,
+            user_id,
+            card_ids={str(existing["id"])},
+        )
     if card_changed:
         account = database.execute(
             "SELECT state FROM anki_accounts WHERE user_id = ?", (user_id,)
@@ -2432,6 +2682,7 @@ def process_document_highlights(app: Flask, document_id: str, user_id: int) -> N
                     row,
                     user_id=user_id,
                     document_id=document_id,
+                    mine_article_contexts=False,
                 )
             except MissingApiKeyError:
                 discarded += 1
@@ -2443,6 +2694,14 @@ def process_document_highlights(app: Flask, document_id: str, user_id: int) -> N
                 discarded += 1
                 app.logger.exception("Imported highlight enrichment failed")
                 delete_highlight_rows(database, [row], user_id=user_id)
+
+        article_context_cards = refresh_article_contexts(database, user_id)
+        if article_context_cards:
+            account = database.execute(
+                "SELECT state FROM anki_accounts WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            if account is not None and account["state"] in {"connected", "syncing", "error"}:
+                enqueue_sync_job(database, user_id, "article_contexts", delay_seconds=30)
 
         imported_count = database.execute(
             """SELECT COUNT(*) FROM highlights
@@ -2622,30 +2881,46 @@ def semantic_card_rows(card: sqlite3.Row) -> list[dict[str, str]]:
         raise ValueError("Semantic card has no contexts")
     translations_values = json.loads(card["translations_json"])
     fallback_replacement = str(translations_values[0])
-    rendered = []
-    for item in contexts:
-        target = str(item["target"])
-        sentence = str(item["sentence"])
-        replacement = _compact_semantic_replacement(
-            str(item["replacement"]),
-            fallback=fallback_replacement,
-            english_surface=target,
-        )
-        rendered.append({
-            "front": emphasize_target(sentence, target, html.escape(target)),
-            "recall": emphasize_target(
-                sentence,
-                target,
-                f"<b>{html.escape(replacement)}</b>",
-                replacement_is_html=True,
-            ) + _semantic_recall_distractors_html(item),
-            "answer": html.escape(target),
-            "source": html.escape(str(item["source"])),
-        })
-    payload = html.escape(json.dumps(rendered, ensure_ascii=False), quote=True)
+    def render(selected: list[dict[str, Any]]) -> list[dict[str, str]]:
+        rendered = []
+        for item in selected:
+            target = str(item["target"])
+            sentence = str(item["sentence"])
+            replacement = _compact_semantic_replacement(
+                str(item["replacement"]),
+                fallback=fallback_replacement,
+                english_surface=target,
+            )
+            rendered.append({
+                "front": emphasize_target(sentence, target, html.escape(target)),
+                "recall": emphasize_target(
+                    sentence,
+                    target,
+                    f"<b>{html.escape(replacement)}</b>",
+                    replacement_is_html=True,
+                ) + _semantic_recall_distractors_html(item),
+                "answer": html.escape(target),
+                "source": html.escape(str(item["source"])),
+            })
+        return rendered
+
+    meaning_rendered = render(
+        [item for item in contexts if _semantic_context_enabled(item, "meaning")]
+    )
+    recall_rendered = render(
+        [item for item in contexts if _semantic_context_enabled(item, "recall")]
+    )
+    if not meaning_rendered or not recall_rendered:
+        raise ValueError("Semantic card has no contexts for one direction")
+    meaning_payload = html.escape(
+        json.dumps(meaning_rendered, ensure_ascii=False), quote=True
+    )
+    recall_payload = html.escape(
+        json.dumps(recall_rendered, ensure_ascii=False), quote=True
+    )
     key = html.escape(str(card["id"]), quote=True)
-    front = _semantic_front_html(payload, key, "front", rendered[0])
-    recall = _semantic_front_html(payload, key, "recall", rendered[0])
+    front = _semantic_front_html(meaning_payload, key, "front", meaning_rendered[0])
+    recall = _semantic_front_html(recall_payload, key, "recall", recall_rendered[0])
     translations = "<br>".join(
         f"• {html.escape(value)}" for value in translations_values
     )
@@ -2657,23 +2932,28 @@ def semantic_card_rows(card: sqlite3.Row) -> list[dict[str, str]]:
     ).strip("_") or "word"
     common = f"anki_papers::{card['id']} semantic::v1 family::{family_tag}"
     meaning_back = _semantic_back_html(
-        payload,
+        meaning_payload,
         key,
         "front",
-        rendered[0],
+        meaning_rendered[0],
         f"<br>{translations}<br><small>{sense}</small>",
     )
     recall_back = _semantic_back_html(
-        payload,
+        recall_payload,
         key,
         "recall",
-        rendered[0],
+        recall_rendered[0],
         "",
     )
     return [
         {"Front": front, "Back": meaning_back, "Tags": f"{common} card::meaning"},
         {"Front": recall, "Back": recall_back, "Tags": f"{common} card::recall"},
     ]
+
+
+def _semantic_context_enabled(context: dict[str, Any], direction: str) -> bool:
+    directions = context.get("directions")
+    return not directions or direction in directions
 
 
 def _semantic_recall_distractors_html(context: dict[str, Any]) -> str:

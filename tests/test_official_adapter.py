@@ -116,6 +116,14 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
                     "Команды должны преодолеть скрытые допущения до начала анализа"
                 ),
             },
+            {
+                "id": "article:c",
+                "source": "article_context",
+                "directions": ["meaning"],
+                "target": "overcome",
+                "sentence": "Small teams overcome similar constraints in practice.",
+                "replacement": "преодолевают",
+            },
         ],
     }
     note = OfficialAnkiAdapter._add_note(collection, card, "meaning", 1)
@@ -130,6 +138,7 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
     )
     assert "item.source" not in note.fields[0]
     assert "item.translation" not in note.fields[0]
+    assert "Small teams &lt;b&gt;overcome" in note.fields[0]
     assert "family:" not in note.fields[1]
     recall = OfficialAnkiAdapter._add_note(collection, card, "recall", 1)
     assert "[...]" not in recall.fields[0]
@@ -142,6 +151,7 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
         in recall.fields[0]
     )
     assert "llm_generated" in recall.fields[0]
+    assert "Small teams &lt;b&gt;overcome" not in recall.fields[0]
     card["contexts"].append(
         {"id": "c", "source": "llm_generated", "target": "Overcoming", "sentence": "Overcoming noise required repeated trials.", "replacement": "преодоление"}
     )

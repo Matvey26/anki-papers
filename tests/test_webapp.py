@@ -14,7 +14,7 @@ from pypdf.generic import ArrayObject, DecodedStreamObject, FloatObject
 
 import articles_to_anki.apkg as apkg_module
 import articles_to_anki.webapp as webapp_module
-from articles_to_anki.extract import ExtractedHighlight
+from articles_to_anki.extract import DocumentText, ExtractedHighlight
 from articles_to_anki.models import EnrichedItem, SemanticAnalysis, SemanticMatch
 from articles_to_anki.security import claim_token_digest
 from articles_to_anki.webapp import create_app, make_target_context
@@ -43,6 +43,89 @@ def test_semantic_family_retrieval_handles_common_stem_changes() -> None:
     assert webapp_module.semantic_family_compatible("rely", "reliable")
     assert webapp_module.semantic_family_compatible("acquire", "acquisition")
     assert not webapp_module.semantic_family_compatible("train", "transfer")
+
+
+def test_uploaded_articles_add_meaning_only_context_without_highlight(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+    dashboard = identify(client)
+    client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(dashboard), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+    )
+    database_path = tmp_path / "app.sqlite3"
+    with sqlite3.connect(database_path) as database:
+        document_id = database.execute("SELECT id FROM documents").fetchone()[0]
+        source_context = {
+            "id": "source-highlight",
+            "source": "user_pdf",
+            "target": "trails behind",
+            "sentence": "The smaller model trails behind its peers in benchmark performance.",
+            "replacement": "отстаёт от",
+            "lemma": "trail behind",
+            "family_key": "trail behind",
+            "part_of_speech": "verb",
+            "sense_definition_en": "to lag behind in performance",
+        }
+        database.execute(
+            """INSERT INTO cards
+               (id, user_id, document_id, target, target_normalized, sentence, page,
+                translations_json, replacement, alternatives_json, lemma, family_key,
+                part_of_speech, sense_definition_en, contexts_json, semantic_version, created_at)
+               VALUES ('trail-card', 1, ?, 'trail behind', 'trail behind', ?, 1,
+                       '["отставать"]', 'отстаёт', '[]', 'trail behind', 'trail behind',
+                       'verb', 'to lag behind in performance', ?, 1, '2026-01-01')""",
+            (document_id, source_context["sentence"], json.dumps([source_context])),
+        )
+        database.commit()
+
+    article = (
+        "However, open-source models considerably trail behind in benchmark performance."
+    )
+    monkeypatch.setattr(
+        webapp_module,
+        "extract_document_text",
+        lambda _path: DocumentText(
+            text=article,
+            page_ranges=[(0, len(article))],
+            hard_page_starts=[False],
+        ),
+    )
+    with sqlite3.connect(database_path) as database:
+        database.row_factory = sqlite3.Row
+        changed = webapp_module.refresh_article_contexts(database, 1)
+        database.commit()
+        card = database.execute("SELECT * FROM cards WHERE id = 'trail-card'").fetchone()
+        contexts = json.loads(card["contexts_json"])
+        assert changed == {"trail-card"}
+        assert database.execute("SELECT COUNT(*) FROM highlights").fetchone()[0] == 0
+        assert contexts[-1]["source"] == "article_context"
+        assert contexts[-1]["directions"] == ["meaning"]
+        assert "considerably trail behind" in contexts[-1]["sentence"]
+
+        assert webapp_module.refresh_article_contexts(database, 1) == set()
+        rows = webapp_module.semantic_card_rows(card)
+        assert "considerably &lt;b&gt;trail behind" in rows[0]["Front"]
+        assert "considerably &lt;b&gt;trail behind" not in rows[1]["Front"]
+
+
+def test_article_context_rejects_toc_and_numeric_table_rows() -> None:
+    assert not webapp_module._article_context_is_readable(
+        "7 2.1.2 DeepSeekMoE with Auxiliary-Loss-Free Load Balancing ."
+    )
+    assert not webapp_module._article_context_is_readable(
+        "… Annotator 1 100.0% Annotator 2 66.7% Annotator 3 59.8% and 42.1%."
+    )
+    assert not webapp_module._article_context_is_readable(
+        "Figure 3 shows stronger results than Figure 3| Benchmark curves for several corpora."
+    )
+    assert webapp_module._article_context_is_readable(
+        "In engineering tasks, DeepSeek-V3 trails behind Claude-Sonnet but outperforms open models."
+    )
 
 
 def make_app(tmp_path: Path, **config):
