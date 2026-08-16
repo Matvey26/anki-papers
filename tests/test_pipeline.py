@@ -83,6 +83,17 @@ def test_phrase_can_cross_inline_math_and_a_line_wrap() -> None:
     assert groups[0].target == "can be absorbed into"
 
 
+def test_two_word_phrase_can_cross_a_line_wrap() -> None:
+    tokens = [token("along", 0, x0=498), token("with", 1, x0=70)]
+    tokens[1].top = 113
+    tokens[1].bottom = 124
+
+    groups = _group_selected_tokens(tokens, config=ExtractionConfig())
+
+    assert len(groups) == 1
+    assert groups[0].target == "along with"
+
+
 def test_target_rendering_bolds_only_target_and_keeps_punctuation() -> None:
     tokens = [token("It", 0), token("comprises", 1), token("236B", 2), token("parameters.", 3)]
     assert render_sentence(tokens, target_range=(1, 1)) == (

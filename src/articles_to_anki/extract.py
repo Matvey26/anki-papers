@@ -480,7 +480,6 @@ def _group_selected_tokens(
         )
         wrapped_line = (
             adjacent
-            and len(groups[-1].tokens) >= 2
             and token.top > previous.top + 2.0
             and token.top - previous.top <= 1.6 * max(token.height, previous.height)
             and token.x0 < previous.x0
