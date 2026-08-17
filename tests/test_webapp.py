@@ -469,12 +469,11 @@ def test_quick_translation_returns_part_of_speech_groups(tmp_path: Path, monkeyp
     assert client.get("/api/quick-translation?word=one%20two%20three%20four%20five").status_code == 400
 
 
-def test_quick_translation_routes_words_to_dictionary_and_phrases_to_machine(
+def test_quick_translation_uses_dictionary_only(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     app = make_app(tmp_path)
-    calls: list[str] = []
     app.extensions["quick_translation_dictionary"] = webapp_module.StarDictDictionary(
         tmp_path / "unused.dict", {"run": [(0, 1)]}
     )
@@ -488,27 +487,17 @@ def test_quick_translation_routes_words_to_dictionary_and_phrases_to_machine(
         return []
 
     monkeypatch.setattr(webapp_module.StarDictDictionary, "lookup", fake_lookup)
-    app.extensions["quick_translation_machine"] = webapp_module.MachineTranslator(
-        lambda text: calls.append(text) or "машинный перевод"
-    )
     client = app.test_client()
     identify(client)
 
     assert client.get("/api/quick-translation?word=run").json == {
         "groups": [{"part_of_speech": "гл.", "translations": ["бежать", "мчаться"]}]
     }
-    assert calls == []
 
-    response = client.get("/api/quick-translation?word=is%20of%20high%20quality")
-    assert response.json == {
-        "groups": [{"part_of_speech": "", "translations": ["машинный перевод"]}]
+    assert client.get("/api/quick-translation?word=is%20of%20high%20quality").json == {
+        "groups": []
     }
-    assert calls == ["is of high quality"]
-
-    assert client.get("/api/quick-translation?word=went").json == {
-        "groups": [{"part_of_speech": "", "translations": ["машинный перевод"]}]
-    }
-    assert calls == ["is of high quality", "went"]
+    assert client.get("/api/quick-translation?word=went").json == {"groups": []}
     assert original_lookup is not None
 
 

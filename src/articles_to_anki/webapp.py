@@ -67,7 +67,6 @@ from .extract import (
 )
 from .models import ClusterCandidate, ClusterExample, TargetContext
 from .quick_dictionary import StarDictDictionary
-from .quick_translation import MachineTranslator
 from .security import (
     claim_token_digest,
     encrypt_value,
@@ -140,7 +139,6 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app.extensions["quick_translation_dictionary"] = StarDictDictionary.load(
         Path(app.config["DATA_DIR"]) / "dictionaries" / "eng-rus"
     )
-    app.extensions["quick_translation_machine"] = MachineTranslator.load()
     app.extensions["deleted_document_paths"] = {}
     app.extensions["highlight_resume_done"] = False
 
@@ -1745,13 +1743,8 @@ def is_selectable_target(value: str) -> bool:
 
 def quick_translation_groups(word: str) -> list[dict[str, Any]]:
     dictionary = current_app.extensions.get("quick_translation_dictionary")
-    if isinstance(dictionary, StarDictDictionary) and len(word.split()) == 1:
-        groups = dictionary.lookup(word)
-        if groups:
-            return groups
-    machine = current_app.extensions.get("quick_translation_machine")
-    if isinstance(machine, MachineTranslator):
-        return [{"part_of_speech": "", "translations": [machine(word)]}]
+    if isinstance(dictionary, StarDictDictionary):
+        return dictionary.lookup(word)
     return []
 
 
