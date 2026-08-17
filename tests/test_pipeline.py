@@ -10,10 +10,9 @@ import articles_to_anki.enrich as enrich_module
 import articles_to_anki.extract as extract_module
 from articles_to_anki.cli import _exclude_processed_targets, _load_excluded_targets
 from articles_to_anki.enrich import (
-    analyse_semantic_context,
+    analyse_cluster_assignment,
     build_openrouter_payload,
     enrich_targets,
-    select_semantic_match,
 )
 from articles_to_anki.export import write_anki_csv
 from articles_to_anki.extract import (
@@ -31,12 +30,11 @@ from articles_to_anki.extract import (
     render_sentence,
 )
 from articles_to_anki.models import (
+    ClusterAnalysis,
+    ClusterCandidate,
     EnrichedItem,
     EnrichmentRequestItem,
     RecallDistractors,
-    SemanticAnalysis,
-    SemanticCandidate,
-    SemanticMatchResponse,
     TargetContext,
 )
 
@@ -260,13 +258,13 @@ def test_luna_payload_omits_unsupported_temperature() -> None:
     assert payload["provider"]["require_parameters"] is True
 
 
-def test_semantic_deepseek_payloads_disable_reasoning(monkeypatch) -> None:
+def test_cluster_assignment_uses_reasoning_and_dynamic_cluster_enum(monkeypatch) -> None:
     payloads = []
-    analysis = SemanticAnalysis(
-        lemma="acknowledge",
-        family_key="acknowledge",
+    analysis = ClusterAnalysis(
+        cluster_id="cluster-1",
+        leader="acknowledge",
         part_of_speech="verb",
-        sense_definition_en="accept that a fact or limitation is true",
+        cluster_definition_en="accept that a fact or limitation is true",
         translations_ru=["признать"],
         replacement_ru="признала",
         generated_sentence="The committee acknowledged the limitation before proceeding.",
@@ -288,48 +286,37 @@ def test_semantic_deepseek_payloads_disable_reasoning(monkeypatch) -> None:
 
     def fake_request(payload, _api_key):
         payloads.append(payload)
-        if payload["response_format"]["json_schema"]["name"] == "semantic_context_analysis":
-            content = analysis.model_dump_json()
-        else:
-            content = SemanticMatchResponse(
-                match={
-                    "card_id": "card-1",
-                    "relationship": "same_sense",
-                    "merged_sense_definition_en": analysis.sense_definition_en,
-                    "rationale_ru": "Значение и управление совпадают.",
-                }
-            ).model_dump_json()
-        return {"choices": [{"message": {"content": content}}]}
+        return {"choices": [{"message": {"content": analysis.model_dump_json()}}]}
 
     monkeypatch.setattr(enrich_module, "_post_json", fake_request)
-    result = analyse_semantic_context(
+    result = analyse_cluster_assignment(
+        "acknowledged",
         "acknowledged",
         "The committee acknowledged the limitation.",
-        api_key="test-key",
-    )
-    select_semantic_match(
-        result,
         [
-            SemanticCandidate(
-                id="card-1",
-                family_key="acknowledge",
-                lemmas=["acknowledge"],
-                parts_of_speech=["verb"],
-                sense_definition_en=analysis.sense_definition_en,
+            ClusterCandidate(
+                cluster_id="cluster-1",
+                leader="acknowledge",
+                examples=[
+                    {
+                        "highlight": "acknowledging",
+                        "context": "The report is acknowledging a known limitation.",
+                    }
+                ],
             )
         ],
         api_key="test-key",
     )
-
+    assert result.cluster_id == "cluster-1"
     assert [payload["model"] for payload in payloads] == [
-        enrich_module.DEFAULT_SEMANTIC_MODEL,
-        enrich_module.DEFAULT_SEMANTIC_MODEL,
+        enrich_module.DEFAULT_SEMANTIC_MODEL
     ]
-    assert [payload["reasoning"] for payload in payloads] == [
-        {"effort": "none"},
-        {"effort": "none"},
-    ]
-    assert [payload["temperature"] for payload in payloads] == [0.2, 0.0]
+    assert payloads[0]["reasoning"] == {"effort": "low", "exclude": True}
+    assert payloads[0]["max_tokens"] == 16000
+    assert payloads[0]["temperature"] == 0.1
+    assert payloads[0]["response_format"]["json_schema"]["schema"]["properties"][
+        "cluster_id"
+    ]["enum"] == ["new_cluster", "cluster-1"]
     assert all(payload["provider"]["require_parameters"] for payload in payloads)
 
 
@@ -418,12 +405,12 @@ def test_enrichment_allows_one_precise_translation_and_no_alternatives() -> None
     assert item.forbidden_alternatives_en == []
 
 
-def test_semantic_analysis_rejects_loose_pos_and_non_russian_replacements() -> None:
+def test_cluster_analysis_rejects_loose_pos_and_non_russian_replacements() -> None:
     values = {
-        "lemma": "robust",
-        "family_key": "robust",
+        "cluster_id": "new_cluster",
+        "leader": "robust",
         "part_of_speech": "adjective",
-        "sense_definition_en": "able to remain reliable under difficult conditions",
+        "cluster_definition_en": "able to remain reliable under difficult conditions",
         "translations_ru": ["надёжный", "устойчивый"],
         "replacement_ru": "надёжным",
         "generated_sentence": "The estimator remained robust under heavy noise.",
@@ -442,20 +429,20 @@ def test_semantic_analysis_rejects_loose_pos_and_non_russian_replacements() -> N
             "valid_related_en": [],
         },
     }
-    assert SemanticAnalysis(**values).part_of_speech == "adjective"
+    assert ClusterAnalysis(**values).part_of_speech == "adjective"
     assert (
-        SemanticAnalysis(**{**values, "part_of_speech": "preposition"}).part_of_speech
+        ClusterAnalysis(**{**values, "part_of_speech": "preposition"}).part_of_speech
         == "preposition"
     )
-    assert SemanticAnalysis(**{**values, "family_key": " Robust "}).family_key == "robust"
+    assert ClusterAnalysis(**{**values, "leader": " Robust "}).leader == "robust"
     with pytest.raises(ValidationError):
-        SemanticAnalysis(**{**values, "part_of_speech": "adj"})
+        ClusterAnalysis(**{**values, "part_of_speech": "adj"})
     with pytest.raises(ValidationError):
-        SemanticAnalysis(**{**values, "replacement_ru": "reliable"})
+        ClusterAnalysis(**{**values, "replacement_ru": "reliable"})
     with pytest.raises(ValidationError):
-        SemanticAnalysis(**{**values, "generated_translation_ru": "stable"})
+        ClusterAnalysis(**{**values, "generated_translation_ru": "stable"})
     with pytest.raises(ValidationError):
-        SemanticAnalysis(
+        ClusterAnalysis(
             **{
                 **values,
                 "generated_translation_ru": (
@@ -538,19 +525,9 @@ def test_generated_surface_must_be_a_complete_word_or_phrase() -> None:
     )
 
 
-def test_semantic_match_schema_requires_nullable_card_id() -> None:
-    schema = SemanticMatchResponse.model_json_schema()
-    match_schema = schema["$defs"]["SemanticMatch"]
-    assert {
-        "card_id",
-        "relationship",
-        "merged_sense_definition_en",
-        "rationale_ru",
-    } <= set(match_schema["required"])
-    assert {item["type"] for item in match_schema["properties"]["card_id"]["anyOf"]} == {
-        "string",
-        "null",
-    }
+def test_cluster_analysis_schema_requires_cluster_choice_and_leader() -> None:
+    schema = ClusterAnalysis.model_json_schema()
+    assert {"cluster_id", "leader", "cluster_definition_en"} <= set(schema["required"])
 
 
 def test_csv_cards_are_shuffled_reproducibly(tmp_path) -> None:

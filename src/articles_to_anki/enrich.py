@@ -13,14 +13,12 @@ from typing import Any
 from pydantic import ValidationError
 
 from .models import (
+    ClusterAnalysis,
+    ClusterCandidate,
     EnrichedItem,
     EnrichmentBatch,
     EnrichmentRequestItem,
     RecallDistractors,
-    SemanticAnalysis,
-    SemanticCandidate,
-    SemanticMatch,
-    SemanticMatchResponse,
     TargetContext,
 )
 
@@ -78,12 +76,31 @@ forbidden_alternatives_en; never rename it to near_synonyms or anything else.
 Return every input id once and only once. Follow the supplied JSON Schema exactly.
 """
 
-SEMANTIC_SYSTEM_PROMPT = """\
-Build one advanced English-to-Russian vocabulary card from ONE highlighted target and its full
-sentence. Return its canonical lemma, coarse part_of_speech, and a short English definition of its
-exact contextual sense. family_key is the lowercase base shared by inflectional or derivational
-forms with the same semantic core. Spelling or etymology alone never joins unrelated meanings;
-treat fixed multiword expressions as units.
+CLUSTER_SYSTEM_PROMPT = """\
+Assign ONE highlighted English word or expression to a learnable word-formation cluster and build
+its English-to-Russian card context.
+
+You receive the raw highlight, its normalized form, its full sentence, and zero to five candidate
+clusters found only by fuzzy spelling similarity. Each candidate has a stable cluster_id, a leader,
+and up to five real highlights with their contexts. Fuzzy similarity is retrieval only: it is not
+evidence that meanings or word families match.
+
+Set cluster_id to exactly one supplied candidate cluster_id only when the new highlight is
+word-formation-related to that cluster AND shares its central learnable meaning. Inflections and
+derivations may share a cluster: acquire/acquires/acquired/acquisition can use leader acquire.
+Homonyms with identical spelling but unrelated meanings must remain separate clusters: train as a
+noun meaning a railway vehicle and train as a verb meaning practise need different cluster_id
+values. Different senses that would teach different answers also need separate clusters.
+
+Set cluster_id to the literal value new_cluster when no candidate qualifies. This is always a valid
+choice, even when candidates exist. Never invent a cluster_id. For new_cluster, leader must be the
+canonical lowercase representative: a base word, normalized phrase, or fixed expression. For an
+existing cluster, repeat its supplied leader exactly. Fixed expressions that cannot be usefully
+re-formed remain singleton clusters, e.g. it's worth has leader it's worth.
+
+cluster_definition_en must precisely cover the selected cluster after adding this occurrence. For a
+new cluster it defines this occurrence's sense. For an existing cluster it is a concise umbrella
+definition that covers both old examples and the new occurrence without admitting unrelated senses.
 
 Give 1-4 precise Russian translations of the highlighted span. replacement_ru must translate only
 that span, preserving its contextual case, number, tense, and role without absorbing neighboring
@@ -107,28 +124,6 @@ different verb, preposition, determiner, or word order. Never repair the sentenc
 different construction. Exclude the target and spelling/case variants, Russian words,
 explanations, and sentences. Valid lists may be empty; quality beats count.
 Return only JSON matching the schema.
-"""
-
-SEMANTIC_MATCH_PROMPT = """\
-Decide whether the analysed source belongs on the same LEARNABLE CARD as one supplied candidate.
-Candidates share either family_key or a conservative morphological prefix. Reject false lexical
-relatives; spelling similarity alone is never enough.
-
-Use same_sense for inflectional variants or effectively interchangeable meanings. Use
-related_sense when the meanings share one clear central concept and seeing both contexts together
-helps the learner acquire a broader, richer meaning. Derivational relatives and part-of-speech
-changes may merge: acquire/acquired/acquisition and acknowledge/acknowledging are good examples
-when their contexts preserve the same semantic core.
-
-Use new_card when combining would teach two answers rather than enrich one concept. Polysemy must
-stay separate: recognize meaning "identify from prior knowledge" is different from recognize
-meaning "admit or acknowledge as true"; run physically, run a company, and run software are also
-different cards. Similar spelling, family_key, or topic never overrides this rule.
-
-For same_sense or related_sense, return the candidate card_id and a concise umbrella English
-definition that covers both the existing candidate and source while excluding incompatible senses.
-For new_card, card_id and merged_sense_definition_en must both be null. Explain briefly in Russian.
-Return JSON only and follow the schema exactly.
 """
 
 
@@ -335,38 +330,60 @@ def _post_json(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
     return json.loads(body)
 
 
-def analyse_semantic_context(
+def analyse_cluster_assignment(
     target: str,
+    normalized_target: str,
     sentence: str,
+    candidates: list[ClusterCandidate],
     *,
     api_key: str,
     model: str = DEFAULT_SEMANTIC_MODEL,
-) -> SemanticAnalysis:
-    """Classify a lexical sense and create one explicitly synthetic extra context."""
+) -> ClusterAnalysis:
+    """Choose a cluster and create its card context in one model call."""
+    allowed_cluster_ids = ["new_cluster", *(item.cluster_id for item in candidates)]
+    schema = ClusterAnalysis.model_json_schema()
+    schema["properties"]["cluster_id"]["enum"] = allowed_cluster_ids
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": SEMANTIC_SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps({"target": target, "sentence": sentence}, ensure_ascii=False)},
+            {"role": "system", "content": CLUSTER_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "highlight": target,
+                        "normalized_highlight": normalized_target,
+                        "context": sentence,
+                        "candidate_clusters": [
+                            item.model_dump() for item in candidates
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            },
         ],
-        "max_tokens": 900,
+        "max_tokens": 16000,
         "stream": False,
         "response_format": {
             "type": "json_schema",
             "json_schema": {
-                "name": "semantic_context_analysis",
+                "name": "highlight_cluster_assignment",
                 "strict": True,
-                "schema": SemanticAnalysis.model_json_schema(),
+                "schema": schema,
             },
         },
         "provider": {"require_parameters": True},
+        "reasoning": {"effort": "low", "exclude": True},
     }
-    _apply_model_generation_config(payload, model=model, temperature=0.2)
+    if not model.startswith("openai/gpt-5.6-luna"):
+        payload["temperature"] = 0.1
     result = _post_json(payload, api_key)
     content = result["choices"][0]["message"]["content"]
     if not isinstance(content, str):
-        raise RuntimeError("OpenRouter returned non-text semantic analysis.")
-    analysis = SemanticAnalysis.model_validate_json(_strip_json_code_fence(content))
+        raise RuntimeError("OpenRouter returned non-text cluster analysis.")
+    analysis = ClusterAnalysis.model_validate_json(_strip_json_code_fence(content))
+    if analysis.cluster_id not in allowed_cluster_ids:
+        raise RuntimeError("OpenRouter selected a cluster outside the candidate set.")
     if not _contains_exact_surface(
         analysis.generated_sentence,
         analysis.generated_surface,
@@ -390,49 +407,6 @@ def _validate_recall_distractors(
     values = distractors.valid_substitutes_en + distractors.valid_related_en
     if any(" ".join(value.casefold().split()) == normalized_target for value in values):
         raise RuntimeError("Recall distractors must not contain the target itself.")
-
-
-def select_semantic_match(
-    analysis: SemanticAnalysis,
-    candidates: list[SemanticCandidate],
-    *,
-    api_key: str,
-    model: str = DEFAULT_SEMANTIC_MODEL,
-) -> SemanticMatch:
-    """Choose a compatible semantic cluster inside one lexical family."""
-    if not candidates:
-        return SemanticMatch(
-            card_id=None,
-            relationship="new_card",
-            merged_sense_definition_en=None,
-            rationale_ru="В этом лексическом семействе пока нет карточек.",
-        )
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SEMANTIC_MATCH_PROMPT},
-            {"role": "user", "content": json.dumps({"source": analysis.model_dump(), "candidates": [item.model_dump() for item in candidates]}, ensure_ascii=False)},
-        ],
-        "max_tokens": 500,
-        "stream": False,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": "semantic_match", "strict": True, "schema": SemanticMatchResponse.model_json_schema()},
-        },
-        "provider": {"require_parameters": True},
-    }
-    _apply_model_generation_config(payload, model=model, temperature=0.0)
-    result = _post_json(payload, api_key)
-    content = result["choices"][0]["message"]["content"]
-    if not isinstance(content, str):
-        raise RuntimeError("OpenRouter returned non-text semantic match.")
-    response = SemanticMatchResponse.model_validate_json(
-        _strip_json_code_fence(content)
-    )
-    candidate_ids = {item.id for item in candidates}
-    if response.match.card_id is not None and response.match.card_id not in candidate_ids:
-        raise RuntimeError("OpenRouter selected a non-candidate semantic card.")
-    return response.match
 
 
 def _contains_exact_surface(sentence: str, surface: str) -> bool:

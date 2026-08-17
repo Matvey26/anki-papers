@@ -23,8 +23,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
-from urllib.request import Request, urlopen
 
 from flask import (
     Flask,
@@ -51,22 +49,25 @@ from pypdf.generic import (
     NameObject,
     TextStringObject,
 )
+from rapidfuzz import fuzz, process
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from .enrich import (
     DEFAULT_SEMANTIC_MODEL,
-    analyse_semantic_context,
+    analyse_cluster_assignment,
     enrich_targets,  # noqa: F401 - retained as a monkeypatch seam for callers/tests
     load_env_file,
-    select_semantic_match,
 )
 from .extract import (
     RECALL_PLACEHOLDER,
+    DocumentText,
     extract_document_text,
     extract_highlights,
     find_article_contexts,
 )
-from .models import SemanticCandidate, TargetContext
+from .models import ClusterCandidate, ClusterExample, TargetContext
+from .quick_dictionary import StarDictDictionary
+from .quick_translation import MachineTranslator
 from .security import (
     claim_token_digest,
     encrypt_value,
@@ -87,8 +88,11 @@ from .sync_ui import (
 
 USERNAME_RE = re.compile(r"^[\w.\-]{3,32}$", re.UNICODE)
 WORD_RE = re.compile(r"^[\w]+(?:['’\-][\w]+)*$", re.UNICODE)
-HYPHENATED_LINE_BREAK_RE = re.compile(r"[-\u2010\u00ad]\s*\r?\n\s*")
-MAX_TARGET_WORDS = 3
+HYPHENATED_LINE_BREAK_RE = re.compile(r"[-\u2010-\u2015\u2212\u00ad]\s*\r?\n\s*")
+MAX_TARGET_WORDS = 4
+MAX_CLUSTER_CANDIDATES = 5
+MAX_CLUSTER_EXAMPLES = 5
+CLUSTER_FUZZY_SCORE_CUTOFF = 45.0
 ARTICLE_CONTEXT_LIMIT = 4
 LOGGER = logging.getLogger(__name__)
 _ARTICLE_STOPWORDS = {
@@ -133,6 +137,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app.extensions["reader_highlight_jobs"] = set()
     app.extensions["quick_translation_cache"] = {}
     app.extensions["quick_translation_cache_lock"] = threading.Lock()
+    app.extensions["quick_translation_dictionary"] = StarDictDictionary.load(
+        Path(app.config["DATA_DIR"]) / "dictionaries" / "eng-rus"
+    )
+    app.extensions["quick_translation_machine"] = MachineTranslator.load()
     app.extensions["deleted_document_paths"] = {}
     app.extensions["highlight_resume_done"] = False
 
@@ -687,7 +695,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def quick_translation() -> Response:
         word = normalize_selected_text(request.args.get("word", ""))
         if not is_selectable_target(word):
-            return jsonify(error="Нужно указать до трёх слов."), 400
+            return jsonify(error="Нужно указать до четырёх слов."), 400
         cache: dict[str, tuple[float, list[dict[str, Any]]]] = app.extensions[
             "quick_translation_cache"
         ]
@@ -867,7 +875,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         except (KeyError, OverflowError, TypeError, ValueError):
             return jsonify(error="Некорректные координаты выделения."), 400
         if not is_selectable_target(target) or not sentence or len(sentence) > 1200:
-            return jsonify(error="Нужно выделить до трёх слов."), 400
+            return jsonify(error="Нужно выделить до четырёх слов."), 400
         if page_number < 1 or page_number > document["page_count"]:
             return jsonify(error="Некорректная страница."), 400
 
@@ -1455,6 +1463,7 @@ def init_database(app: Flask) -> None:
         if "read_at" not in document_columns:
             connection.execute("ALTER TABLE documents ADD COLUMN read_at TEXT")
         document_migrations = {
+            "text_path": "TEXT",
             "last_page": "INTEGER",
             "last_opened_at": "TEXT",
             "source_path": "TEXT",
@@ -1494,9 +1503,10 @@ def init_database(app: Flask) -> None:
         for column, declaration in semantic_columns.items():
             if column not in card_columns:
                 connection.execute(f"ALTER TABLE cards ADD COLUMN {column} {declaration}")
+        connection.execute("DROP INDEX IF EXISTS idx_cards_semantic_family_lookup")
         connection.execute(
-            """CREATE INDEX IF NOT EXISTS idx_cards_semantic_family_lookup
-               ON cards(user_id, semantic_version, family_key)"""
+            """CREATE INDEX IF NOT EXISTS idx_cards_cluster_leader
+               ON cards(user_id, semantic_version, target_normalized)"""
         )
         account_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(anki_accounts)")
@@ -1522,9 +1532,10 @@ def init_database(app: Flask) -> None:
         for column, declaration in semantic_columns.items():
             if column not in card_columns:
                 connection.execute(f"ALTER TABLE cards ADD COLUMN {column} {declaration}")
+        connection.execute("DROP INDEX IF EXISTS idx_cards_semantic_family_lookup")
         connection.execute(
-            """CREATE INDEX IF NOT EXISTS idx_cards_semantic_family_lookup
-               ON cards(user_id, semantic_version, family_key)"""
+            """CREATE INDEX IF NOT EXISTS idx_cards_cluster_leader
+               ON cards(user_id, semantic_version, target_normalized)"""
         )
         synchronize_card_highlights_by_context(connection)
         connection.execute("PRAGMA optimize")
@@ -1549,7 +1560,7 @@ def require_csrf(*, header: bool = False) -> None:
 
 
 def normalize_target(value: str) -> str:
-    return " ".join(value.casefold().strip().split())
+    return normalize_selected_text(value)
 
 
 def card_context_key(row: sqlite3.Row) -> tuple[int, str, int, str, str]:
@@ -1701,7 +1712,26 @@ def word_count_label(value: int) -> str:
 
 
 def normalize_selected_text(value: str) -> str:
-    return " ".join(HYPHENATED_LINE_BREAK_RE.sub("", value).split())
+    value = unicodedata.normalize("NFKC", str(value))
+    value = HYPHENATED_LINE_BREAK_RE.sub("", value)
+    value = value.replace("\u00ad", "")
+    cleaned: list[str] = []
+    for character in value:
+        category = unicodedata.category(character)
+        if character in {"'", "’", "‘", "ʼ", "＇"}:
+            cleaned.append("'")
+        elif category == "Pd" or character == "\u2212":
+            cleaned.append("-")
+        elif category[0] in {"L", "M", "N"}:
+            cleaned.append(character.casefold())
+        elif character.isspace():
+            cleaned.append(" ")
+        else:
+            cleaned.append(" ")
+    normalized = " ".join("".join(cleaned).split())
+    normalized = re.sub(r"-{2,}", "-", normalized)
+    normalized = re.sub(r"'{2,}", "'", normalized)
+    return normalized.strip(" -'")
 
 
 def is_selectable_target(value: str) -> bool:
@@ -1713,107 +1743,16 @@ def is_selectable_target(value: str) -> bool:
     )
 
 
-WIKTIONARY_PARTS_OF_SPEECH = {
-    "Noun": "сущ.",
-    "Verb": "гл.",
-    "Adjective": "прил.",
-    "Adverb": "нареч.",
-    "Pronoun": "мест.",
-    "Preposition": "предл.",
-    "Conjunction": "союз",
-    "Interjection": "межд.",
-    "Numeral": "числ.",
-    "Article": "артикль",
-    "Determiner": "опред.",
-    "Proper noun": "имя собств.",
-}
-
-
-def fetch_public_json(url: str, *, timeout: float = 2.0) -> Any:
-    request = Request(url, headers={"User-Agent": "Anki-Papers/1.0"})
-    with urlopen(request, timeout=timeout) as response:
-        if response.status != 200:
-            raise RuntimeError(f"Translation API returned HTTP {response.status}")
-        return json.load(response)
-
-
-def wiktionary_wikitext(page: str) -> str:
-    payload = fetch_public_json(
-        "https://en.wiktionary.org/w/api.php?action=parse&prop=wikitext"
-        f"&format=json&formatversion=2&page={quote(page, safe='')}",
-    )
-    return payload.get("parse", {}).get("wikitext", "")
-
-
-def parse_wiktionary_translation_groups(wikitext: str) -> list[dict[str, Any]]:
-    english = re.search(r"(?ms)^==English==\s*(.*?)(?=^==[^=]|\Z)", wikitext)
-    if english is None:
-        return []
-    groups: list[dict[str, Any]] = []
-    sections = list(re.finditer(r"(?m)^===([^=]+)===\s*$", english.group(1)))
-    for index, section in enumerate(sections):
-        part = section.group(1).strip()
-        label = WIKTIONARY_PARTS_OF_SPEECH.get(part)
-        if label is None:
-            continue
-        end = sections[index + 1].start() if index + 1 < len(sections) else len(english.group(1))
-        content = english.group(1)[section.end() : end]
-        translations = re.search(
-            r"(?ms)^====Translations====\s*$\s*(.*?)(?=^====|\Z)", content
-        )
-        if translations is None:
-            continue
-        values: list[str] = []
-        for value in re.findall(r"\{\{t\+?\|ru\|([^|}]+)", translations.group(1)):
-            cleaned = value.strip()
-            if cleaned and cleaned not in values:
-                values.append(cleaned)
-            if len(values) == 6:
-                break
-        if values:
-            groups.append({"part_of_speech": label, "translations": values})
-    return groups
-
-
-def wiktionary_translation_groups(word: str) -> list[dict[str, Any]]:
-    wikitext = wiktionary_wikitext(word)
-    if not isinstance(wikitext, str):
-        return []
-    groups = parse_wiktionary_translation_groups(wikitext)
-    if groups or "{{see translation subpage|" not in wikitext:
-        return groups
-    subpage = wiktionary_wikitext(f"{word}/translations")
-    return parse_wiktionary_translation_groups(subpage) if isinstance(subpage, str) else []
-
-
-def mymemory_translation_groups(word: str) -> list[dict[str, Any]]:
-    payload = fetch_public_json(
-        "https://api.mymemory.translated.net/get?"
-        f"q={quote(word, safe='')}&langpair=en%7Cru&mt=1",
-    )
-    values: list[str] = []
-    candidates = [payload.get("responseData", {}).get("translatedText", "")]
-    candidates.extend(match.get("translation", "") for match in payload.get("matches", []))
-    for value in candidates:
-        cleaned = html.unescape(str(value)).strip()
-        if cleaned and cleaned.casefold() != word.casefold() and cleaned not in values:
-            values.append(cleaned)
-        if len(values) == 6:
-            break
-    return [{"part_of_speech": "", "translations": values}] if values else []
-
-
 def quick_translation_groups(word: str) -> list[dict[str, Any]]:
-    try:
-        groups = wiktionary_translation_groups(word)
-    except (OSError, TimeoutError, ValueError):
-        groups = []
-    if groups:
-        return groups
-    try:
-        return mymemory_translation_groups(word)
-    except (OSError, TimeoutError, ValueError):
-        return []
+    dictionary = current_app.extensions.get("quick_translation_dictionary")
+    if isinstance(dictionary, StarDictDictionary) and len(word.split()) == 1:
+        groups = dictionary.lookup(word)
+        if groups:
+            return groups
+    machine = current_app.extensions.get("quick_translation_machine")
+    if isinstance(machine, MachineTranslator):
+        return [{"part_of_speech": "", "translations": [machine(word)]}]
+    return []
 
 
 def clean_highlight_rects(value: Any) -> list[dict[str, float]]:
@@ -1966,26 +1905,91 @@ class MissingApiKeyError(RuntimeError):
     pass
 
 
-def semantic_candidate(card: sqlite3.Row) -> SemanticCandidate:
-    contexts = json.loads(card["contexts_json"] or "[]")
-    lemmas = [str(card["lemma"])]
-    parts_of_speech = [str(card["part_of_speech"])]
-    for context in contexts:
-        if not isinstance(context, dict):
+def cluster_examples(
+    database: sqlite3.Connection,
+    card: sqlite3.Row,
+) -> list[ClusterExample]:
+    rows = database.execute(
+        """SELECT highlights.target, highlights.sentence
+           FROM highlights
+           JOIN card_highlights ON card_highlights.highlight_id = highlights.id
+           WHERE card_highlights.card_id = ? AND highlights.user_id = ?
+           ORDER BY highlights.created_at""",
+        (card["id"], card["user_id"]),
+    ).fetchall()
+    values: list[ClusterExample] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        highlight = normalize_selected_text(str(row["target"]))
+        context = " ".join(str(row["sentence"]).split())
+        key = (highlight, context.casefold())
+        if not highlight or not context or key in seen:
             continue
-        lemma = str(context.get("lemma") or "").strip()
-        part_of_speech = str(context.get("part_of_speech") or "").strip()
-        if lemma and lemma not in lemmas:
-            lemmas.append(lemma)
-        if part_of_speech and part_of_speech not in parts_of_speech:
-            parts_of_speech.append(part_of_speech)
-    return SemanticCandidate(
-        id=str(card["id"]),
-        family_key=str(card["family_key"] or card["lemma"]),
-        lemmas=lemmas[:12],
-        parts_of_speech=parts_of_speech[:6],
-        sense_definition_en=str(card["sense_definition_en"]),
+        seen.add(key)
+        values.append(ClusterExample(highlight=highlight, context=context))
+        if len(values) == MAX_CLUSTER_EXAMPLES:
+            return values
+
+    for item in json.loads(card["contexts_json"] or "[]"):
+        if not isinstance(item, dict) or item.get("source") != "user_pdf":
+            continue
+        highlight = normalize_selected_text(str(item.get("target") or ""))
+        context = " ".join(str(item.get("sentence") or "").split())
+        key = (highlight, context.casefold())
+        if not highlight or not context or key in seen:
+            continue
+        seen.add(key)
+        values.append(ClusterExample(highlight=highlight, context=context))
+        if len(values) == MAX_CLUSTER_EXAMPLES:
+            return values
+
+    if not values:
+        values.append(
+            ClusterExample(
+                highlight=normalize_selected_text(str(card["target"])),
+                context=" ".join(str(card["sentence"]).split()),
+            )
+        )
+    return values
+
+
+def find_cluster_candidates(
+    database: sqlite3.Connection,
+    user_id: int,
+    normalized_highlight: str,
+    *,
+    limit: int = MAX_CLUSTER_CANDIDATES,
+) -> list[ClusterCandidate]:
+    cards = database.execute(
+        """SELECT * FROM cards
+           WHERE user_id = ? AND semantic_version = 1
+           ORDER BY created_at, id""",
+        (user_id,),
+    ).fetchall()
+    leaders = {
+        str(card["id"]): normalize_selected_text(
+            str(card["target"] or card["family_key"] or card["lemma"] or "")
+        )
+        for card in cards
+    }
+    leaders = {cluster_id: leader for cluster_id, leader in leaders.items() if leader}
+    matches = process.extract(
+        normalized_highlight,
+        leaders,
+        scorer=fuzz.WRatio,
+        processor=None,
+        score_cutoff=CLUSTER_FUZZY_SCORE_CUTOFF,
+        limit=max(1, min(limit, MAX_CLUSTER_CANDIDATES)),
     )
+    cards_by_id = {str(card["id"]): card for card in cards}
+    return [
+        ClusterCandidate(
+            cluster_id=str(cluster_id),
+            leader=leader,
+            examples=cluster_examples(database, cards_by_id[str(cluster_id)]),
+        )
+        for leader, _score, cluster_id in matches
+    ]
 
 
 def merge_semantic_translations(*groups: list[str], limit: int = 8) -> list[str]:
@@ -2001,34 +2005,6 @@ def merge_semantic_translations(*groups: list[str], limit: int = 8) -> list[str]
             if len(merged) == limit:
                 return merged
     return merged
-
-
-def semantic_family_prefix(value: str) -> str:
-    compact = "".join(value.casefold().split())
-    if compact.endswith("y"):
-        compact = f"{compact[:-1]}i"
-    width = 4 if len(compact) <= 4 else 5
-    return compact[:width]
-
-
-def semantic_family_compatible(left: str, right: str) -> bool:
-    left_prefix = semantic_family_prefix(left)
-    right_prefix = semantic_family_prefix(right)
-    return bool(
-        left_prefix
-        and right_prefix
-        and (
-            left_prefix.startswith(right_prefix)
-            or right_prefix.startswith(left_prefix)
-        )
-    )
-
-
-def canonical_semantic_family(*values: str) -> str:
-    cleaned = {" ".join(value.casefold().split()) for value in values if value.strip()}
-    if not cleaned:
-        raise ValueError("Semantic family cannot be empty")
-    return min(cleaned, key=lambda value: (len(value), value))
 
 
 def _article_words(value: str, *, targets: set[str]) -> set[str]:
@@ -2113,19 +2089,19 @@ def refresh_article_contexts(
         parameters,
     ).fetchall()
     documents = database.execute(
-        """SELECT id, name, source_path, stored_path FROM documents
+        """SELECT id, user_id, name, source_path, stored_path, text_path FROM documents
            WHERE user_id = ? AND kind = 'pdf' ORDER BY created_at""",
         (user_id,),
     ).fetchall()
     parsed_documents = []
     for document in documents:
-        path = Path(document["source_path"] or document["stored_path"])
-        if not path.is_file():
-            continue
         try:
-            parsed_documents.append((document, extract_document_text(path)))
-        except (OSError, PdfReadError, RuntimeError, ValueError) as exc:
-            LOGGER.warning("Could not mine article contexts from %s: %s", path, exc)
+            parsed = load_or_extract_document_text(database, document)
+            parsed_documents.append((document, parsed))
+        except (OSError, PdfReadError, RuntimeError, TypeError, ValueError) as exc:
+            LOGGER.warning(
+                "Could not load article text for %s: %s", document["name"], exc
+            )
             continue
 
     changed: set[str] = set()
@@ -2205,6 +2181,69 @@ def refresh_article_contexts(
     return changed
 
 
+def document_text_cache_path(document: sqlite3.Row) -> Path:
+    return Path(document["stored_path"]).with_suffix(".text.json")
+
+
+def write_document_text_cache(path: Path, document_text: DocumentText) -> None:
+    payload = json.dumps(
+        {
+            "version": 1,
+            "text": document_text.text,
+            "page_ranges": document_text.page_ranges,
+            "hard_page_starts": document_text.hard_page_starts,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    replace_managed_file(path, payload)
+
+
+def read_document_text_cache(path: Path) -> DocumentText:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError("Document-text cache must contain an object")
+    if payload.get("version") != 1 or not isinstance(payload.get("text"), str):
+        raise ValueError("Unsupported document-text cache")
+    page_ranges = [tuple(item) for item in payload.get("page_ranges", [])]
+    hard_page_starts = payload.get("hard_page_starts", [])
+    if not all(
+        len(item) == 2 and all(isinstance(value, int) for value in item)
+        for item in page_ranges
+    ) or not all(isinstance(value, bool) for value in hard_page_starts):
+        raise ValueError("Invalid document-text cache")
+    if len(page_ranges) != len(hard_page_starts):
+        raise ValueError("Invalid document-text page metadata")
+    return DocumentText(
+        text=payload["text"],
+        page_ranges=page_ranges,
+        hard_page_starts=hard_page_starts,
+    )
+
+
+def load_or_extract_document_text(
+    database: sqlite3.Connection,
+    document: sqlite3.Row,
+) -> DocumentText:
+    cached_path = Path(document["text_path"]) if document["text_path"] else None
+    if cached_path is not None and cached_path.is_file():
+        try:
+            return read_document_text_cache(cached_path)
+        except (OSError, TypeError, ValueError):
+            LOGGER.warning("Rebuilding invalid article-text cache %s", cached_path)
+
+    pdf_path = Path(document["source_path"] or document["stored_path"])
+    parsed = extract_document_text(pdf_path)
+    cached_path = document_text_cache_path(document)
+    write_document_text_cache(cached_path, parsed)
+    database.execute(
+        "UPDATE documents SET text_path = ? WHERE id = ? AND user_id = ?",
+        (str(cached_path), document["id"], document["user_id"]),
+    )
+    return parsed
+
+
 def remove_article_contexts_for_document(
     database: sqlite3.Connection,
     user_id: int,
@@ -2253,36 +2292,22 @@ def enrich_highlight_row(
     if not api_key:
         raise MissingApiKeyError
     model = os.environ.get("OPENROUTER_SEMANTIC_MODEL", DEFAULT_SEMANTIC_MODEL)
-    analysis = analyse_semantic_context(
-        row["target"], row["sentence"], api_key=api_key, model=model
+    normalized_highlight = normalize_selected_text(str(row["target"]))
+    candidates = find_cluster_candidates(database, user_id, normalized_highlight)
+    analysis = analyse_cluster_assignment(
+        str(row["target"]),
+        normalized_highlight,
+        str(row["sentence"]),
+        candidates,
+        api_key=api_key,
+        model=model,
     )
-    candidate_rows = database.execute(
-        """SELECT * FROM cards
-           WHERE user_id = ? AND semantic_version = 1
-             AND (
-               COALESCE(family_key, lemma) = ?
-               OR substr(replace(COALESCE(family_key, lemma), ' ', ''), 1, 3) = ?
-             )
-           ORDER BY created_at LIMIT 100""",
-        (
-            user_id,
-            analysis.family_key,
-            semantic_family_prefix(analysis.family_key)[:3],
-        ),
-    ).fetchall()
-    candidates = [semantic_candidate(candidate) for candidate in candidate_rows]
-    source_families = (analysis.family_key, analysis.lemma)
-    candidates = [
-        candidate
-        for candidate in candidates
-        if any(
-            semantic_family_compatible(source, existing)
-            for source in source_families
-            for existing in (candidate.family_key, *candidate.lemmas)
-        )
-    ][-20:]
-    match = select_semantic_match(
-        analysis, candidates, api_key=api_key, model=model
+    candidates_by_id = {item.cluster_id: item for item in candidates}
+    selected_candidate = candidates_by_id.get(analysis.cluster_id)
+    leader = (
+        selected_candidate.leader
+        if selected_candidate is not None
+        else normalize_selected_text(analysis.leader) or normalized_highlight
     )
     translations = json.dumps(analysis.translations_ru, ensure_ascii=False)
     replacement = analysis.replacement_ru
@@ -2290,9 +2315,9 @@ def enrich_highlight_row(
     source_context = {
         "id": str(row["id"]), "source": "user_pdf", "target": str(row["target"]),
         "sentence": str(row["sentence"]), "replacement": replacement,
-        "translations": analysis.translations_ru, "lemma": analysis.lemma,
-        "family_key": analysis.family_key, "part_of_speech": analysis.part_of_speech,
-        "sense_definition_en": analysis.sense_definition_en,
+        "translations": analysis.translations_ru, "lemma": leader,
+        "family_key": leader, "part_of_speech": analysis.part_of_speech,
+        "sense_definition_en": analysis.cluster_definition_en,
         "substitutes_en": analysis.source_distractors.substitutes_en,
         "related_en": analysis.source_distractors.related_en,
         "valid_substitutes_en": analysis.source_distractors.valid_substitutes_en,
@@ -2302,19 +2327,18 @@ def enrich_highlight_row(
         "id": f"generated:{row['id']}", "source": "llm_generated",
         "target": analysis.generated_surface, "sentence": analysis.generated_sentence,
         "replacement": analysis.generated_translation_ru,
-        "translations": analysis.translations_ru, "lemma": analysis.lemma,
-        "family_key": analysis.family_key, "part_of_speech": analysis.part_of_speech,
-        "sense_definition_en": analysis.sense_definition_en,
+        "translations": analysis.translations_ru, "lemma": leader,
+        "family_key": leader, "part_of_speech": analysis.part_of_speech,
+        "sense_definition_en": analysis.cluster_definition_en,
         "substitutes_en": analysis.generated_distractors.substitutes_en,
         "related_en": analysis.generated_distractors.related_en,
         "valid_substitutes_en": analysis.generated_distractors.valid_substitutes_en,
         "valid_related_en": analysis.generated_distractors.valid_related_en,
     }
-    card_changed = True
-    if match.card_id is not None:
+    if selected_candidate is not None:
         existing = database.execute(
             "SELECT * FROM cards WHERE id = ? AND user_id = ?",
-            (match.card_id, user_id),
+            (selected_candidate.cluster_id, user_id),
         ).fetchone()
         if existing is None:
             raise RuntimeError("Selected semantic card disappeared")
@@ -2325,22 +2349,14 @@ def enrich_highlight_row(
             json.loads(existing["translations_json"]),
             analysis.translations_ru,
         )
-        family_key = canonical_semantic_family(
-            str(existing["family_key"] or existing["lemma"]),
-            analysis.family_key,
-        )
         database.execute(
-            """UPDATE cards SET target = ?, target_normalized = ?, family_key = ?,
-               contexts_json = ?, translations_json = ?,
+            """UPDATE cards SET contexts_json = ?, translations_json = ?,
                sense_definition_en = ?, csv_exported_at = NULL,
                apkg_exported_at = NULL, anki_synced_at = NULL WHERE id = ? AND user_id = ?""",
             (
-                family_key,
-                normalize_target(family_key),
-                family_key,
                 json.dumps(contexts, ensure_ascii=False),
                 json.dumps(card_translations, ensure_ascii=False),
-                match.merged_sense_definition_en,
+                analysis.cluster_definition_en,
                 existing["id"],
                 user_id,
             ),
@@ -2354,12 +2370,12 @@ def enrich_highlight_row(
                 part_of_speech, sense_definition_en, contexts_json, semantic_version, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
             (
-                card_id, user_id, document_id, analysis.family_key,
-                normalize_target(analysis.family_key),
+                card_id, user_id, document_id, leader,
+                normalize_target(leader),
                 row["sentence"], row["page"], translations, replacement, alternatives,
-                analysis.lemma.casefold(), analysis.family_key,
+                leader, leader,
                 analysis.part_of_speech.casefold(),
-                analysis.sense_definition_en, json.dumps([source_context, generated_context], ensure_ascii=False), timestamp,
+                analysis.cluster_definition_en, json.dumps([source_context, generated_context], ensure_ascii=False), timestamp,
             ),
         )
         existing = database.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
@@ -2378,18 +2394,11 @@ def enrich_highlight_row(
            WHERE id = ? AND user_id = ?""",
         (translations, replacement, alternatives, timestamp, row["id"], user_id),
     )
-    if mine_article_contexts:
-        refresh_article_contexts(
-            database,
-            user_id,
-            card_ids={str(existing["id"])},
-        )
-    if card_changed:
-        account = database.execute(
-            "SELECT state FROM anki_accounts WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        if account is not None and account["state"] in {"connected", "syncing", "error"}:
-            enqueue_sync_job(database, user_id, "card_saved", delay_seconds=30)
+    account = database.execute(
+        "SELECT state FROM anki_accounts WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    if account is not None and account["state"] in {"connected", "syncing", "error"}:
+        enqueue_sync_job(database, user_id, "card_saved", delay_seconds=30)
     database.commit()
     ready = database.execute(
         "SELECT * FROM highlights WHERE id = ? AND user_id = ?",
@@ -2397,6 +2406,25 @@ def enrich_highlight_row(
     ).fetchone()
     if ready is None:
         raise RuntimeError("Highlight disappeared during enrichment")
+    if mine_article_contexts:
+        try:
+            changed = refresh_article_contexts(
+                database,
+                user_id,
+                card_ids={str(existing["id"])},
+            )
+            if changed and account is not None and account["state"] in {
+                "connected", "syncing", "error"
+            }:
+                enqueue_sync_job(
+                    database, user_id, "article_contexts", delay_seconds=30
+                )
+            database.commit()
+        except Exception:
+            database.rollback()
+            app.logger.exception(
+                "Article context mining failed after highlight was saved"
+            )
     return ready
 
 
@@ -2598,7 +2626,9 @@ def process_document_highlights(app: Flask, document_id: str, user_id: int) -> N
             )
             database.commit()
 
-        extracted = extract_highlights(source_path)
+        document_text = load_or_extract_document_text(database, document)
+        database.commit()
+        extracted = extract_highlights(source_path, document_text=document_text)
         write_pdf_without_native_highlights(source_path, stored_path)
         database.execute(
             "DELETE FROM highlights WHERE document_id = ? AND user_id = ? AND source = 'pdf_import'",

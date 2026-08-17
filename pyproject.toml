@@ -9,15 +9,18 @@ description = "Extract hand-highlighted vocabulary from PDFs and create Anki car
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "argostranslate>=1.11,<2",
   "argon2-cffi>=25.1,<26",
   "cryptography>=45,<47",
   "Flask>=3.1,<4",
+  "nltk>=3.9,<4",
   "numpy>=1.26,<3",
   "pdfplumber>=0.11,<1",
   "Pillow>=10,<13",
   "pydantic>=2.7,<3",
   "pypdf>=5,<7",
   "pypdfium2>=4.30,<5",
+  "RapidFuzz>=3.14,<4",
   "waitress>=3,<4",
   "zstandard>=0.23,<1",
 ]

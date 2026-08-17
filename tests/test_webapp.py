@@ -15,7 +15,7 @@ from pypdf.generic import ArrayObject, DecodedStreamObject, FloatObject
 import articles_to_anki.apkg as apkg_module
 import articles_to_anki.webapp as webapp_module
 from articles_to_anki.extract import DocumentText, ExtractedHighlight
-from articles_to_anki.models import EnrichedItem, SemanticAnalysis, SemanticMatch
+from articles_to_anki.models import ClusterAnalysis, EnrichedItem
 from articles_to_anki.security import claim_token_digest
 from articles_to_anki.webapp import create_app, make_target_context
 
@@ -38,11 +38,72 @@ def pdf_bytes(page_count: int = 1) -> io.BytesIO:
     return stream
 
 
-def test_semantic_family_retrieval_handles_common_stem_changes() -> None:
-    assert webapp_module.semantic_family_compatible("imply", "implication")
-    assert webapp_module.semantic_family_compatible("rely", "reliable")
-    assert webapp_module.semantic_family_compatible("acquire", "acquisition")
-    assert not webapp_module.semantic_family_compatible("train", "transfer")
+def test_highlight_normalization_removes_noise_but_preserves_word_punctuation() -> None:
+    assert webapp_module.normalize_selected_text(
+        '  “IT’S\n worth!!!🦆  '
+    ) == "it's worth"
+    assert webapp_module.normalize_selected_text("cutting-edge") == "cutting-edge"
+    assert webapp_module.normalize_selected_text("attrib-\nuted") == "attributed"
+    assert webapp_module.normalize_selected_text("(Train),") == "train"
+
+
+def test_fuzzy_cluster_lookup_uses_leaders_keeps_homonyms_and_caps_payload(
+    tmp_path: Path,
+) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+    dashboard = identify(client)
+    client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(dashboard), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+    )
+    database_path = tmp_path / "app.sqlite3"
+    with sqlite3.connect(database_path) as database:
+        database.row_factory = sqlite3.Row
+        document_id = database.execute("SELECT id FROM documents").fetchone()[0]
+        for index in range(6):
+            contexts = [
+                {
+                    "id": f"highlight-{index}-{example}",
+                    "source": "user_pdf",
+                    "target": "train",
+                    "sentence": f"Distinct train context {index}-{example}.",
+                }
+                for example in range(6)
+            ]
+            database.execute(
+                """INSERT INTO cards
+                   (id, user_id, document_id, target, target_normalized, sentence,
+                    page, translations_json, replacement, alternatives_json,
+                    lemma, family_key, part_of_speech, sense_definition_en,
+                    contexts_json, semantic_version, created_at)
+                   VALUES (?, 1, ?, 'train', 'train', ?, 1, '[]', '', '[]',
+                           'train', 'train', 'other', ?, ?, 1, ?)""",
+                (
+                    f"cluster-{index}",
+                    document_id,
+                    f"Seed sentence {index}.",
+                    f"Separate homonymous sense {index}.",
+                    json.dumps(contexts),
+                    f"2026-08-16T00:00:0{index}+00:00",
+                ),
+            )
+        database.commit()
+
+        candidates = webapp_module.find_cluster_candidates(
+            database, 1, "training", limit=99
+        )
+        indexes = {
+            row[1] for row in database.execute("PRAGMA index_list(cards)")
+        }
+
+    assert len(candidates) == 5
+    assert len({candidate.cluster_id for candidate in candidates}) == 5
+    assert {candidate.leader for candidate in candidates} == {"train"}
+    assert all(len(candidate.examples) == 5 for candidate in candidates)
+    assert "idx_cards_cluster_leader" in indexes
+    assert "idx_cards_semantic_family_lookup" not in indexes
 
 
 def test_uploaded_articles_add_meaning_only_context_without_highlight(
@@ -86,14 +147,21 @@ def test_uploaded_articles_add_meaning_only_context_without_highlight(
     article = (
         "However, open-source models considerably trail behind in benchmark performance."
     )
-    monkeypatch.setattr(
-        webapp_module,
-        "extract_document_text",
-        lambda _path: DocumentText(
+    parse_calls = 0
+
+    def fake_extract_document_text(_path):
+        nonlocal parse_calls
+        parse_calls += 1
+        return DocumentText(
             text=article,
             page_ranges=[(0, len(article))],
             hard_page_starts=[False],
-        ),
+        )
+
+    monkeypatch.setattr(
+        webapp_module,
+        "extract_document_text",
+        fake_extract_document_text,
     )
     with sqlite3.connect(database_path) as database:
         database.row_factory = sqlite3.Row
@@ -108,9 +176,62 @@ def test_uploaded_articles_add_meaning_only_context_without_highlight(
         assert "considerably trail behind" in contexts[-1]["sentence"]
 
         assert webapp_module.refresh_article_contexts(database, 1) == set()
+        assert parse_calls == 1
+        text_path = database.execute(
+            "SELECT text_path FROM documents WHERE id = ?", (document_id,)
+        ).fetchone()[0]
+        assert Path(text_path).is_file()
         rows = webapp_module.semantic_card_rows(card)
         assert "considerably &lt;b&gt;trail behind" in rows[0]["Front"]
         assert "considerably &lt;b&gt;trail behind" not in rows[1]["Front"]
+
+
+def test_article_context_mining_runs_after_ready_commit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    install_fake_enrichment(monkeypatch)
+    app = make_app(tmp_path)
+    client = app.test_client()
+    dashboard = identify(client)
+    client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(dashboard), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+    )
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        document_id = database.execute("SELECT id FROM documents").fetchone()[0]
+
+    saw_committed_ready = False
+
+    def fail_after_check(_database, _user_id, **_kwargs):
+        nonlocal saw_committed_ready
+        with sqlite3.connect(tmp_path / "app.sqlite3") as observer:
+            status = observer.execute("SELECT status FROM highlights").fetchone()[0]
+            card_count = observer.execute("SELECT COUNT(*) FROM cards").fetchone()[0]
+        saw_committed_ready = status == "ready" and card_count == 1
+        raise RuntimeError("context index unavailable")
+
+    monkeypatch.setattr(webapp_module, "refresh_article_contexts", fail_after_check)
+    reader = client.get(f"/article/{document_id}")
+    response = client.post(
+        f"/api/article/{document_id}/highlights",
+        json={
+            "id": str(uuid.uuid4()),
+            "target": "robust",
+            "sentence": "This is a robust result.",
+            "page": 1,
+            "rects": [{"x1": 80, "y1": 190, "x2": 120, "y2": 205}],
+        },
+        headers={"X-CSRF-Token": csrf(reader)},
+    )
+
+    assert response.status_code == 200
+    assert response.json["highlight"]["status"] == "ready"
+    assert saw_committed_ready
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        assert database.execute("SELECT status FROM highlights").fetchone()[0] == "ready"
+        assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 1
 
 
 def test_article_context_rejects_toc_and_numeric_table_rows() -> None:
@@ -175,13 +296,14 @@ def install_fake_enrichment(monkeypatch) -> None:
 
     monkeypatch.setattr(webapp_module, "enrich_targets", fake_enrich)
 
-    def fake_semantic(target, sentence, **_kwargs):
+    def fake_cluster(target, normalized_target, sentence, candidates, **_kwargs):
         assert target == "robust"
-        return SemanticAnalysis(
-            lemma="robust",
-            family_key="robust",
+        assert normalized_target == "robust"
+        return ClusterAnalysis(
+            cluster_id=candidates[0].cluster_id if candidates else "new_cluster",
+            leader="robust",
             part_of_speech="adjective",
-            sense_definition_en="reliable and resilient in operation",
+            cluster_definition_en="reliable and resilient in operation",
             translations_ru=["надёжный", "устойчивый"],
             replacement_ru="надёжный",
             generated_sentence="The method remained robust under a substantial distribution shift.",
@@ -201,23 +323,7 @@ def install_fake_enrichment(monkeypatch) -> None:
             },
         )
 
-    monkeypatch.setattr(webapp_module, "analyse_semantic_context", fake_semantic)
-    def fake_match(analysis, candidates, **_kwargs):
-        if not candidates:
-            return SemanticMatch(
-                card_id=None,
-                relationship="new_card",
-                merged_sense_definition_en=None,
-                rationale_ru="Кандидатов пока нет.",
-            )
-        return SemanticMatch(
-            card_id=candidates[0].id,
-            relationship="same_sense",
-            merged_sense_definition_en=analysis.sense_definition_en,
-            rationale_ru="Это одно значение.",
-        )
-
-    monkeypatch.setattr(webapp_module, "select_semantic_match", fake_match)
+    monkeypatch.setattr(webapp_module, "analyse_cluster_assignment", fake_cluster)
 
 
 def test_register_upload_add_and_export_only_new_cards(
@@ -359,7 +465,51 @@ def test_quick_translation_returns_part_of_speech_groups(tmp_path: Path, monkeyp
     }
     assert client.get("/api/quick-translation?word=two%20words").status_code == 200
     assert client.get("/api/quick-translation?word=one%20two%20three").status_code == 200
-    assert client.get("/api/quick-translation?word=one%20two%20three%20four").status_code == 400
+    assert client.get("/api/quick-translation?word=is%20of%20high%20quality").status_code == 200
+    assert client.get("/api/quick-translation?word=one%20two%20three%20four%20five").status_code == 400
+
+
+def test_quick_translation_routes_words_to_dictionary_and_phrases_to_machine(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = make_app(tmp_path)
+    calls: list[str] = []
+    app.extensions["quick_translation_dictionary"] = webapp_module.StarDictDictionary(
+        tmp_path / "unused.dict", {"run": [(0, 1)]}
+    )
+    original_lookup = webapp_module.StarDictDictionary.lookup
+
+    def fake_lookup(self, word, *, limit=6):
+        if word == "run":
+            return [
+                {"part_of_speech": "гл.", "translations": ["бежать", "мчаться"]}
+            ]
+        return []
+
+    monkeypatch.setattr(webapp_module.StarDictDictionary, "lookup", fake_lookup)
+    app.extensions["quick_translation_machine"] = webapp_module.MachineTranslator(
+        lambda text: calls.append(text) or "машинный перевод"
+    )
+    client = app.test_client()
+    identify(client)
+
+    assert client.get("/api/quick-translation?word=run").json == {
+        "groups": [{"part_of_speech": "гл.", "translations": ["бежать", "мчаться"]}]
+    }
+    assert calls == []
+
+    response = client.get("/api/quick-translation?word=is%20of%20high%20quality")
+    assert response.json == {
+        "groups": [{"part_of_speech": "", "translations": ["машинный перевод"]}]
+    }
+    assert calls == ["is of high quality"]
+
+    assert client.get("/api/quick-translation?word=went").json == {
+        "groups": [{"part_of_speech": "", "translations": ["машинный перевод"]}]
+    }
+    assert calls == ["is of high quality", "went"]
+    assert original_lookup is not None
 
 
 def test_selected_text_normalizes_line_break_hyphens_and_keeps_regular_hyphens() -> None:
@@ -367,7 +517,8 @@ def test_selected_text_normalizes_line_break_hyphens_and_keeps_regular_hyphens()
     assert webapp_module.normalize_selected_text("well-known") == "well-known"
     assert webapp_module.is_selectable_target("rule out")
     assert webapp_module.is_selectable_target("one two three")
-    assert not webapp_module.is_selectable_target("one two three four")
+    assert webapp_module.is_selectable_target("is of high quality")
+    assert not webapp_module.is_selectable_target("one two three four five")
 
 
 def test_users_cannot_open_each_others_documents(tmp_path: Path) -> None:
@@ -474,11 +625,11 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
 ) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     analyses = {
-        "acquired": SemanticAnalysis(
-            lemma="acquire",
-            family_key="acquire",
+        "acquired": ClusterAnalysis(
+            cluster_id="new_cluster",
+            leader="acquire",
             part_of_speech="verb",
-            sense_definition_en="obtain or gain possession of something",
+            cluster_definition_en="obtain or gain possession of something",
             translations_ru=["приобрести", "получить"],
             replacement_ru="приобрела",
             generated_sentence="The laboratory acquired a more precise sensor.",
@@ -487,11 +638,11 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
             source_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
             generated_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
         ),
-        "acquisition": SemanticAnalysis(
-            lemma="acquisition",
-            family_key="acquisition",
+        "acquisition": ClusterAnalysis(
+            cluster_id="new_cluster",
+            leader="acquire",
             part_of_speech="noun",
-            sense_definition_en="the act or process of obtaining something",
+            cluster_definition_en="the act or process of obtaining something",
             translations_ru=["приобретение", "получение"],
             replacement_ru="получение",
             generated_sentence="Data acquisition requires careful calibration.",
@@ -500,11 +651,11 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
             source_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
             generated_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
         ),
-        "recognize-identify": SemanticAnalysis(
-            lemma="recognize",
-            family_key="recognize",
+        "recognize-identify": ClusterAnalysis(
+            cluster_id="new_cluster",
+            leader="recognize",
             part_of_speech="verb",
-            sense_definition_en="identify something from previous knowledge",
+            cluster_definition_en="identify something from previous knowledge",
             translations_ru=["распознать", "узнать"],
             replacement_ru="распознать",
             generated_sentence="The model can recognize partially hidden symbols.",
@@ -513,11 +664,11 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
             source_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
             generated_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
         ),
-        "recognize-admit": SemanticAnalysis(
-            lemma="recognize",
-            family_key="recognize",
+        "recognize-admit": ClusterAnalysis(
+            cluster_id="new_cluster",
+            leader="recognize",
             part_of_speech="verb",
-            sense_definition_en="admit or acknowledge that something is true",
+            cluster_definition_en="admit or acknowledge that something is true",
             translations_ru=["признать", "признавать"],
             replacement_ru="признать",
             generated_sentence="The review must recognize the study's limitations.",
@@ -528,36 +679,22 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
         ),
     }
 
-    def fake_analysis(target, sentence, **_kwargs):
+    def fake_analysis(target, _normalized, sentence, candidates, **_kwargs):
+        if target == "acquisition":
+            assert candidates[0].leader == "acquire"
+            return analyses[target].model_copy(
+                update={
+                    "cluster_id": candidates[0].cluster_id,
+                    "cluster_definition_en": (
+                        "obtain something or the process of obtaining it"
+                    ),
+                }
+            )
         if target != "recognize":
             return analyses[target]
         key = "recognize-identify" if "face" in sentence else "recognize-admit"
         return analyses[key]
-
-    def fake_match(analysis, candidates, **_kwargs):
-        if not candidates:
-            return SemanticMatch(
-                card_id=None,
-                relationship="new_card",
-                merged_sense_definition_en=None,
-                rationale_ru="Подходящей карточки пока нет.",
-            )
-        if analysis.family_key.startswith("acqui"):
-            return SemanticMatch(
-                card_id=candidates[0].id,
-                relationship="related_sense",
-                merged_sense_definition_en="obtain something or the process of obtaining it",
-                rationale_ru="Формы разделяют смысловое ядро получения.",
-            )
-        return SemanticMatch(
-            card_id=None,
-            relationship="new_card",
-            merged_sense_definition_en=None,
-            rationale_ru="Значения распознавания и признания различаются.",
-        )
-
-    monkeypatch.setattr(webapp_module, "analyse_semantic_context", fake_analysis)
-    monkeypatch.setattr(webapp_module, "select_semantic_match", fake_match)
+    monkeypatch.setattr(webapp_module, "analyse_cluster_assignment", fake_analysis)
     app = make_app(tmp_path)
     client = app.test_client()
     dashboard = identify(client)
@@ -609,10 +746,11 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
     assert len(acquire_cards) == 1
     assert len(recognize_cards) == 2
     acquire_contexts = json.loads(acquire_cards[0]["contexts_json"])
-    assert {context["lemma"] for context in acquire_contexts} == {
-        "acquire",
+    assert {context["target"] for context in acquire_contexts} >= {
+        "acquired",
         "acquisition",
     }
+    assert {context["lemma"] for context in acquire_contexts} == {"acquire"}
     assert json.loads(acquire_cards[0]["translations_json"]) == [
         "приобрести",
         "получить",
@@ -832,7 +970,9 @@ def test_import_failure_is_silent_and_does_not_leave_dead_highlight(
         ),
         rects=[{"x1": 80, "y1": 190, "x2": 120, "y2": 205}],
     )
-    monkeypatch.setattr(webapp_module, "extract_highlights", lambda _path: [extracted])
+    monkeypatch.setattr(
+        webapp_module, "extract_highlights", lambda _path, **_kwargs: [extracted]
+    )
     monkeypatch.setattr(
         webapp_module,
         "enrich_targets",
@@ -1141,7 +1281,9 @@ def test_uploaded_pdf_highlights_are_imported_automatically(
         ),
         rects=[{"x1": 80, "y1": 190, "x2": 120, "y2": 205}],
     )
-    monkeypatch.setattr(webapp_module, "extract_highlights", lambda _path: [extracted])
+    monkeypatch.setattr(
+        webapp_module, "extract_highlights", lambda _path, **_kwargs: [extracted]
+    )
     app = make_app(tmp_path, AUTO_PROCESS_UPLOADS=True)
     client = app.test_client()
     dashboard = identify(client)
@@ -1161,6 +1303,7 @@ def test_uploaded_pdf_highlights_are_imported_automatically(
         assert document["imported_highlight_count"] == 1
         assert Path(document["source_path"]).is_file()
         assert Path(document["stored_path"]).is_file()
+        assert Path(document["text_path"]).is_file()
         assert highlight["source"] == "pdf_import"
         assert highlight["status"] == "ready"
         assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 1
@@ -1171,6 +1314,11 @@ def test_uploaded_pdf_highlights_are_imported_automatically(
         headers={"X-CSRF-Token": csrf(reader)},
     )
     assert deleted.status_code == 200
+    monkeypatch.setattr(
+        webapp_module,
+        "extract_document_text",
+        lambda _path: (_ for _ in ()).throw(AssertionError("PDF text parsed twice")),
+    )
     webapp_module.process_document_highlights(app, document["id"], document["user_id"])
     with sqlite3.connect(tmp_path / "app.sqlite3") as database:
         assert database.execute("SELECT COUNT(*) FROM highlights").fetchone()[0] == 0
@@ -1191,7 +1339,9 @@ def test_existing_pdf_can_be_processed_directly_without_reupload(
         ),
         rects=[{"x1": 80, "y1": 190, "x2": 120, "y2": 205}],
     )
-    monkeypatch.setattr(webapp_module, "extract_highlights", lambda _path: [extracted])
+    monkeypatch.setattr(
+        webapp_module, "extract_highlights", lambda _path, **_kwargs: [extracted]
+    )
     app = make_app(tmp_path)
     client = app.test_client()
     dashboard = identify(client)
@@ -1239,7 +1389,9 @@ def test_pdf_import_does_not_duplicate_overlapping_reader_highlight(
         ),
         rects=[{"x1": 82, "y1": 191, "x2": 119, "y2": 204}],
     )
-    monkeypatch.setattr(webapp_module, "extract_highlights", lambda _path: [extracted])
+    monkeypatch.setattr(
+        webapp_module, "extract_highlights", lambda _path, **_kwargs: [extracted]
+    )
     app = make_app(tmp_path)
     client = app.test_client()
     dashboard = identify(client)

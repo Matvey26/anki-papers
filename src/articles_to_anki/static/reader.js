@@ -493,9 +493,18 @@ function selectionHint(range, shell) {
 
 function normalizeSelectedText(value) {
   return value
-    .replace(/[-\u2010\u00ad]\s*\r?\n\s*/g, "")
+    .normalize("NFKC")
+    .replace(/[-\u2010-\u2015\u2212\u2E3A\u2E3B\uFE58\uFE63\uFF0D\u00ad]\s*\r?\n\s*/g, "")
+    .replace(/\u00ad/g, "")
+    .replace(/[’‘ʼ＇]/g, "'")
+    .replace(/[\p{Dash_Punctuation}\u2212]/gu, "-")
+    .replace(/[^\p{L}\p{M}\p{N}'\-\s]/gu, " ")
+    .toLocaleLowerCase()
     .replace(/\s+/g, " ")
-    .trim();
+    .replace(/-{2,}/g, "-")
+    .replace(/'{2,}/g, "'")
+    .trim()
+    .replace(/^[-']+|[-']+$/g, "");
 }
 
 function isSelectableTarget(value) {

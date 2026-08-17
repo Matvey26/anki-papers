@@ -186,13 +186,33 @@ class RecallDistractors(StrictModel):
             raise ValueError("recall distractors must contain English letters")
         return cleaned
 
-class SemanticAnalysis(StrictModel):
-    """LLM result used to group contexts into one learnable lexical sense."""
+class ClusterExample(StrictModel):
+    highlight: str = Field(min_length=1, max_length=100)
+    context: str = Field(min_length=1, max_length=1200)
 
-    lemma: str = Field(min_length=1, max_length=100)
-    family_key: str = Field(min_length=1, max_length=100)
+
+class ClusterCandidate(StrictModel):
+    cluster_id: str
+    leader: str = Field(min_length=1, max_length=100)
+    examples: list[ClusterExample] = Field(min_length=1, max_length=5)
+
+
+class ClusterAnalysis(StrictModel):
+    """One LLM result that assigns a highlight and builds its card context."""
+
+    cluster_id: str = Field(
+        description="One supplied cluster_id or the literal new_cluster."
+    )
+    leader: str = Field(
+        min_length=1,
+        max_length=100,
+        description=(
+            "Canonical lowercase representative for a new cluster; repeat the supplied "
+            "leader when selecting an existing cluster."
+        ),
+    )
     part_of_speech: SemanticPartOfSpeech
-    sense_definition_en: str = Field(min_length=3, max_length=300)
+    cluster_definition_en: str = Field(min_length=3, max_length=300)
     translations_ru: list[str] = Field(min_length=1, max_length=4)
     replacement_ru: str = Field(min_length=1, max_length=100)
     generated_sentence: str = Field(min_length=12, max_length=500)
@@ -208,7 +228,7 @@ class SemanticAnalysis(StrictModel):
     source_distractors: RecallDistractors
     generated_distractors: RecallDistractors
 
-    @field_validator("lemma", "sense_definition_en", "generated_sentence", "generated_surface")
+    @field_validator("cluster_definition_en", "generated_sentence", "generated_surface")
     @classmethod
     def stripped_english(cls, value: str) -> str:
         value = value.strip()
@@ -216,12 +236,12 @@ class SemanticAnalysis(StrictModel):
             raise ValueError("must not be blank")
         return value
 
-    @field_validator("family_key")
+    @field_validator("leader")
     @classmethod
-    def normalized_family_key(cls, value: str) -> str:
+    def normalized_leader(cls, value: str) -> str:
         cleaned = " ".join(value.casefold().split())
-        if not any("a" <= char <= "z" for char in cleaned):
-            raise ValueError("family key must contain English letters")
+        if not cleaned:
+            raise ValueError("leader must not be blank")
         return cleaned
 
     @field_validator("translations_ru")
@@ -246,9 +266,9 @@ class SemanticAnalysis(StrictModel):
         return cleaned
 
     @model_validator(mode="after")
-    def replacements_are_compact_phrases(self) -> SemanticAnalysis:
+    def replacements_are_compact_phrases(self) -> ClusterAnalysis:
         for field_name, value, english_surface in (
-            ("replacement_ru", self.replacement_ru, self.lemma),
+            ("replacement_ru", self.replacement_ru, self.leader),
             (
                 "generated_translation_ru",
                 self.generated_translation_ru,
@@ -266,35 +286,3 @@ class SemanticAnalysis(StrictModel):
             if any(mark in value for mark in ("\n", ".", ";", "!", "?")):
                 raise ValueError(f"{field_name} must not contain sentence punctuation")
         return self
-
-
-class SemanticCandidate(StrictModel):
-    id: str
-    family_key: str
-    lemmas: list[str] = Field(min_length=1, max_length=12)
-    parts_of_speech: list[SemanticPartOfSpeech] = Field(min_length=1, max_length=6)
-    sense_definition_en: str
-
-
-class SemanticMatch(StrictModel):
-    card_id: str | None
-    relationship: Literal["same_sense", "related_sense", "new_card"]
-    merged_sense_definition_en: str | None
-    rationale_ru: str = Field(
-        min_length=1,
-        max_length=2000,
-        pattern=r".*[А-Яа-яЁё].*",
-    )
-
-    @model_validator(mode="after")
-    def valid_merge_shape(self) -> SemanticMatch:
-        if self.relationship == "new_card":
-            if self.card_id is not None or self.merged_sense_definition_en is not None:
-                raise ValueError("new card must not select or rewrite an existing card")
-        elif self.card_id is None or not self.merged_sense_definition_en:
-            raise ValueError("semantic merge must select a card and return a definition")
-        return self
-
-
-class SemanticMatchResponse(StrictModel):
-    match: SemanticMatch

@@ -158,6 +158,7 @@ def extract_highlights(
     *,
     config: ExtractionConfig | None = None,
     debug_dir: str | Path | None = None,
+    document_text: DocumentText | None = None,
 ) -> list[ExtractedHighlight]:
     config = config or ExtractionConfig()
     pdf_path = Path(pdf_path).expanduser().resolve()
@@ -216,7 +217,8 @@ def extract_highlights(
             token.global_index = len(flat_tokens)
             flat_tokens.append(token)
 
-    document_text = _extract_document_text(pdf_path)
+    if document_text is None:
+        document_text = _extract_document_text(pdf_path)
     occurrence_counts: dict[tuple[int, str], int] = {}
     reader = PdfReader(pdf_path)
     page_boxes = [

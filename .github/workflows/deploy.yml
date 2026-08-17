@@ -137,6 +137,8 @@ jobs:
           .venv/bin/python -m pip install --upgrade pip
           .venv/bin/python -m pip install . ./sync-worker
           .venv/bin/python -m pip check
+          .venv/bin/python scripts/install_quick_dictionary.py --data-dir "$data_dir"
+          .venv/bin/python scripts/install_quick_translator.py --data-dir "$data_dir"
           .venv/bin/python -c 'from articles_to_anki.webapp import create_app; create_app()'
 
           for unit in anki-papers-web anki-papers-sync-worker; do
