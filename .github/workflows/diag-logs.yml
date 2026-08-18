@@ -31,24 +31,49 @@ jobs:
               printf '%s' "$DIAG_PASSWORD_B64" | base64 -d | sudo -S -p '' "$@"
             fi
           }
-          echo "=== rebuild failed traceback ==="
-          run_root journalctl -u anki-papers-web --since "2026-08-18 14:05" --no-pager 2>/dev/null | grep -A 25 "Deck rebuild failed" | head -35 || true
-          echo "=== database state ==="
           cd "$HOME/anki-papers"
           .venv/bin/python - <<'PY'
           import json
           import sqlite3
           database = sqlite3.connect("data/app.sqlite3")
           database.row_factory = sqlite3.Row
-          print("users:", [dict(r) for r in database.execute("SELECT id, username FROM users")])
-          print("highlights total/ready:", database.execute("SELECT COUNT(*), SUM(status = 'ready') FROM highlights").fetchone())
-          print("cards semantic_version=1:", database.execute("SELECT COUNT(*) FROM cards WHERE semantic_version = 1").fetchone()[0])
-          for row in database.execute("SELECT id, target, status FROM highlights LIMIT 8"):
-              print("hl:", dict(row))
-          for row in database.execute("SELECT id FROM cards WHERE semantic_version = 1 LIMIT 8"):
-              contexts = json.loads(row["contexts_json"] or "[]")
-              print("card:", row["id"], "ctx ids:", [c.get("id") for c in contexts if isinstance(c, dict)][:4],
-                    "sources:", [c.get("source") for c in contexts if isinstance(c, dict)][:4])
+          columns = [row[1] for row in database.execute("PRAGMA table_info(cards)")]
+          print("cards columns:", columns)
+          print("highlights count by status:", dict(
+              database.execute("SELECT status, COUNT(*) FROM highlights GROUP BY status").fetchall()
+          ))
+          print("highlights by user:", dict(
+              database.execute("SELECT user_id, COUNT(*) FROM highlights GROUP BY user_id").fetchall()
+          ))
+          print("cards by user:", dict(
+              database.execute("SELECT user_id, COUNT(*) FROM cards GROUP BY user_id").fetchall()
+          ))
+          from collections import Counter
+          sources = Counter()
+          sample_ids = []
+          for row in database.execute("SELECT contexts_json FROM cards WHERE semantic_version = 1"):
+              contexts = json.loads(row[0] or "[]")
+              for item in contexts:
+                  if isinstance(item, dict):
+                      sources[item.get("source")] += 1
+                      if len(sample_ids) < 6:
+                          sample_ids.append((item.get("id"), item.get("source")))
+          print("context sources:", dict(sources))
+          print("sample ctx ids:", sample_ids)
+          hl_ids = {str(r[0]) for r in database.execute("SELECT id FROM highlights")}
+          overlap = [cid for cid, _src in sample_ids if cid in hl_ids]
+          print("ctx ids in highlights table:", overlap)
+          database.close()
+          PY
+          echo "=== mirror files ==="
+          ls -la "$HOME/anki-papers/data/anki_mirrors/" 2>/dev/null || true
+          echo "=== anki_accounts ==="
+          .venv/bin/python - <<'PY'
+          import sqlite3
+          database = sqlite3.connect("data/app.sqlite3")
+          database.row_factory = sqlite3.Row
+          for row in database.execute("SELECT user_id, state, mirror_path, mirror_key_version FROM anki_accounts"):
+              print("account:", dict(row))
           database.close()
           PY
           unset DIAG_PASSWORD_B64
