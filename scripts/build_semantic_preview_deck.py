@@ -317,18 +317,6 @@ def make_contexts(
             "valid_substitutes_en": analysis.source_distractors.valid_substitutes_en,
             "valid_related_en": analysis.source_distractors.valid_related_en,
         },
-        {
-            **common,
-            "id": f"generated:{source.id}",
-            "source": "llm_generated",
-            "target": analysis.generated_surface,
-            "sentence": analysis.generated_sentence,
-            "replacement": analysis.generated_translation_ru,
-            "substitutes_en": analysis.generated_distractors.substitutes_en,
-            "related_en": analysis.generated_distractors.related_en,
-            "valid_substitutes_en": analysis.generated_distractors.valid_substitutes_en,
-            "valid_related_en": analysis.generated_distractors.valid_related_en,
-        },
     ]
 
 
@@ -594,11 +582,7 @@ def write_report(path: Path, clusters: list[dict[str, Any]]) -> None:
         )
         writer.writeheader()
         for cluster in clusters:
-            source_contexts = [
-                context
-                for context in cluster["contexts"]
-                if context["source"] != "llm_generated"
-            ]
+            source_contexts = [context for context in cluster["contexts"]]
             writer.writerow(
                 {
                     "cluster_id": cluster["id"],

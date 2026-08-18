@@ -55,17 +55,26 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from .enrich import (
     DEFAULT_SEMANTIC_MODEL,
     analyse_cluster_assignment,
+    approve_context_candidates,
     enrich_targets,  # noqa: F401 - retained as a monkeypatch seam for callers/tests
     load_env_file,
 )
 from .extract import (
     RECALL_PLACEHOLDER,
     DocumentText,
+    DocumentWordIndex,
+    document_word_index,
     extract_document_text,
     extract_highlights,
     find_article_contexts,
+    find_variant_article_contexts,
 )
-from .models import ClusterCandidate, ClusterExample, TargetContext
+from .models import (
+    ClusterCandidate,
+    ClusterExample,
+    ContextCandidate,
+    TargetContext,
+)
 from .quick_dictionary import StarDictDictionary
 from .security import (
     claim_token_digest,
@@ -93,6 +102,9 @@ MAX_CLUSTER_CANDIDATES = 5
 MAX_CLUSTER_EXAMPLES = 5
 CLUSTER_FUZZY_SCORE_CUTOFF = 45.0
 ARTICLE_CONTEXT_LIMIT = 4
+CONTEXT_CANDIDATES_PER_DOCUMENT = 6
+CONTEXT_APPROVAL_CANDIDATE_LIMIT = 14
+MAX_CONTEXT_APPROVAL_EXAMPLES = 5
 LOGGER = logging.getLogger(__name__)
 _ARTICLE_STOPWORDS = {
     "about", "after", "also", "among", "and", "are", "because", "been", "before",
@@ -1535,6 +1547,7 @@ def init_database(app: Flask) -> None:
             """CREATE INDEX IF NOT EXISTS idx_cards_cluster_leader
                ON cards(user_id, semantic_version, target_normalized)"""
         )
+        purge_llm_generated_contexts(connection)
         synchronize_card_highlights_by_context(connection)
         connection.execute("PRAGMA optimize")
         connection.commit()
@@ -1569,6 +1582,29 @@ def card_context_key(row: sqlite3.Row) -> tuple[int, str, int, str, str]:
         normalize_target(row["target"]),
         " ".join(str(row["sentence"]).casefold().split()),
     )
+
+
+def purge_llm_generated_contexts(connection: sqlite3.Connection) -> None:
+    """Drop synthetic LLM contexts from legacy cards on startup."""
+    rows = connection.execute(
+        "SELECT id, contexts_json FROM cards WHERE semantic_version = 1"
+    ).fetchall()
+    for row in rows:
+        contexts = json.loads(row["contexts_json"] or "[]")
+        retained = [
+            item
+            for item in contexts
+            if not (
+                isinstance(item, dict)
+                and item.get("source") == "llm_generated"
+            )
+        ]
+        if len(retained) == len(contexts):
+            continue
+        connection.execute(
+            "UPDATE cards SET contexts_json = ? WHERE id = ?",
+            (json.dumps(retained, ensure_ascii=False), row["id"]),
+        )
 
 
 def migrate_cards_to_contexts(connection: sqlite3.Connection) -> None:
@@ -1862,7 +1898,6 @@ def delete_highlight_rows(
             contexts = [
                 item for item in contexts
                 if str(item.get("id")) not in removed
-                and not any(str(item.get("id")) == f"generated:{context_id}" for context_id in removed)
             ]
             database.execute(
                 """UPDATE cards SET document_id = ?, target = ?, target_normalized = ?,
@@ -2066,7 +2101,13 @@ def refresh_article_contexts(
     *,
     card_ids: set[str] | None = None,
 ) -> set[str]:
-    """Mine uploaded PDFs for extra meaning-only contexts without LLM calls."""
+    """Mine uploaded PDFs for extra meaning-only contexts.
+
+    Exact occurrences plus imprecise word-formation matches (impair -> impaired)
+    are collected, then the semantic model approves only the sentences that teach
+    the card's exact sense. Without an API key a conservative offline fallback
+    keeps the legacy lexical-overlap selection.
+    """
     parameters: list[Any] = [user_id]
     card_filter = ""
     if card_ids is not None:
@@ -2097,6 +2138,9 @@ def refresh_article_contexts(
             )
             continue
 
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    model = os.environ.get("OPENROUTER_SEMANTIC_MODEL", DEFAULT_SEMANTIC_MODEL)
+    word_indexes: dict[str, DocumentWordIndex] = {}
     changed: set[str] = set()
     for card in cards:
         contexts = [
@@ -2118,11 +2162,29 @@ def refresh_article_contexts(
             " ".join(str(item.get("sentence") or "").casefold().split())
             for item in retained
         }
-        candidates: list[tuple[int, str, int, dict[str, Any]]] = []
+        candidates: list[dict[str, Any]] = []
         for document, parsed in parsed_documents:
-            for occurrence in find_article_contexts(parsed, sorted(targets)):
+            index = word_indexes.get(document["id"])
+            if index is None:
+                index = document_word_index(parsed)
+                word_indexes[document["id"]] = index
+            collected: list[tuple[bool, TargetContext]] = [
+                (True, occurrence)
+                for occurrence in find_article_contexts(parsed, sorted(targets))
+            ]
+            collected.extend(
+                (False, occurrence)
+                for occurrence in find_variant_article_contexts(
+                    parsed,
+                    sorted(targets),
+                    index=index,
+                )
+            )
+            for exact, occurrence in collected[:CONTEXT_CANDIDATES_PER_DOCUMENT]:
                 sentence_key = " ".join(occurrence.sentence.casefold().split())
                 if sentence_key in known_sentences:
+                    continue
+                if not _article_context_is_readable(occurrence.sentence):
                     continue
                 score = _article_context_score(
                     card,
@@ -2131,36 +2193,53 @@ def refresh_article_contexts(
                     occurrence.sentence,
                     targets,
                 )
-                if score is None:
-                    continue
-                context = {
-                    "id": f"article:{document['id']}:{occurrence.id}",
-                    "source": "article_context",
-                    "document_id": str(document["id"]),
-                    "document_name": str(document["name"]),
-                    "page": occurrence.source_page,
-                    "directions": ["meaning"],
-                    "target": occurrence.target,
-                    "sentence": occurrence.sentence,
-                    "replacement": str(card["replacement"]),
-                    "lemma": str(card["lemma"]),
-                    "family_key": str(card["family_key"]),
-                    "part_of_speech": str(card["part_of_speech"]),
-                    "sense_definition_en": str(card["sense_definition_en"]),
-                }
-                candidates.append((score, str(document["id"]), occurrence.source_page, context))
+                candidates.append(
+                    _article_context_candidate(
+                        card,
+                        document,
+                        occurrence.target,
+                        occurrence.sentence,
+                        occurrence.source_page,
+                        occurrence.id,
+                        exact=exact,
+                        score=score,
+                    )
+                )
                 known_sentences.add(sentence_key)
-        candidates.sort(key=lambda item: (-item[0], item[1], item[2], item[3]["id"]))
-        selected = []
-        per_document: dict[str, int] = {}
-        for candidate in candidates:
-            document_id = candidate[1]
-            if per_document.get(document_id, 0) >= 2:
-                continue
-            selected.append(candidate[3])
-            per_document[document_id] = per_document.get(document_id, 0) + 1
-            if len(selected) == ARTICLE_CONTEXT_LIMIT:
-                break
+        if not candidates:
+            continue
+        approved: set[str] | None = None
+        if api_key:
+            approval_candidates = candidates[:CONTEXT_APPROVAL_CANDIDATE_LIMIT]
+            try:
+                approved = approve_context_candidates(
+                    leader=str(card["lemma"] or card["family_key"] or card["target"]),
+                    definition=str(card["sense_definition_en"] or ""),
+                    translations=json.loads(card["translations_json"]),
+                    known_contexts=[
+                        " ".join(str(item.get("sentence") or "").split())
+                        for item in retained[:MAX_CONTEXT_APPROVAL_EXAMPLES]
+                        if item.get("sentence")
+                    ],
+                    candidates=[
+                        ContextCandidate(
+                            id=str(item["id"]),
+                            surface=str(item["target"]),
+                            sentence=str(item["sentence"]),
+                        )
+                        for item in approval_candidates
+                    ],
+                    api_key=api_key,
+                    model=model,
+                )
+            except Exception:
+                LOGGER.warning(
+                    "Article-context approval failed for card %s; "
+                    "falling back to lexical selection",
+                    card["id"],
+                )
+                approved = None
+        selected = _select_article_context_candidates(candidates, approved)
         updated = retained + selected
         if updated == contexts:
             continue
@@ -2172,6 +2251,74 @@ def refresh_article_contexts(
         )
         changed.add(str(card["id"]))
     return changed
+
+
+def _article_context_candidate(
+    card: sqlite3.Row,
+    document: sqlite3.Row,
+    target: str,
+    sentence: str,
+    page: int,
+    occurrence_id: str,
+    *,
+    exact: bool,
+    score: int | None,
+) -> dict[str, Any]:
+    return {
+        "id": f"article:{document['id']}:{occurrence_id}",
+        "source": "article_context",
+        "document_id": str(document["id"]),
+        "document_name": str(document["name"]),
+        "page": page,
+        "directions": ["meaning"],
+        "target": target,
+        "sentence": sentence,
+        "replacement": str(card["replacement"]),
+        "lemma": str(card["lemma"]),
+        "family_key": str(card["family_key"]),
+        "part_of_speech": str(card["part_of_speech"]),
+        "sense_definition_en": str(card["sense_definition_en"]),
+        "score": score,
+        "exact": exact,
+    }
+
+
+def _select_article_context_candidates(
+    candidates: list[dict[str, Any]],
+    approved: set[str] | None,
+) -> list[dict[str, Any]]:
+    def order_key(item: dict[str, Any]) -> tuple[Any, ...]:
+        if approved is not None:
+            return (
+                item["id"] not in approved,
+                not item["exact"],
+                -(item["score"] or 0),
+                item["document_id"],
+                item["page"],
+                item["id"],
+            )
+        score = item["score"]
+        return (
+            -score if score is not None else -1,
+            item["document_id"],
+            item["page"],
+            item["id"],
+        )
+
+    if approved is None:
+        candidates = [item for item in candidates if item["score"] is not None]
+    selected = []
+    per_document: dict[str, int] = {}
+    for candidate in sorted(candidates, key=order_key):
+        if per_document.get(candidate["document_id"], 0) >= 2:
+            continue
+        selected.append(candidate)
+        per_document[candidate["document_id"]] = (
+            per_document.get(candidate["document_id"], 0) + 1
+        )
+        if len(selected) == ARTICLE_CONTEXT_LIMIT:
+            break
+    return selected
 
 
 def document_text_cache_path(document: sqlite3.Row) -> Path:
@@ -2316,18 +2463,6 @@ def enrich_highlight_row(
         "valid_substitutes_en": analysis.source_distractors.valid_substitutes_en,
         "valid_related_en": analysis.source_distractors.valid_related_en,
     }
-    generated_context = {
-        "id": f"generated:{row['id']}", "source": "llm_generated",
-        "target": analysis.generated_surface, "sentence": analysis.generated_sentence,
-        "replacement": analysis.generated_translation_ru,
-        "translations": analysis.translations_ru, "lemma": leader,
-        "family_key": leader, "part_of_speech": analysis.part_of_speech,
-        "sense_definition_en": analysis.cluster_definition_en,
-        "substitutes_en": analysis.generated_distractors.substitutes_en,
-        "related_en": analysis.generated_distractors.related_en,
-        "valid_substitutes_en": analysis.generated_distractors.valid_substitutes_en,
-        "valid_related_en": analysis.generated_distractors.valid_related_en,
-    }
     if selected_candidate is not None:
         existing = database.execute(
             "SELECT * FROM cards WHERE id = ? AND user_id = ?",
@@ -2337,7 +2472,18 @@ def enrich_highlight_row(
             raise RuntimeError("Selected semantic card disappeared")
         contexts = json.loads(existing["contexts_json"] or "[]")
         known = {str(item.get("id")) for item in contexts if isinstance(item, dict)}
-        contexts.extend(item for item in (source_context, generated_context) if item["id"] not in known)
+        known_sentences = {
+            " ".join(str(item.get("sentence") or "").casefold().split())
+            for item in contexts
+            if isinstance(item, dict) and item.get("sentence")
+        }
+        source_sentence = " ".join(str(row["sentence"]).casefold().split())
+        added_contexts = (
+            []
+            if source_sentence in known_sentences
+            else [source_context]
+        )
+        contexts.extend(item for item in added_contexts if item["id"] not in known)
         card_translations = merge_semantic_translations(
             json.loads(existing["translations_json"]),
             analysis.translations_ru,
@@ -2368,7 +2514,7 @@ def enrich_highlight_row(
                 row["sentence"], row["page"], translations, replacement, alternatives,
                 leader, leader,
                 analysis.part_of_speech.casefold(),
-                analysis.cluster_definition_en, json.dumps([source_context, generated_context], ensure_ascii=False), timestamp,
+                analysis.cluster_definition_en, json.dumps([source_context], ensure_ascii=False), timestamp,
             ),
         )
         existing = database.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()

@@ -215,20 +215,9 @@ class ClusterAnalysis(StrictModel):
     cluster_definition_en: str = Field(min_length=3, max_length=300)
     translations_ru: list[str] = Field(min_length=1, max_length=4)
     replacement_ru: str = Field(min_length=1, max_length=100)
-    generated_sentence: str = Field(min_length=12, max_length=500)
-    generated_surface: str = Field(min_length=1, max_length=100)
-    generated_translation_ru: str = Field(
-        min_length=1,
-        max_length=100,
-        description=(
-            "A compact Russian replacement for generated_surface only, in the exact "
-            "grammatical form required by generated_sentence; never a sentence translation."
-        ),
-    )
     source_distractors: RecallDistractors
-    generated_distractors: RecallDistractors
 
-    @field_validator("cluster_definition_en", "generated_sentence", "generated_surface")
+    @field_validator("cluster_definition_en")
     @classmethod
     def stripped_english(cls, value: str) -> str:
         value = value.strip()
@@ -254,7 +243,7 @@ class ClusterAnalysis(StrictModel):
             raise ValueError("translations must be unique")
         return cleaned
 
-    @field_validator("replacement_ru", "generated_translation_ru")
+    @field_validator("replacement_ru")
     @classmethod
     def russian_replacements(cls, value: str) -> str:
         cleaned = value.strip()
@@ -267,22 +256,29 @@ class ClusterAnalysis(StrictModel):
 
     @model_validator(mode="after")
     def replacements_are_compact_phrases(self) -> ClusterAnalysis:
-        for field_name, value, english_surface in (
-            ("replacement_ru", self.replacement_ru, self.leader),
-            (
-                "generated_translation_ru",
-                self.generated_translation_ru,
-                self.generated_surface,
-            ),
-        ):
-            russian_words = re.findall(r"[A-Za-zА-Яа-яЁё0-9-]+", value)
-            english_words = re.findall(r"[A-Za-z0-9-]+", english_surface)
-            maximum_words = min(8, max(5, len(english_words) * 2 + 1))
-            if len(russian_words) > maximum_words:
-                raise ValueError(
-                    f"{field_name} must translate only the highlighted surface, "
-                    "not the full sentence"
-                )
-            if any(mark in value for mark in ("\n", ".", ";", "!", "?")):
-                raise ValueError(f"{field_name} must not contain sentence punctuation")
+        russian_words = re.findall(r"[A-Za-zА-Яа-яЁё0-9-]+", self.replacement_ru)
+        english_words = re.findall(r"[A-Za-z0-9-]+", self.leader)
+        maximum_words = min(8, max(5, len(english_words) * 2 + 1))
+        if len(russian_words) > maximum_words:
+            raise ValueError(
+                "replacement_ru must translate only the highlighted surface, "
+                "not the full sentence"
+            )
+        if any(mark in self.replacement_ru for mark in ("\n", ".", ";", "!", "?")):
+            raise ValueError("replacement_ru must not contain sentence punctuation")
         return self
+
+
+class ContextCandidate(StrictModel):
+    id: str = Field(min_length=1, max_length=200)
+    surface: str = Field(min_length=1, max_length=100)
+    sentence: str = Field(min_length=1, max_length=1200)
+
+
+class ContextApproval(StrictModel):
+    id: str = Field(min_length=1, max_length=200)
+    suitable: bool
+
+
+class ContextApprovalBatch(StrictModel):
+    items: list[ContextApproval]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 
 import pytest
@@ -26,12 +27,14 @@ from articles_to_anki.extract import (
     _pdf_quad_to_region,
     _rectangle_overlap_ratio,
     find_article_contexts,
+    find_variant_article_contexts,
     is_sentence_end,
     render_sentence,
 )
 from articles_to_anki.models import (
     ClusterAnalysis,
     ClusterCandidate,
+    ContextCandidate,
     EnrichedItem,
     EnrichmentRequestItem,
     RecallDistractors,
@@ -267,20 +270,11 @@ def test_cluster_assignment_uses_reasoning_and_dynamic_cluster_enum(monkeypatch)
         cluster_definition_en="accept that a fact or limitation is true",
         translations_ru=["признать"],
         replacement_ru="признала",
-        generated_sentence="The committee acknowledged the limitation before proceeding.",
-        generated_surface="acknowledged",
-        generated_translation_ru="признал",
         source_distractors={
             "substitutes_en": ["accepted"],
             "related_en": ["acceptance"],
             "valid_substitutes_en": ["accepted"],
             "valid_related_en": ["acceptance"],
-        },
-        generated_distractors={
-            "substitutes_en": ["recognized"],
-            "related_en": ["recognition"],
-            "valid_substitutes_en": ["recognized"],
-            "valid_related_en": ["recognition"],
         },
     )
 
@@ -413,16 +407,7 @@ def test_cluster_analysis_rejects_loose_pos_and_non_russian_replacements() -> No
         "cluster_definition_en": "able to remain reliable under difficult conditions",
         "translations_ru": ["надёжный", "устойчивый"],
         "replacement_ru": "надёжным",
-        "generated_sentence": "The estimator remained robust under heavy noise.",
-        "generated_surface": "robust",
-        "generated_translation_ru": "устойчивым",
         "source_distractors": {
-            "substitutes_en": [],
-            "related_en": [],
-            "valid_substitutes_en": [],
-            "valid_related_en": [],
-        },
-        "generated_distractors": {
             "substitutes_en": [],
             "related_en": [],
             "valid_substitutes_en": [],
@@ -440,12 +425,10 @@ def test_cluster_analysis_rejects_loose_pos_and_non_russian_replacements() -> No
     with pytest.raises(ValidationError):
         ClusterAnalysis(**{**values, "replacement_ru": "reliable"})
     with pytest.raises(ValidationError):
-        ClusterAnalysis(**{**values, "generated_translation_ru": "stable"})
-    with pytest.raises(ValidationError):
         ClusterAnalysis(
             **{
                 **values,
-                "generated_translation_ru": (
+                "replacement_ru": (
                     "Оценка оставалась устойчивой даже при очень сильном внешнем шуме"
                 ),
             }
@@ -510,24 +493,161 @@ def test_semantic_json_code_fence_is_removed_without_changing_json() -> None:
     assert enrich_module._strip_json_code_fence(f"```json\n{value}\n```") == value
 
 
-def test_generated_surface_must_be_a_complete_word_or_phrase() -> None:
-    assert enrich_module._contains_exact_surface(
-        "The estimator remained robust under heavy noise.",
-        "robust",
+def test_variant_article_context_finds_inflected_forms() -> None:
+    sentence = (
+        "Chronic stress can impair memory consolidation. "
+        "An impaired immune response follows quickly. "
+        "The review notes the same impairment in the discussion."
     )
-    assert enrich_module._contains_exact_surface(
-        "The team ruled out a measurement error.",
-        "ruled out",
+    document = DocumentText(
+        text=sentence,
+        page_ranges=[(0, len(sentence))],
+        hard_page_starts=[False],
     )
-    assert not enrich_module._contains_exact_surface(
-        "The estimator's robustness improved.",
-        "robust",
+
+    contexts = find_variant_article_contexts(document, ["impair"])
+
+    assert [context.target for context in contexts] == [
+        "impaired",
+        "impairment",
+    ]
+    assert all("impair" in context.sentence for context in contexts)
+
+
+def test_variant_article_context_finds_inflected_phrases() -> None:
+    sentence = (
+        "The small model trailed behind the leader. "
+        "The baseline trails behind in the last benchmark."
     )
+    document = DocumentText(
+        text=sentence,
+        page_ranges=[(0, len(sentence))],
+        hard_page_starts=[False],
+    )
+
+    contexts = find_variant_article_contexts(document, ["trail behind"])
+
+    assert [context.target for context in contexts] == [
+        "trailed behind",
+        "trails behind",
+    ]
+    assert "<b>trailed behind</b>" in contexts[0].sentence_html
+
+
+def test_variant_article_context_skips_exact_and_unrelated_words() -> None:
+    sentence = (
+        "The agent improves the policy. "
+        "An improved policy is deployed. "
+        "The improvement was measured."
+    )
+    document = DocumentText(
+        text=sentence,
+        page_ranges=[(0, len(sentence))],
+        hard_page_starts=[False],
+    )
+
+    contexts = find_variant_article_contexts(document, ["improve"])
+
+    assert sorted(context.target for context in contexts) == [
+        "improved",
+        "improvement",
+        "improves",
+    ]
 
 
 def test_cluster_analysis_schema_requires_cluster_choice_and_leader() -> None:
     schema = ClusterAnalysis.model_json_schema()
     assert {"cluster_id", "leader", "cluster_definition_en"} <= set(schema["required"])
+
+
+def test_approve_context_candidates_returns_only_approved_ids(monkeypatch) -> None:
+    payloads = []
+    candidates = [
+        ContextCandidate(
+            id="c1",
+            surface="impaired",
+            sentence="An impaired immune response follows quickly.",
+        ),
+        ContextCandidate(
+            id="c2",
+            surface="impairment",
+            sentence="The review notes the same impairment in the discussion.",
+        ),
+        ContextCandidate(
+            id="c3",
+            surface="impaired",
+            sentence="A different sense of impaired appears here.",
+        ),
+    ]
+
+    def fake_request(payload, _api_key):
+        payloads.append(payload)
+        batch = {
+            "items": [
+                {"id": "c1", "suitable": True},
+                {"id": "c2", "suitable": False},
+                {"id": "c3", "suitable": True},
+            ]
+        }
+        return {"choices": [{"message": {"content": json.dumps(batch)}}]}
+
+    monkeypatch.setattr(enrich_module, "_post_json", fake_request)
+    approved = enrich_module.approve_context_candidates(
+        leader="impair",
+        definition="weaken or damage something",
+        translations=["ухудшать", "нарушать"],
+        known_contexts=["Chronic stress can impair memory consolidation."],
+        candidates=candidates,
+        api_key="test-key",
+    )
+
+    assert approved == {"c1", "c3"}
+    assert payloads[0]["temperature"] == 0.1
+    assert payloads[0]["model"] == enrich_module.DEFAULT_SEMANTIC_MODEL
+    assert payloads[0]["response_format"]["json_schema"]["schema"]["$defs"][
+        "ContextApproval"
+    ]["properties"]["suitable"]["type"] == "boolean"
+
+
+def test_approve_context_candidates_retries_on_id_set_mismatch(monkeypatch) -> None:
+    calls = []
+    candidates = [
+        ContextCandidate(id="c1", surface="impaired", sentence="Sentence one."),
+        ContextCandidate(id="c2", surface="impairment", sentence="Sentence two."),
+    ]
+
+    def fake_request(payload, _api_key):
+        calls.append(payload)
+        batch = {"items": [{"id": "c9", "suitable": True}, {"id": "c2", "suitable": True}]}
+        return {"choices": [{"message": {"content": json.dumps(batch)}}]}
+
+    monkeypatch.setattr(enrich_module, "_post_json", fake_request)
+    monkeypatch.setattr(enrich_module.time, "sleep", lambda _seconds: None)
+    with pytest.raises(RuntimeError, match="context approval failed after 3 attempts"):
+        enrich_module.approve_context_candidates(
+            leader="impair",
+            definition="weaken",
+            translations=["ухудшать"],
+            known_contexts=[],
+            candidates=candidates,
+            api_key="test-key",
+        )
+
+    assert len(calls) == 3
+
+
+def test_approve_context_candidates_accepts_empty_candidate_list() -> None:
+    assert (
+        enrich_module.approve_context_candidates(
+            leader="impair",
+            definition="weaken",
+            translations=["ухудшать"],
+            known_contexts=[],
+            candidates=[],
+            api_key="test-key",
+        )
+        == set()
+    )
 
 
 def test_csv_cards_are_shuffled_reproducibly(tmp_path) -> None:

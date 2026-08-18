@@ -15,6 +15,8 @@ from pydantic import ValidationError
 from .models import (
     ClusterAnalysis,
     ClusterCandidate,
+    ContextApprovalBatch,
+    ContextCandidate,
     EnrichedItem,
     EnrichmentBatch,
     EnrichmentRequestItem,
@@ -27,6 +29,7 @@ DEEPSEEK_MODEL_PREFIX = "deepseek/deepseek-v4-flash-0731"
 DEFAULT_MODEL = f"{DEEPSEEK_MODEL_PREFIX}:nitro"
 DEFAULT_SEMANTIC_MODEL = DEFAULT_MODEL
 CACHE_VERSION = "v5"
+MAX_APPROVAL_ATTEMPTS = 3
 RETRY_TEMPERATURES = (0.2, 0.1, 0.3, 0.0, 0.25)
 RETRY_INSTRUCTIONS = (
     "Retry independently. Re-read the sentence before choosing the target's exact sense.",
@@ -104,11 +107,9 @@ definition that covers both old examples and the new occurrence without admittin
 
 Give 1-4 precise Russian translations of the highlighted span. replacement_ru must translate only
 that span, preserving its contextual case, number, tense, and role without absorbing neighboring
-words. Create one self-contained, realistic B2+ academic sentence using a natural form of the same
-lemma in a different syntax or collocation. Put that exact form in generated_surface.
-generated_translation_ru follows the same span-only rule. Never invent sources or statistics.
+words. Never invent sources or statistics.
 
-Build source_distractors and generated_distractors independently in two stages. First brainstorm:
+Build source_distractors in two stages. First brainstorm:
 - substitutes_en: as many defensible words or compact phrases as the schema allows that can replace
   only the highlighted surface while all surrounding text stays frozen. The result must read as a
   natural, meaningful sentence; a meaning shift or slight style mismatch is allowed.
@@ -124,6 +125,30 @@ different verb, preposition, determiner, or word order. Never repair the sentenc
 different construction. Exclude the target and spelling/case variants, Russian words,
 explanations, and sentences. Valid lists may be empty; quality beats count.
 Return only JSON matching the schema.
+"""
+
+CONTEXT_APPROVAL_SYSTEM_PROMPT = """\
+You decide which real sentences from the user's articles may be added as extra learning contexts
+to an existing English vocabulary card.
+
+The card trains ONE lexical sense of the word family:
+- leader: {leader}
+- meaning: {definition}
+- Russian translations: {translations_ru}
+- already known contexts: {known_contexts}
+
+Each candidate sentence contains the surface form in angle brackets, e.g. <impaired>. Surfaces
+are found only by spelling/word-formation similarity, NOT by meaning, so any of them may be a
+different word, a homonym, a different sense, or a proper noun.
+
+Set suitable=true only when ALL of these hold:
+1. The surface in THIS sentence expresses exactly the sense the card trains. A different sense of
+   the same spelling, a homonym, a fixed expression with its own meaning, or a proper noun is NOT
+   suitable, even inside a topically related sentence.
+2. The sentence is natural, self-contained, and understandable without extra context.
+3. The sentence would genuinely help an English learner recall this exact meaning.
+
+Return one object with properties id and suitable for EVERY candidate id, exactly once.
 """
 
 
@@ -384,17 +409,89 @@ def analyse_cluster_assignment(
     analysis = ClusterAnalysis.model_validate_json(_strip_json_code_fence(content))
     if analysis.cluster_id not in allowed_cluster_ids:
         raise RuntimeError("OpenRouter selected a cluster outside the candidate set.")
-    if not _contains_exact_surface(
-        analysis.generated_sentence,
-        analysis.generated_surface,
-    ):
-        raise RuntimeError("Generated surface is absent from generated sentence.")
     _validate_recall_distractors(target, analysis.source_distractors)
-    _validate_recall_distractors(
-        analysis.generated_surface,
-        analysis.generated_distractors,
-    )
     return analysis
+
+
+def approve_context_candidates(
+    *,
+    leader: str,
+    definition: str,
+    translations: list[str],
+    known_contexts: list[str],
+    candidates: list[ContextCandidate],
+    api_key: str,
+    model: str = DEFAULT_SEMANTIC_MODEL,
+) -> set[str]:
+    """Ask the model which real article sentences fit the card's exact sense."""
+    if not candidates:
+        return set()
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": CONTEXT_APPROVAL_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "leader": leader,
+                        "definition": definition,
+                        "translations_ru": translations,
+                        "known_contexts": known_contexts,
+                        "candidates": [
+                            {
+                                "id": item.id,
+                                "surface": item.surface,
+                                "sentence": item.sentence,
+                            }
+                            for item in candidates
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        "max_tokens": 4000,
+        "stream": False,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "article_context_approval",
+                "strict": True,
+                "schema": ContextApprovalBatch.model_json_schema(),
+            },
+        },
+        "provider": {"require_parameters": True},
+    }
+    _apply_model_generation_config(payload, model=model, temperature=0.1)
+    requested_ids = {item.id for item in candidates}
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_APPROVAL_ATTEMPTS + 1):
+        try:
+            result = _post_json(payload, api_key)
+            content = result["choices"][0]["message"]["content"]
+            if not isinstance(content, str):
+                raise RuntimeError("OpenRouter returned non-text context approval.")
+            batch = ContextApprovalBatch.model_validate_json(
+                _strip_json_code_fence(content)
+            )
+            by_id = {item.id: item.suitable for item in batch.items}
+            if len(by_id) != len(batch.items):
+                raise RuntimeError("OpenRouter returned duplicate candidate ids.")
+            if set(by_id) != requested_ids:
+                raise RuntimeError(
+                    "OpenRouter changed the candidate id set: "
+                    f"expected {sorted(requested_ids)}, got {sorted(by_id)}"
+                )
+            return {item_id for item_id, suitable in by_id.items() if suitable}
+        except (KeyError, TypeError, ValueError, RuntimeError, OSError) as exc:
+            last_error = exc
+            if attempt < MAX_APPROVAL_ATTEMPTS:
+                time.sleep(2 ** (attempt - 1))
+    raise RuntimeError(
+        f"OpenRouter context approval failed after {MAX_APPROVAL_ATTEMPTS} attempts: "
+        f"{last_error}"
+    ) from last_error
 
 
 def _validate_recall_distractors(
@@ -407,14 +504,6 @@ def _validate_recall_distractors(
     values = distractors.valid_substitutes_en + distractors.valid_related_en
     if any(" ".join(value.casefold().split()) == normalized_target for value in values):
         raise RuntimeError("Recall distractors must not contain the target itself.")
-
-
-def _contains_exact_surface(sentence: str, surface: str) -> bool:
-    return re.search(
-        rf"(?<!\w){re.escape(surface)}(?!\w)",
-        sentence,
-        flags=re.IGNORECASE,
-    ) is not None
 
 
 def _strip_json_code_fence(content: str) -> str:

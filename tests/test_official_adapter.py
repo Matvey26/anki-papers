@@ -109,7 +109,7 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
             },
             {
                 "id": "b",
-                "source": "llm_generated",
+                "source": "user_pdf",
                 "target": "overcome",
                 "sentence": "Teams must overcome hidden assumptions.",
                 "replacement": (
@@ -150,10 +150,10 @@ def test_semantic_note_uses_separate_type_and_can_be_refreshed(tmp_path: Path) -
         "Teams must &lt;b&gt;преодолеть&lt;/b&gt; hidden assumptions."
         in recall.fields[0]
     )
-    assert "llm_generated" in recall.fields[0]
+    assert "user_pdf" in recall.fields[0]
     assert "Small teams &lt;b&gt;overcome" not in recall.fields[0]
     card["contexts"].append(
-        {"id": "c", "source": "llm_generated", "target": "Overcoming", "sentence": "Overcoming noise required repeated trials.", "replacement": "преодоление"}
+        {"id": "c", "source": "user_pdf", "target": "Overcoming", "sentence": "Overcoming noise required repeated trials.", "replacement": "преодоление"}
     )
     OfficialAnkiAdapter._update_semantic_note(collection, note, card, "meaning")
     assert "Overcoming" in note.fields[0]

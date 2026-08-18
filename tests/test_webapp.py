@@ -186,6 +186,196 @@ def test_uploaded_articles_add_meaning_only_context_without_highlight(
         assert "considerably &lt;b&gt;trail behind" not in rows[1]["Front"]
 
 
+def test_refresh_article_contexts_uses_llm_approval_for_variants(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    app = make_app(tmp_path)
+    client = app.test_client()
+    dashboard = identify(client)
+    client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(dashboard), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+    )
+    database_path = tmp_path / "app.sqlite3"
+    with sqlite3.connect(database_path) as database:
+        document_id = database.execute("SELECT id FROM documents").fetchone()[0]
+        source_context = {
+            "id": "source-highlight",
+            "source": "user_pdf",
+            "target": "impair",
+            "sentence": "Chronic stress can impair memory consolidation.",
+            "replacement": "ухудшать",
+            "lemma": "impair",
+            "family_key": "impair",
+            "part_of_speech": "verb",
+            "sense_definition_en": "to weaken or damage something",
+        }
+        database.execute(
+            """INSERT INTO cards
+               (id, user_id, document_id, target, target_normalized, sentence, page,
+                translations_json, replacement, alternatives_json, lemma, family_key,
+                part_of_speech, sense_definition_en, contexts_json, semantic_version, created_at)
+               VALUES ('impair-card', 1, ?, 'impair', 'impair', ?, 1,
+                       '["ухудшать"]', 'ухудшают', '[]', 'impair', 'impair',
+                       'verb', 'to weaken or damage something', ?, 1, '2026-01-01')""",
+            (document_id, source_context["sentence"], json.dumps([source_context])),
+        )
+        database.commit()
+
+    article = (
+        "Chronic stress can impair memory consolidation. "
+        "An impaired immune response follows quickly in stressed animals. "
+        "Обычный Russian sentence to block the variant behind it."
+    )
+    monkeypatch.setattr(
+        webapp_module,
+        "extract_document_text",
+        lambda _path: DocumentText(
+            text=article,
+            page_ranges=[(0, len(article))],
+            hard_page_starts=[False],
+        ),
+    )
+    sent_ids = []
+
+    def fake_approve(*, candidates, **_kwargs):
+        sent_ids.append([(item.id, item.surface) for item in candidates])
+        return {item.id for item in candidates if item.surface == "impaired"}
+
+    monkeypatch.setattr(webapp_module, "approve_context_candidates", fake_approve)
+    with sqlite3.connect(database_path) as database:
+        database.row_factory = sqlite3.Row
+        changed = webapp_module.refresh_article_contexts(database, 1)
+        database.commit()
+        card = database.execute(
+            "SELECT contexts_json FROM cards WHERE id = 'impair-card'"
+        ).fetchone()
+        contexts = json.loads(card["contexts_json"])
+
+    assert changed == {"impair-card"}
+    assert sent_ids[0][0][1] == "impaired"
+    assert [item["target"] for item in contexts[1:]] == ["impaired"]
+    assert "immune response" in contexts[1]["sentence"]
+
+
+def test_refresh_article_contexts_falls_back_to_lexical_selection_on_approval_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    app = make_app(tmp_path)
+    client = app.test_client()
+    dashboard = identify(client)
+    client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(dashboard), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+    )
+    database_path = tmp_path / "app.sqlite3"
+    with sqlite3.connect(database_path) as database:
+        document_id = database.execute("SELECT id FROM documents").fetchone()[0]
+        source_context = {
+            "id": "source-highlight",
+            "source": "user_pdf",
+            "target": "impair",
+            "sentence": "Chronic stress can impair memory consolidation.",
+            "replacement": "ухудшать",
+            "lemma": "impair",
+            "family_key": "impair",
+            "part_of_speech": "verb",
+            "sense_definition_en": "to weaken or damage something",
+        }
+        database.execute(
+            """INSERT INTO cards
+               (id, user_id, document_id, target, target_normalized, sentence, page,
+                translations_json, replacement, alternatives_json, lemma, family_key,
+                part_of_speech, sense_definition_en, contexts_json, semantic_version, created_at)
+               VALUES ('impair-card', 1, ?, 'impair', 'impair', ?, 1,
+                       '["ухудшать"]', 'ухудшают', '[]', 'impair', 'impair',
+                       'verb', 'to weaken or damage something', ?, 1, '2026-01-01')""",
+            (document_id, source_context["sentence"], json.dumps([source_context])),
+        )
+        database.commit()
+
+    article = "Chronic stress can impair memory consolidation drastically."
+    monkeypatch.setattr(
+        webapp_module,
+        "extract_document_text",
+        lambda _path: DocumentText(
+            text=article,
+            page_ranges=[(0, len(article))],
+            hard_page_starts=[False],
+        ),
+    )
+
+    def failing_approve(**_kwargs):
+        raise OSError("provider unavailable")
+
+    monkeypatch.setattr(webapp_module, "approve_context_candidates", failing_approve)
+    with sqlite3.connect(database_path) as database:
+        database.row_factory = sqlite3.Row
+        changed = webapp_module.refresh_article_contexts(database, 1)
+        database.commit()
+        card = database.execute(
+            "SELECT contexts_json FROM cards WHERE id = 'impair-card'"
+        ).fetchone()
+        contexts = json.loads(card["contexts_json"])
+
+    assert changed == {"impair-card"}
+    assert contexts[1]["source"] == "article_context"
+    assert "drastically" in contexts[1]["sentence"]
+
+
+def test_purge_llm_generated_contexts_removes_legacy_synthetic_contexts(
+    tmp_path: Path,
+) -> None:
+    app = make_app(tmp_path)
+    identify(app.test_client())
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        database.execute(
+            """INSERT INTO documents
+               (id, user_id, kind, name, stored_path, page_count, size, created_at)
+               VALUES ('doc', 1, 'pdf', 'paper.pdf', '/tmp/paper.pdf', 1, 1, '2026-01-01')"""
+        )
+        real_context = {
+            "id": "source:highlight",
+            "source": "user_pdf",
+            "target": "impair",
+            "sentence": "An impaired immune response follows quickly.",
+        }
+        synthetic_context = {
+            "id": "generated:legacy",
+            "source": "llm_generated",
+            "target": "impaired",
+            "sentence": "Even mild radiation can impair memory formation over time.",
+        }
+        database.execute(
+            """INSERT INTO cards
+               (id, user_id, document_id, target, target_normalized, sentence, page,
+                translations_json, replacement, alternatives_json, lemma, family_key,
+                part_of_speech, sense_definition_en, contexts_json, semantic_version, created_at)
+               VALUES ('legacy-card', 1, 'doc', 'impair', 'impair', 'Chronic stress can impair memory.', 1,
+                       '["ухудшать"]', 'ухудшают', '[]', 'impair', 'impair',
+                       'verb', 'to weaken or damage something', ?, 1, '2026-01-01')""",
+            (json.dumps([real_context, synthetic_context]),),
+        )
+        database.commit()
+
+    make_app(tmp_path)
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        database.row_factory = sqlite3.Row
+        contexts = json.loads(
+            database.execute(
+                "SELECT contexts_json FROM cards WHERE id = 'legacy-card'"
+            ).fetchone()[0]
+        )
+
+    assert [item["source"] for item in contexts] == ["user_pdf"]
+
+
 def test_article_context_mining_runs_after_ready_commit(
     tmp_path: Path,
     monkeypatch,
@@ -306,20 +496,11 @@ def install_fake_enrichment(monkeypatch) -> None:
             cluster_definition_en="reliable and resilient in operation",
             translations_ru=["надёжный", "устойчивый"],
             replacement_ru="надёжный",
-            generated_sentence="The method remained robust under a substantial distribution shift.",
-            generated_surface="robust",
-            generated_translation_ru="устойчивым",
             source_distractors={
                 "substitutes_en": ["strong", "durable"],
                 "related_en": ["strength", "resilience"],
                 "valid_substitutes_en": ["strong"],
                 "valid_related_en": ["strength"],
-            },
-            generated_distractors={
-                "substitutes_en": ["reliable"],
-                "related_en": ["reliability"],
-                "valid_substitutes_en": ["reliable"],
-                "valid_related_en": ["reliability"],
             },
         )
 
@@ -582,7 +763,7 @@ def test_same_word_in_same_sense_merges_contexts(
         ).fetchone()
         assert card[1] == 1
         contexts = json.loads(card[0])
-        assert len(contexts) == 4
+        assert len(contexts) == 2
         assert contexts[0]["substitutes_en"] == ["strong", "durable"]
         assert contexts[0]["related_en"] == ["strength", "resilience"]
         assert contexts[0]["valid_substitutes_en"] == ["strong"]
@@ -621,11 +802,7 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
             cluster_definition_en="obtain or gain possession of something",
             translations_ru=["приобрести", "получить"],
             replacement_ru="приобрела",
-            generated_sentence="The laboratory acquired a more precise sensor.",
-            generated_surface="acquired",
-            generated_translation_ru="приобрела",
             source_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
-            generated_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
         ),
         "acquisition": ClusterAnalysis(
             cluster_id="new_cluster",
@@ -634,11 +811,7 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
             cluster_definition_en="the act or process of obtaining something",
             translations_ru=["приобретение", "получение"],
             replacement_ru="получение",
-            generated_sentence="Data acquisition requires careful calibration.",
-            generated_surface="acquisition",
-            generated_translation_ru="сбор",
             source_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
-            generated_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
         ),
         "recognize-identify": ClusterAnalysis(
             cluster_id="new_cluster",
@@ -647,11 +820,7 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
             cluster_definition_en="identify something from previous knowledge",
             translations_ru=["распознать", "узнать"],
             replacement_ru="распознать",
-            generated_sentence="The model can recognize partially hidden symbols.",
-            generated_surface="recognize",
-            generated_translation_ru="распознавать",
             source_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
-            generated_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
         ),
         "recognize-admit": ClusterAnalysis(
             cluster_id="new_cluster",
@@ -660,11 +829,7 @@ def test_lexical_family_merges_derivations_but_splits_polysemy(
             cluster_definition_en="admit or acknowledge that something is true",
             translations_ru=["признать", "признавать"],
             replacement_ru="признать",
-            generated_sentence="The review must recognize the study's limitations.",
-            generated_surface="recognize",
-            generated_translation_ru="признать",
             source_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
-            generated_distractors={"substitutes_en": [], "related_en": [], "valid_substitutes_en": [], "valid_related_en": []},
         ),
     }
 
