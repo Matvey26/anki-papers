@@ -3,10 +3,12 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import sqlite3
 import time
 import uuid
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,10 @@ from test_webapp import csrf, identify, install_fake_enrichment, make_app, pdf_b
 import articles_to_anki.rebuild as rebuild_module
 import articles_to_anki.webapp as webapp_module
 from articles_to_anki.models import ClusterAnalysis, ClusterCandidate, RecallDistractors
+
+_REBUILD_DECK_NAME_RE = re.compile(
+    r"^Anki Papers \(пересборка\) \d{4}-\d{2}-\d{2} \d{2}:\d{2}$"
+)
 
 
 def _legacy_collection_bytes(
@@ -251,7 +257,7 @@ def test_rebuild_carries_schedule_from_old_deck(tmp_path: Path, monkeypatch) -> 
         for row in rows:
             assert f"anki_papers::{site_id}" in row[0]
         deck = json.loads(database.execute("SELECT decks FROM col").fetchone()[0])
-        assert deck["200"]["name"] == "Anki Papers (пересборка)"
+        assert _REBUILD_DECK_NAME_RE.match(deck["200"]["name"])
         notes = database.execute("SELECT mid, flds FROM notes").fetchall()
         assert all(mid == 100 for mid, _ in notes)
         assert all("\x1f" in fields and fields.strip() for _, fields in notes)
@@ -261,6 +267,11 @@ def test_rebuild_carries_schedule_from_old_deck(tmp_path: Path, monkeypatch) -> 
 
 def test_rebuild_fresh_without_old_deck_is_deterministic(tmp_path: Path, monkeypatch) -> None:
     install_fake_enrichment(monkeypatch)
+    monkeypatch.setattr(
+        rebuild_module,
+        "_deck_name",
+        lambda value: "Anki Papers (пересборка) 2026-01-01 00:00",
+    )
     app = make_app(tmp_path)
     client = app.test_client()
     response = identify(client)
@@ -480,7 +491,7 @@ def test_rebuild_apkg_imports_in_anki_with_schedule(tmp_path: Path, monkeypatch)
             )
         )
         assert any(
-            deck.name == "Anki Papers (пересборка)"
+            _REBUILD_DECK_NAME_RE.match(deck.name)
             for deck in collection.decks.all_names_and_ids()
         )
         cards = [collection.get_card(card_id) for card_id in collection.find_cards("")]
@@ -633,6 +644,11 @@ def test_collect_seeds_accepts_all_highlight_sources(tmp_path: Path) -> None:
     assert seeds["h1"]["cluster_id"] == "new_cluster"
     assert seeds["h1"]["leader"] == "robust"
     assert seeds_old_cards == {"h1": "card1", "h2": "card1"}
+
+
+def test_deck_name_carries_minute_timestamp() -> None:
+    name = rebuild_module._deck_name(datetime(2026, 8, 18, 22, 50, 37, tzinfo=UTC))
+    assert name == "Anki Papers (пересборка) 2026-08-18 22:50"
 
 
 def test_rebuild_merges_clusters_with_colliding_ids(tmp_path: Path, monkeypatch) -> None:
@@ -836,8 +852,8 @@ def test_rebuild_accepts_modern_unicase_collection(tmp_path: Path, monkeypatch) 
         }
         assert by_direction["meaning"][1:] == (2, 2, 3333, 25, 2500, 6, 1)
         assert by_direction["recall"][1:] == (3, 1, 4444, 7, 2500, 3, 0)
-        assert database.execute(
-            "SELECT name FROM decks WHERE id = 1"
-        ).fetchone()[0] == "Anki Papers (пересборка)"
+        assert _REBUILD_DECK_NAME_RE.match(
+            database.execute("SELECT name FROM decks WHERE id = 1").fetchone()[0]
+        )
     finally:
         database.close()

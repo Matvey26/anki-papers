@@ -12,6 +12,7 @@ import time
 import unicodedata
 import zipfile
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -680,14 +681,25 @@ def _rebuild_deck_id(connection: sqlite3.Connection) -> int:
         raise RuntimeError("Rebuild source contains no decks")
 
 
-def _rename_deck(connection: sqlite3.Connection, deck_id: int) -> None:
+def _deck_name(value: datetime) -> str:
+    """Deck name for one rebuild, labelled with its minute of generation.
+
+    The minute timestamp keeps successive rebuilds distinguishable in Anki
+    instead of collecting under one permanently named deck.
+    """
+    return f"{REBUILD_DECK_NAME} {value:%Y-%m-%d %H:%M}"
+
+
+def _rename_deck(
+    connection: sqlite3.Connection, deck_id: int, deck_name: str
+) -> None:
     try:
         row = connection.execute("SELECT decks FROM col LIMIT 1").fetchone()
         decks = json.loads(row[0]) if row else None
     except (sqlite3.OperationalError, TypeError, ValueError, json.JSONDecodeError):
         decks = None
     if decks:
-        decks[str(deck_id)]["name"] = REBUILD_DECK_NAME
+        decks[str(deck_id)]["name"] = deck_name
         connection.execute(
             "UPDATE col SET decks = ?",
             (json.dumps(decks, ensure_ascii=False),),
@@ -695,7 +707,7 @@ def _rename_deck(connection: sqlite3.Connection, deck_id: int) -> None:
         return
     try:
         connection.execute(
-            "UPDATE decks SET name = ? WHERE id = ?", (REBUILD_DECK_NAME, deck_id)
+            "UPDATE decks SET name = ? WHERE id = ?", (deck_name, deck_id)
         )
     except sqlite3.OperationalError:
         raise RuntimeError("Rebuild source contains no decks")
@@ -889,6 +901,7 @@ def build_rebuilt_deck_apkg(
         raise RuntimeError("Нет карточек для пересобранной колоды")
 
     now_seconds = int(time.time())
+    deck_name = _deck_name(datetime.fromtimestamp(now_seconds, tz=UTC))
     with tempfile.TemporaryDirectory(prefix="anki-papers-rebuild-") as temporary_name:
         temporary = Path(temporary_name)
         collection_path, is_compressed = _open_old_collection(source_path, temporary)
@@ -896,7 +909,7 @@ def build_rebuilt_deck_apkg(
         try:
             schedules = _extract_schedules(connection)
             deck_id = _rebuild_deck_id(connection)
-            _rename_deck(connection, deck_id)
+            _rename_deck(connection, deck_id, deck_name)
             note_type_id = _rebuild_note_type_id(connection)
             _empty_collection(connection)
             next_due = 1
