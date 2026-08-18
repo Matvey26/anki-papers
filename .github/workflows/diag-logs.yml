@@ -77,6 +77,6 @@ jobs:
           database.close()
           PY
           echo "=== journal: rebuild window ==="
-          run_root journalctl -u anki-papers-web --since "2026-08-18 19:15" --no-pager | grep -E "ERROR|Traceback|Rebuild|collation|Deck rebuild|RuntimeError|Decrypt|mirror" | tail -120
+          run_root journalctl -u anki-papers-web --since "2026-08-18 19:15" --no-pager | tail -250
           unset DIAG_PASSWORD_B64
           REMOTE
