@@ -106,6 +106,21 @@
 </section>
 
 <section class="settings-section">
+  <div class="section-heading"><div><span class="eyebrow">Колода</span><h2>Пересобрать колоду</h2></div></div>
+  <div class="setup-card">
+    <div>
+      <h3>Собрать всё заново одним файлом</h3>
+      <p>Все сохранённые слова пройдут текущий конвейер (кластеры, контексты, переводы), а результат будет упакован в свежий APKG. Существующие карточки не изменяются — просто импортируйте файл в Anki и решите, какую колоду оставить. LLM-вызовы повторно не оплачиваются: результаты кешируются.</p>
+    </div>
+    <form class="settings-form rebuild-form" action="{{ url_for('export_rebuild_apkg') }}" method="post" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>Старая колода (APKG), чтобы перенести прогресс обучения <span class="field-help">Если не указана, используется зеркало AnkiWeb, иначе прогресс не переносится</span><input type="file" name="old_deck" accept=".apkg"></label>
+      <button class="primary">Собрать и скачать</button>
+    </form>
+  </div>
+</section>
+
+<section class="settings-section">
   <details class="settings-disclosure security-settings">
     <summary>Пароль Anki Papers</summary>
     <div class="disclosure-content">

@@ -44,6 +44,7 @@ articles_to_anki = [
   "static/*.js",
   "static/vendor/pdfjs/*.mjs",
   "static/vendor/pdfjs/LICENSE",
+  "rebuild_template.json",
 ]
 
 [tool.pytest.ini_options]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import functools
+import hashlib
 import html
 import io
 import json
@@ -70,6 +71,7 @@ from .extract import (
     find_variant_article_contexts,
 )
 from .models import (
+    ClusterAnalysis,
     ClusterCandidate,
     ClusterExample,
     ContextCandidate,
@@ -77,7 +79,9 @@ from .models import (
 )
 from .quick_dictionary import StarDictDictionary
 from .security import (
+    EncryptedValue,
     claim_token_digest,
+    decrypt_value,
     encrypt_value,
     hash_password,
     load_credential_keys,
@@ -1064,6 +1068,57 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             content,
             mimetype="application/octet-stream",
             headers={"Content-Disposition": f'attachment; filename="{safe_download_name(stem)}-updated.apkg"'},
+        )
+
+    @app.post("/export/rebuild")
+    @login_required
+    def export_rebuild_apkg() -> Response:
+        require_csrf()
+        from .rebuild import build_rebuilt_deck_apkg
+
+        old_deck = request.files.get("old_deck")
+        with tempfile.TemporaryDirectory(prefix="anki-papers-rebuild-") as temporary_name:
+            temporary = Path(temporary_name)
+            source_path: Path | None = None
+            if old_deck is not None and old_deck.filename:
+                head = old_deck.stream.read(5)
+                old_deck.stream.seek(0)
+                if not head.startswith(b"PK"):
+                    flash("Старая колода должна быть файлом APKG.", "error")
+                    return redirect(url_for("settings"))
+                source_path = temporary / "old-deck.apkg"
+                old_deck.save(source_path)
+            database = get_database()
+            user_id = session["user_id"]
+            try:
+                if source_path is None:
+                    mirror = decrypt_mirror_collection(database, user_id)
+                    if mirror is not None:
+                        mirror_path = temporary / "mirror-collection.anki2"
+                        mirror_path.write_bytes(mirror)
+                        source_path = mirror_path
+                content = build_rebuilt_deck_apkg(
+                    database,
+                    user_id,
+                    data_dir=Path(app.config["DATA_DIR"]),
+                    source_path=source_path,
+                )
+            except Exception:
+                app.logger.exception("Deck rebuild failed")
+                flash(
+                    "Не удалось пересобрать колоду. Попробуйте загрузить файл APKG "
+                    "старой колоды вручную.",
+                    "error",
+                )
+                return redirect(url_for("settings"))
+        return Response(
+            content,
+            mimetype="application/octet-stream",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="anki-papers-rebuild-{datetime.now(UTC).date()}.apkg"'
+                )
+            },
         )
 
     def save_document(upload: Any, kind: str) -> str:
@@ -2095,11 +2150,192 @@ def _article_context_is_readable(sentence: str) -> bool:
     return True
 
 
+def _llm_cache_dir(data_dir: Path) -> Path:
+    return Path(data_dir) / "caches"
+
+
+def _read_cache_file(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_cache_file(path: Path, cache: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _candidate_cache_payload(candidate: Any) -> dict[str, Any]:
+    """Stable content of one cluster candidate for cache keys (model or dict)."""
+    cluster_id = getattr(candidate, "cluster_id", None)
+    leader = getattr(candidate, "leader", None)
+    examples = getattr(candidate, "examples", None)
+    if cluster_id is None and isinstance(candidate, dict):
+        cluster_id = candidate.get("cluster_id")
+        leader = candidate.get("leader")
+        examples = candidate.get("examples")
+    example_payload = []
+    for item in examples or []:
+        highlight = getattr(item, "highlight", None)
+        context = getattr(item, "context", None)
+        if highlight is None and isinstance(item, dict):
+            highlight = item.get("highlight")
+            context = item.get("context")
+        example_payload.append(
+            {"highlight": str(highlight or ""), "context": str(context or "")}
+        )
+    return {"cluster_id": str(cluster_id or ""), "leader": str(leader or ""), "examples": example_payload}
+
+
+def cluster_analysis_cached(
+    cache_dir: Path,
+    user_id: int,
+    *,
+    model: str,
+    target: str,
+    normalized_target: str,
+    sentence: str,
+    candidates: list[Any],
+    api_key: str | None,
+) -> tuple[ClusterAnalysis, bool]:
+    """Analyse one highlight into a semantic cluster, reusing cached results.
+
+    The cache is keyed by the exact model inputs, so repeated enrichments and
+    deck rebuilds never pay for the same LLM call twice. Returns the analysis
+    and whether it came from the cache.
+    """
+    key_payload = json.dumps(
+        {
+            "model": model,
+            "target": target,
+            "normalized_target": normalized_target,
+            "sentence": sentence,
+            "candidates": [
+                _candidate_cache_payload(candidate) for candidate in candidates
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    key = hashlib.sha256(key_payload.encode("utf-8")).hexdigest()
+    path = cache_dir / f"cluster-analysis-{user_id}.json"
+    cache = _read_cache_file(path)
+    cached = cache.get(key)
+    if cached is not None:
+        try:
+            return ClusterAnalysis.model_validate(cached), True
+        except Exception:
+            pass
+    if not api_key:
+        raise MissingApiKeyError
+    analysis = analyse_cluster_assignment(
+        target,
+        normalized_target,
+        sentence,
+        candidates,
+        api_key=api_key,
+        model=model,
+    )
+    cache = _read_cache_file(path)
+    cache[key] = analysis.model_dump()
+    _write_cache_file(path, cache)
+    return analysis, False
+
+
+def context_approval_cached(
+    cache_dir: Path,
+    user_id: int,
+    *,
+    model: str,
+    leader: str,
+    definition: str,
+    translations: list[str],
+    known_contexts: list[str],
+    candidates: list[ContextCandidate],
+    api_key: str | None,
+) -> set[str] | None:
+    """Approve mined article contexts, reusing cached decisions by content."""
+    key_payload = json.dumps(
+        {
+            "model": model,
+            "leader": leader,
+            "definition": definition,
+            "translations": translations,
+            "known_contexts": known_contexts,
+            "candidates": [
+                {"id": item.id, "surface": item.surface, "sentence": item.sentence}
+                for item in candidates
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    key = hashlib.sha256(key_payload.encode("utf-8")).hexdigest()
+    path = cache_dir / f"context-approval-{user_id}.json"
+    cache = _read_cache_file(path)
+    cached = cache.get(key)
+    if cached is not None:
+        return set(cached)
+    if not api_key:
+        return None
+    approved = approve_context_candidates(
+        leader=leader,
+        definition=definition,
+        translations=translations,
+        known_contexts=known_contexts,
+        candidates=candidates,
+        api_key=api_key,
+        model=model,
+    )
+    cache = _read_cache_file(path)
+    cache[key] = sorted(approved)
+    _write_cache_file(path, cache)
+    return approved
+
+
+def decrypt_mirror_collection(
+    database: sqlite3.Connection, user_id: int
+) -> bytes | None:
+    """Return the stored AnkiWeb collection mirror, or None when unavailable."""
+    account = database.execute(
+        "SELECT mirror_path, mirror_nonce, mirror_key_version FROM anki_accounts WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    if not account or not account["mirror_path"]:
+        return None
+    mirror = Path(account["mirror_path"])
+    if not mirror.is_file():
+        return None
+    try:
+        return decrypt_value(
+            EncryptedValue(
+                mirror.read_bytes(),
+                account["mirror_nonce"],
+                int(account["mirror_key_version"]),
+            ),
+            user_id=user_id,
+            field="collection_mirror",
+            keys=load_credential_keys(),
+        )
+    except Exception:
+        LOGGER.warning("Could not decrypt collection mirror for user %s", user_id)
+        return None
+
+
 def refresh_article_contexts(
     database: sqlite3.Connection,
     user_id: int,
     *,
     card_ids: set[str] | None = None,
+    data_dir: Path | None = None,
 ) -> set[str]:
     """Mine uploaded PDFs for extra meaning-only contexts.
 
@@ -2211,27 +2447,39 @@ def refresh_article_contexts(
         approved: set[str] | None = None
         if api_key:
             approval_candidates = candidates[:CONTEXT_APPROVAL_CANDIDATE_LIMIT]
+            approval_request = {
+                "leader": str(card["lemma"] or card["family_key"] or card["target"]),
+                "definition": str(card["sense_definition_en"] or ""),
+                "translations": json.loads(card["translations_json"]),
+                "known_contexts": [
+                    " ".join(str(item.get("sentence") or "").split())
+                    for item in retained[:MAX_CONTEXT_APPROVAL_EXAMPLES]
+                    if item.get("sentence")
+                ],
+                "candidates": [
+                    ContextCandidate(
+                        id=str(item["id"]),
+                        surface=str(item["target"]),
+                        sentence=str(item["sentence"]),
+                    )
+                    for item in approval_candidates
+                ],
+            }
             try:
-                approved = approve_context_candidates(
-                    leader=str(card["lemma"] or card["family_key"] or card["target"]),
-                    definition=str(card["sense_definition_en"] or ""),
-                    translations=json.loads(card["translations_json"]),
-                    known_contexts=[
-                        " ".join(str(item.get("sentence") or "").split())
-                        for item in retained[:MAX_CONTEXT_APPROVAL_EXAMPLES]
-                        if item.get("sentence")
-                    ],
-                    candidates=[
-                        ContextCandidate(
-                            id=str(item["id"]),
-                            surface=str(item["target"]),
-                            sentence=str(item["sentence"]),
-                        )
-                        for item in approval_candidates
-                    ],
-                    api_key=api_key,
-                    model=model,
-                )
+                if data_dir is not None:
+                    approved = context_approval_cached(
+                        _llm_cache_dir(data_dir),
+                        user_id,
+                        api_key=api_key,
+                        model=model,
+                        **approval_request,
+                    )
+                else:
+                    approved = approve_context_candidates(
+                        api_key=api_key,
+                        model=model,
+                        **approval_request,
+                    )
             except Exception:
                 LOGGER.warning(
                     "Article-context approval failed for card %s; "
@@ -2434,13 +2682,15 @@ def enrich_highlight_row(
     model = os.environ.get("OPENROUTER_SEMANTIC_MODEL", DEFAULT_SEMANTIC_MODEL)
     normalized_highlight = normalize_selected_text(str(row["target"]))
     candidates = find_cluster_candidates(database, user_id, normalized_highlight)
-    analysis = analyse_cluster_assignment(
-        str(row["target"]),
-        normalized_highlight,
-        str(row["sentence"]),
-        candidates,
-        api_key=api_key,
+    analysis, _cached = cluster_analysis_cached(
+        _llm_cache_dir(Path(app.config["DATA_DIR"])),
+        user_id,
         model=model,
+        target=str(row["target"]),
+        normalized_target=normalized_highlight,
+        sentence=str(row["sentence"]),
+        candidates=candidates,
+        api_key=api_key,
     )
     candidates_by_id = {item.cluster_id: item for item in candidates}
     selected_candidate = candidates_by_id.get(analysis.cluster_id)
@@ -2551,6 +2801,7 @@ def enrich_highlight_row(
                 database,
                 user_id,
                 card_ids={str(existing["id"])},
+                data_dir=Path(app.config["DATA_DIR"]),
             )
             if changed and account is not None and account["state"] in {
                 "connected", "syncing", "error"
@@ -2864,7 +3115,9 @@ def process_document_highlights(app: Flask, document_id: str, user_id: int) -> N
                 app.logger.exception("Imported highlight enrichment failed")
                 delete_highlight_rows(database, [row], user_id=user_id)
 
-        article_context_cards = refresh_article_contexts(database, user_id)
+        article_context_cards = refresh_article_contexts(
+            database, user_id, data_dir=Path(app.config["DATA_DIR"])
+        )
         if article_context_cards:
             account = database.execute(
                 "SELECT state FROM anki_accounts WHERE user_id = ?", (user_id,)
