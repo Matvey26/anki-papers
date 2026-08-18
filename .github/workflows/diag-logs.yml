@@ -17,9 +17,6 @@ jobs:
       - name: Fetch logs
         run: |
           set -euo pipefail
-          test -n "$SERVER_IP"
-          test -n "$SERVER_USER"
-          test -n "$SERVER_PASSWORD"
           export SSHPASS="$SERVER_PASSWORD"
           mkdir -p "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
@@ -34,6 +31,18 @@ jobs:
               printf '%s' "$DIAG_PASSWORD_B64" | base64 -d | sudo -S -p '' "$@"
             fi
           }
-          run_root journalctl -u anki-papers-web --since "2026-08-18 16:00" --no-pager 2>/dev/null | tail -400
+          echo "=== units ==="
+          run_root systemctl list-units --all --no-pager | grep -i anki || true
+          echo "=== service files ==="
+          ls "$HOME/anki-papers/deploy/" 2>/dev/null || true
+          cat "$HOME/anki-papers/deploy/anki-papers-web.service" 2>/dev/null || true
+          echo "=== journal web ==="
+          run_root journalctl -u anki-papers-web -n 300 --no-pager 2>&1 | tail -250 || true
+          echo "=== app dir ==="
+          ls -la "$HOME/anki-papers/" | head -30
+          ls -la "$HOME/anki-papers/data/" 2>/dev/null | head -20
+          find "$HOME/anki-papers" -maxdepth 2 -name "*.log" -o -maxdepth 2 -name "nohup.out" 2>/dev/null | head
+          echo "=== tail app.log ==="
+          tail -200 "$HOME/anki-papers/app.log" 2>/dev/null || true
           unset DIAG_PASSWORD_B64
           REMOTE
