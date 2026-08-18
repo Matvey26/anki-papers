@@ -565,6 +565,9 @@ def test_collect_seeds_accepts_all_highlight_sources(tmp_path: Path) -> None:
                 id TEXT PRIMARY KEY, user_id INTEGER, semantic_version INTEGER,
                 contexts_json TEXT
             );
+            CREATE TABLE card_highlights (
+                card_id TEXT, highlight_id TEXT, PRIMARY KEY(card_id, highlight_id)
+            );
             """
         )
         database.execute("INSERT INTO highlights VALUES ('h1', 1), ('h2', 1), ('other', 1)")
@@ -583,33 +586,45 @@ def test_collect_seeds_accepts_all_highlight_sources(tmp_path: Path) -> None:
             "valid_substitutes_en": [],
             "valid_related_en": [],
         }
+        pdf_context = {
+            "id": "h2",
+            "source": "pdf_import",
+            "target": "result",
+            "sentence": "A final result.",
+            "lemma": "result",
+            "part_of_speech": "noun",
+            "sense_definition_en": "outcome",
+            "translations": ["итог"],
+            "replacement": "итог",
+            "substitutes_en": [],
+            "related_en": [],
+            "valid_substitutes_en": [],
+            "valid_related_en": [],
+        }
+        article_context = {
+            "id": "article:1:ctx-0001",
+            "source": "article_context",
+            "target": "robust",
+            "sentence": "A robust result.",
+            "lemma": "robust",
+            "part_of_speech": "adjective",
+            "sense_definition_en": "definition",
+            "translations": ["надёжный"],
+            "replacement": "надёжный",
+            "substitutes_en": [],
+            "related_en": [],
+            "valid_substitutes_en": [],
+            "valid_related_en": [],
+        }
+        database.execute(
+            "INSERT INTO card_highlights VALUES ('card1', 'h1'), ('card1', 'h2')"
+        )
         database.execute(
             "INSERT INTO cards VALUES ('card1', 1, 1, ?)",
-            (
-                json.dumps(
-                    [
-                        context,
-                        {
-                            "id": "h2",
-                            "source": "pdf_import",
-                            "target": "result",
-                            "sentence": "A final result.",
-                            "lemma": "result",
-                            "part_of_speech": "noun",
-                            "sense_definition_en": "outcome",
-                            "translations": ["итог"],
-                            "replacement": "итог",
-                            "substitutes_en": [],
-                            "related_en": [],
-                            "valid_substitutes_en": [],
-                            "valid_related_en": [],
-                        },
-                        context,
-                    ]
-                ),
-            ),
+            (json.dumps([context, pdf_context, article_context]),),
         )
-        database.execute("INSERT INTO cards VALUES ('card2', 1, 0, ?)", ("[]",))
+        database.execute("INSERT INTO cards VALUES ('card2', 1, 1, ?)", ("[]",))
+        database.execute("INSERT INTO cards VALUES ('card3', 1, 0, ?)", ("[]",))
         database.row_factory = sqlite3.Row
         seeds, seeds_old_cards = rebuild_module._collect_seeds(database, 1)
     finally:
@@ -618,6 +633,78 @@ def test_collect_seeds_accepts_all_highlight_sources(tmp_path: Path) -> None:
     assert seeds["h1"]["cluster_id"] == "new_cluster"
     assert seeds["h1"]["leader"] == "robust"
     assert seeds_old_cards == {"h1": "card1", "h2": "card1"}
+
+
+def test_rebuild_merges_clusters_with_colliding_ids(tmp_path: Path, monkeypatch) -> None:
+    install_fake_enrichment(monkeypatch)
+
+    def constant_leader(target, normalized_target, sentence, candidates, **_kwargs):
+        return ClusterAnalysis(
+            cluster_id=candidates[0].cluster_id if candidates else "new_cluster",
+            leader="robust",
+            part_of_speech="adjective",
+            cluster_definition_en="reliable and resilient in operation",
+            translations_ru=["надёжный", "устойчивый"],
+            replacement_ru="надёжный",
+            source_distractors={
+                "substitutes_en": ["strong", "durable"],
+                "related_en": ["strength", "resilience"],
+                "valid_substitutes_en": ["strong"],
+                "valid_related_en": ["strength"],
+            },
+        )
+
+    monkeypatch.setattr(webapp_module, "analyse_cluster_assignment", constant_leader)
+    app = make_app(tmp_path)
+    client = app.test_client()
+    response = identify(client)
+
+    response = client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(response), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    sentence = "This is a robust result."
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        user_id = database.execute("SELECT id FROM users").fetchone()[0]
+        document_id = database.execute(
+            "SELECT id FROM documents WHERE kind = 'pdf' ORDER BY created_at LIMIT 1"
+        ).fetchone()[0]
+        for index, target in enumerate(("robust", "qqq")):
+            database.execute(
+                """INSERT INTO highlights
+                   (id, user_id, document_id, target, sentence, page, rects_json,
+                    translations_json, replacement, alternatives_json, status,
+                    error, source, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, '[]', '', '[]', 'ready', NULL,
+                           'reader', ?, ?)""",
+                (
+                    str(uuid.uuid4()),
+                    user_id,
+                    document_id,
+                    target,
+                    sentence,
+                    1,
+                    f"[{index}]",
+                    f"2026-08-18T1{index}:00:00",
+                    f"2026-08-18T1{index}:00:00",
+                ),
+            )
+        database.commit()
+
+    response = client.post(
+        "/export/rebuild",
+        data={"csrf_token": csrf(client.get("/settings"))},
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 200
+    database = _read_rebuilt(tmp_path, response)
+    try:
+        note_ids = [row[0] for row in database.execute("SELECT id FROM notes")]
+        assert len(note_ids) == len(set(note_ids)) == 2
+    finally:
+        database.close()
 
 
 def test_cluster_analysis_cached_coerces_dict_candidates(tmp_path: Path, monkeypatch) -> None:

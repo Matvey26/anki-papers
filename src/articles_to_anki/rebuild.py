@@ -189,9 +189,11 @@ def _collect_seeds(
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Reuse analyses already stored on semantic cards, keyed by highlight id.
 
-    Any context that names an existing highlight (whatever its source label,
-    including `user_pdf`, `reader` and `pdf_import`) is a seed, so highlights
-    that already went through the live pipeline never reach the model again.
+    Highlights are linked to their cards through `card_highlights`; a context
+    stored on that card (whatever its source label, including `user_pdf`,
+    `reader` and `pdf_import`) is a seed, so highlights that already went
+    through the live pipeline never reach the model again. Contexts whose id
+    directly names an existing highlight are also seeds.
     """
     seeds: dict[str, dict[str, Any]] = {}
     seeds_old_cards: dict[str, str] = {}
@@ -206,7 +208,21 @@ def _collect_seeds(
            WHERE user_id = ? AND semantic_version = 1""",
         (user_id,),
     ).fetchall()
+    highlight_to_card: dict[str, str] = {}
+    try:
+        highlight_to_card = {
+            str(row[0]): str(row[1])
+            for row in database.execute(
+                """SELECT highlight_id, card_id FROM card_highlights
+                   JOIN cards ON cards.id = card_id
+                   WHERE cards.user_id = ? AND cards.semantic_version = 1""",
+                (user_id,),
+            )
+        }
+    except sqlite3.OperationalError:
+        pass
     for row in rows:
+        card_id = str(row["id"])
         try:
             contexts = json.loads(row["contexts_json"] or "[]")
         except (ValueError, TypeError):
@@ -217,10 +233,15 @@ def _collect_seeds(
             if not isinstance(context, dict):
                 continue
             highlight_id = str(context.get("id") or "")
-            if highlight_id not in highlight_ids or highlight_id in seeds:
+            if highlight_id in seeds:
+                continue
+            if highlight_id in highlight_to_card:
+                if highlight_to_card[highlight_id] != card_id:
+                    continue
+            elif highlight_id not in highlight_ids:
                 continue
             seeds[highlight_id] = seed_analysis_from_context(context)
-            seeds_old_cards[highlight_id] = str(row["id"])
+            seeds_old_cards[highlight_id] = card_id
     return seeds, seeds_old_cards
 
 
@@ -477,21 +498,27 @@ def rebuild_semantic_deck(
         )
         if cluster is None:
             old_card_id = seeds_old_cards.get(entry.id)
-            cluster = RebuildCluster(
-                id=old_card_id or _cluster_id(leader, entry.sentence),
-                target=entry.target,
-                leader=leader,
-                sentence=entry.sentence,
-                part_of_speech=analysis.part_of_speech.casefold(),
-                sense_definition_en=analysis.cluster_definition_en,
-                translations=list(analysis.translations_ru),
-                contexts=[],
-                highlight_ids=[],
-                old_card_ids=[old_card_id] if old_card_id else [],
-                source_page=entry.page,
-                document_id=entry.document_id,
+            cluster_id = old_card_id or _cluster_id(leader, entry.sentence)
+            cluster = next(
+                (item for item in clusters if item.id == cluster_id),
+                None,
             )
-            clusters.append(cluster)
+            if cluster is None:
+                cluster = RebuildCluster(
+                    id=cluster_id,
+                    target=entry.target,
+                    leader=leader,
+                    sentence=entry.sentence,
+                    part_of_speech=analysis.part_of_speech.casefold(),
+                    sense_definition_en=analysis.cluster_definition_en,
+                    translations=list(analysis.translations_ru),
+                    contexts=[],
+                    highlight_ids=[],
+                    old_card_ids=[old_card_id] if old_card_id else [],
+                    source_page=entry.page,
+                    document_id=entry.document_id,
+                )
+                clusters.append(cluster)
         source_context = {
             "id": entry.id,
             "source": "user_pdf",
