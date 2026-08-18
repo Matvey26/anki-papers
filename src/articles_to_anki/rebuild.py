@@ -635,15 +635,71 @@ def _site_direction(tags: str) -> tuple[str, str]:
     return site_tag.removeprefix("anki_papers::"), direction
 
 
+def _deck_names(connection: sqlite3.Connection) -> dict[int, str]:
+    """Map deck id to name, covering both modern col JSON and legacy decks table."""
+    try:
+        row = connection.execute("SELECT decks FROM col LIMIT 1").fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if row is not None:
+        try:
+            decks = json.loads(row[0])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decks = None
+        if decks:
+            names: dict[int, str] = {}
+            for deck_id, deck in decks.items():
+                name = deck.get("name") if isinstance(deck, dict) else None
+                if isinstance(name, str):
+                    names[int(deck_id)] = name
+            if names:
+                return names
+    try:
+        return {
+            int(deck_id): str(name)
+            for deck_id, name in connection.execute("SELECT id, name FROM decks")
+        }
+    except (sqlite3.OperationalError, TypeError, ValueError):
+        return {}
+
+
+def _resolve_source_decks(
+    connection: sqlite3.Connection, selected_deck_id: int
+) -> set[int]:
+    """Expand a chosen deck to itself and all of its subdecks."""
+    names = _deck_names(connection)
+    selected_name = names.get(selected_deck_id)
+    if selected_name is None:
+        return {selected_deck_id}
+    prefix = f"{selected_name}::"
+    return {
+        deck_id
+        for deck_id, name in names.items()
+        if deck_id == selected_deck_id or name.startswith(prefix)
+    }
+
+
 def _extract_schedules(
     connection: sqlite3.Connection,
+    deck_ids: set[int] | None = None,
 ) -> dict[tuple[str, str], dict[str, int]]:
-    """Read card scheduling from the old deck, keyed by site card and direction."""
+    """Read card scheduling keyed by site card and direction.
+
+    When deck_ids is given, only cards inside those decks (and the decks they
+    expand to) contribute; otherwise every card in the collection qualifies.
+    """
     try:
+        parameters: list[int] = []
+        deck_filter = ""
+        if deck_ids:
+            placeholders = ",".join("?" for _ in deck_ids)
+            deck_filter = f" AND c.did IN ({placeholders})"
+            parameters.extend(sorted(deck_ids))
         rows = connection.execute(
-            """SELECT n.tags AS tags, c.type, c.queue, c.due, c.ivl, c.factor,
+            f"""SELECT n.tags AS tags, c.type, c.queue, c.due, c.ivl, c.factor,
                c.reps, c.lapses, c.left, c.odue, c.odid
-               FROM notes n JOIN cards c ON c.nid = n.id"""
+               FROM notes n JOIN cards c ON c.nid = n.id{deck_filter}""",
+            parameters,
         ).fetchall()
     except sqlite3.OperationalError:
         return {}
@@ -877,15 +933,16 @@ def build_rebuilt_deck_apkg(
     *,
     data_dir: Path,
     source_path: Path | None = None,
+    selected_deck_id: int | None = None,
 ) -> bytes:
     """Rebuild all highlights into a fresh APKG with carried-over schedules.
 
     The rebuilt deck contains one two-field note per semantic card (meaning
     and recall rows), tagged with the same `anki_papers::<card id>` site tags
-    as the live deck. When an old collection is available (upload or mirror),
-    card states from matching old notes are copied across so learning progress
-    survives; otherwise new cards start fresh. The stored data is never
-    modified.
+    as the live deck. When an old collection is available (AnkiWeb mirror of
+    the chosen deck), card states from matching old notes are copied across so
+    learning progress survives; otherwise new cards start fresh. The stored
+    data is never modified.
     """
     replay = rebuild_semantic_deck(database, user_id, data_dir=data_dir)
     cards = replay["cards"]
@@ -907,7 +964,14 @@ def build_rebuilt_deck_apkg(
         collection_path, is_compressed = _open_old_collection(source_path, temporary)
         connection = _connect_collection(collection_path)
         try:
-            schedules = _extract_schedules(connection)
+            schedules = _extract_schedules(
+                connection,
+                deck_ids=(
+                    _resolve_source_decks(connection, selected_deck_id)
+                    if selected_deck_id is not None
+                    else None
+                ),
+            )
             deck_id = _rebuild_deck_id(connection)
             _rename_deck(connection, deck_id, deck_name)
             note_type_id = _rebuild_note_type_id(connection)

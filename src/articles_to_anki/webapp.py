@@ -1076,38 +1076,53 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         require_csrf()
         from .rebuild import build_rebuilt_deck_apkg
 
-        old_deck = request.files.get("old_deck")
+        database = get_database()
+        user_id = session["user_id"]
+        account = database.execute(
+            "SELECT * FROM anki_accounts WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        selected_deck_id: int | None = None
+        deck_value = request.form.get("deck_id", "")
+        if deck_value:
+            try:
+                selected_deck_id = int(deck_value)
+                decks = json.loads(account["available_decks_json"]) if account else []
+                next(deck for deck in decks if int(deck["id"]) == selected_deck_id)
+            except (StopIteration, TypeError, ValueError, json.JSONDecodeError):
+                flash(
+                    "Выбранной колоды нет в аккаунте AnkiWeb. Синхронизируйтесь "
+                    "заново и повторите сборку.",
+                    "error",
+                )
+                return redirect(url_for("settings"))
         with tempfile.TemporaryDirectory(prefix="anki-papers-rebuild-") as temporary_name:
             temporary = Path(temporary_name)
             source_path: Path | None = None
-            if old_deck is not None and old_deck.filename:
-                head = old_deck.stream.read(5)
-                old_deck.stream.seek(0)
-                if not head.startswith(b"PK"):
-                    flash("Старая колода должна быть файлом APKG.", "error")
+            if selected_deck_id is not None:
+                mirror = decrypt_mirror_collection(database, user_id)
+                if mirror is None:
+                    flash(
+                        "Свежее зеркало AnkiWeb недоступно: синхронизируйтесь "
+                        "и повторите сборку.",
+                        "error",
+                    )
                     return redirect(url_for("settings"))
-                source_path = temporary / "old-deck.apkg"
-                old_deck.save(source_path)
-            database = get_database()
-            user_id = session["user_id"]
+                mirror_path = temporary / "mirror-collection.anki2"
+                mirror_path.write_bytes(mirror)
+                source_path = mirror_path
             try:
-                if source_path is None:
-                    mirror = decrypt_mirror_collection(database, user_id)
-                    if mirror is not None:
-                        mirror_path = temporary / "mirror-collection.anki2"
-                        mirror_path.write_bytes(mirror)
-                        source_path = mirror_path
                 content = build_rebuilt_deck_apkg(
                     database,
                     user_id,
                     data_dir=Path(app.config["DATA_DIR"]),
                     source_path=source_path,
+                    selected_deck_id=selected_deck_id,
                 )
             except Exception:
                 app.logger.exception("Deck rebuild failed")
                 flash(
-                    "Не удалось пересобрать колоду. Попробуйте загрузить файл APKG "
-                    "старой колоды вручную.",
+                    "Не удалось пересобрать колоду. Синхронизируйтесь заново "
+                    "и попробуйте ещё раз.",
                     "error",
                 )
                 return redirect(url_for("settings"))

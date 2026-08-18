@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -18,84 +19,13 @@ from test_webapp import csrf, identify, install_fake_enrichment, make_app, pdf_b
 import articles_to_anki.rebuild as rebuild_module
 import articles_to_anki.webapp as webapp_module
 from articles_to_anki.models import ClusterAnalysis, ClusterCandidate, RecallDistractors
+from articles_to_anki.security import encrypt_value, load_credential_keys
 
 _REBUILD_DECK_NAME_RE = re.compile(
     r"^Anki Papers \(пересборка\) \d{4}-\d{2}-\d{2} \d{2}:\d{2}$"
 )
 
-
-def _legacy_collection_bytes(
-    tmp_path: Path,
-    notes: list[tuple[str, str, dict[str, int]]],
-) -> bytes:
-    database = sqlite3.connect(tmp_path / "old.sqlite")
-    database.executescript(
-        """
-        CREATE TABLE col (id INTEGER PRIMARY KEY, mod INTEGER, models TEXT, decks TEXT);
-        CREATE TABLE decks (id INTEGER PRIMARY KEY);
-        CREATE TABLE notes (
-            id INTEGER PRIMARY KEY, guid TEXT, mid INTEGER, mod INTEGER, usn INTEGER,
-            tags TEXT, flds TEXT, sfld TEXT, csum INTEGER, flags INTEGER, data TEXT
-        );
-        CREATE TABLE cards (
-            id INTEGER PRIMARY KEY, nid INTEGER, did INTEGER, ord INTEGER, mod INTEGER,
-            usn INTEGER, type INTEGER, queue INTEGER, due INTEGER, ivl INTEGER,
-            factor INTEGER, reps INTEGER, lapses INTEGER, left INTEGER, odue INTEGER,
-            odid INTEGER, flags INTEGER, data TEXT
-        );
-        """
-    )
-    models = json.dumps({"100": {"flds": [{"name": "Front"}, {"name": "Back"}]}})
-    decks = json.dumps({"200": {"name": "Default"}})
-    database.execute("INSERT INTO col VALUES (1, 1, ?, ?)", (models, decks))
-    database.execute("INSERT INTO decks VALUES (200)")
-    for index, (fields, tags, schedule) in enumerate(notes, start=1):
-        database.execute(
-            "INSERT INTO notes VALUES (?, 'g', 100, 1, 0, ?, ?, ?, 1, 0, '')",
-            (index, tags, fields, fields.partition("\x1f")[0]),
-        )
-        database.execute(
-            "INSERT INTO cards VALUES (?, ?, 200, 0, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '{}')",
-            (
-                index,
-                index,
-                schedule["type"],
-                schedule["queue"],
-                schedule["due"],
-                schedule["ivl"],
-                schedule["factor"],
-                schedule["reps"],
-                schedule["lapses"],
-                0,
-                0,
-                0,
-            ),
-        )
-    database.commit()
-    database.close()
-    content = (tmp_path / "old.sqlite").read_bytes()
-    (tmp_path / "old.sqlite").unlink()
-    return content
-
-
-def _old_deck_apkg(tmp_path: Path, site_id: str) -> bytes:
-    meaning = "Old meaning front\x1fOld meaning back"
-    recall = "Old recall front\x1fOld recall back"
-    notes = [
-        (
-            meaning,
-            f" anki_papers::{site_id} semantic::v1 card::meaning ",
-            {"type": 2, "queue": 2, "due": 3333, "ivl": 25, "factor": 2500, "reps": 6, "lapses": 1},
-        ),
-        (
-            recall,
-            f" anki_papers::{site_id} semantic::v1 card::recall ",
-            {"type": 3, "queue": 1, "due": 4444, "ivl": 7, "factor": 2200, "reps": 3, "lapses": 0},
-        ),
-    ]
-    path = tmp_path / "old.apkg"
-    write_apkg(path, "collection.anki2", _legacy_collection_bytes(tmp_path, notes))
-    return path.read_bytes()
+_KEY = bytes(range(32))
 
 
 def _full_legacy_collection_bytes(tmp_path: Path, site_id: str) -> bytes:
@@ -177,6 +107,138 @@ def _full_legacy_collection_bytes(tmp_path: Path, site_id: str) -> bytes:
     return content
 
 
+def _mirror_collection_bytes(tmp_path: Path, site_id: str) -> bytes:
+    """Full modern collection with three decks and conflicting schedules.
+
+    Deck "Default" carries the site's tags with wrong scheduling, deck
+    "Papers" carries the correct meaning state and its subdeck "Papers::Advanced"
+    the correct recall state. Choosing "Papers" must scope the transfer to the
+    deck subtree and ignore "Default".
+    """
+    database = sqlite3.connect(tmp_path / "mirror-old.sqlite")
+    database.executescript(
+        """
+        CREATE TABLE col (
+            id INTEGER PRIMARY KEY, crt INTEGER NOT NULL, mod INTEGER NOT NULL,
+            scm INTEGER NOT NULL, ver INTEGER NOT NULL, dty INTEGER NOT NULL,
+            usn INTEGER NOT NULL, ls INTEGER NOT NULL, conf TEXT NOT NULL,
+            models TEXT NOT NULL, decks TEXT NOT NULL, dconf TEXT NOT NULL,
+            tags TEXT NOT NULL
+        );
+        CREATE TABLE notes (
+            id INTEGER PRIMARY KEY, guid TEXT NOT NULL, mid INTEGER NOT NULL,
+            mod INTEGER NOT NULL, usn INTEGER NOT NULL, tags TEXT NOT NULL,
+            flds TEXT NOT NULL, sfld TEXT NOT NULL, csum INTEGER NOT NULL,
+            flags INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        CREATE TABLE cards (
+            id INTEGER PRIMARY KEY, nid INTEGER NOT NULL, did INTEGER NOT NULL,
+            ord INTEGER NOT NULL, mod INTEGER NOT NULL, usn INTEGER NOT NULL,
+            type INTEGER NOT NULL, queue INTEGER NOT NULL, due INTEGER NOT NULL,
+            ivl INTEGER NOT NULL, factor INTEGER NOT NULL, reps INTEGER NOT NULL,
+            lapses INTEGER NOT NULL, left INTEGER NOT NULL, odue INTEGER NOT NULL,
+            odid INTEGER NOT NULL, flags INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        CREATE TABLE revlog (
+            id INTEGER PRIMARY KEY, cid INTEGER NOT NULL, usn INTEGER NOT NULL,
+            ease INTEGER NOT NULL, ivl INTEGER NOT NULL, lastIvl INTEGER NOT NULL,
+            factor INTEGER NOT NULL, time INTEGER NOT NULL, type INTEGER NOT NULL
+        );
+        CREATE TABLE graves (
+            id INTEGER PRIMARY KEY, oid INTEGER NOT NULL, type INTEGER NOT NULL,
+            usn INTEGER NOT NULL
+        );
+        """
+    )
+    template = json.loads(
+        (Path(__file__).parent.parent / "src/articles_to_anki/rebuild_template.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    basic = next(mid for mid, model in template["models"].items() if len(model["flds"]) == 2)
+    base_deck = template["decks"]["1"]
+    decks = {
+        "1": {**base_deck, "name": "Default"},
+        "2": {**base_deck, "name": "Papers"},
+        "3": {**base_deck, "name": "Papers::Advanced"},
+    }
+    mod = int(time.time())
+    database.execute(
+        "INSERT INTO col VALUES (1, ?, ?, ?, ?, 0, -1, 0, ?, ?, ?, ?, ?)",
+        (
+            template["crt"],
+            mod,
+            mod * 1000,
+            template["ver"],
+            json.dumps(template["conf"]),
+            json.dumps(template["models"]),
+            json.dumps(decks),
+            json.dumps(template["dconf"]),
+            json.dumps(template["tags"]),
+        ),
+    )
+    for index, (tags, kind, queue, due, ivl, factor, reps, lapses, deck) in enumerate(
+        [
+            (f" anki_papers::{site_id} semantic::v1 card::meaning ", 2, 2, 1111, 90, 2500, 20, 5, 1),
+            (f" anki_papers::{site_id} semantic::v1 card::recall ", 3, 1, 2222, 3, 2200, 1, 0, 1),
+            (f" anki_papers::{site_id} semantic::v1 card::meaning ", 2, 2, 3333, 25, 2500, 6, 1, 2),
+            (f" anki_papers::{site_id} semantic::v1 card::recall ", 3, 1, 4444, 7, 2200, 3, 0, 3),
+        ],
+        start=1,
+    ):
+        database.execute(
+            "INSERT INTO notes VALUES (?, 'g', ?, 1, 0, ?, 'front\\x1fback', 'front', 1, 0, '')",
+            (index, basic, tags),
+        )
+        database.execute(
+            "INSERT INTO cards VALUES (?, ?, ?, 0, 1, 0, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, '{}')",
+            (index, index, deck, kind, queue, due, ivl, factor, reps, lapses),
+        )
+    database.commit()
+    database.close()
+    content = (tmp_path / "mirror-old.sqlite").read_bytes()
+    (tmp_path / "mirror-old.sqlite").unlink()
+    return content
+
+
+def _install_ankiweb_mirror(tmp_path: Path, site_id: str) -> None:
+    """Persist an encrypted mirror and its deck list for the test user (id 1)."""
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        user_id = database.execute("SELECT id FROM users").fetchone()[0]
+        keys = load_credential_keys()
+        encrypted = encrypt_value(
+            _mirror_collection_bytes(tmp_path, site_id),
+            user_id=user_id,
+            field="collection_mirror",
+            keys=keys,
+        )
+        mirror_path = tmp_path / "mirror.enc"
+        mirror_path.write_bytes(encrypted.ciphertext)
+        decks = json.dumps(
+            [
+                {"id": 1, "name": "Default"},
+                {"id": 2, "name": "Papers"},
+                {"id": 3, "name": "Papers::Advanced"},
+            ],
+            ensure_ascii=False,
+        )
+        database.execute(
+            """INSERT INTO anki_accounts
+               (user_id, available_decks_json, mirror_path, mirror_nonce,
+                mirror_key_version, state, selected_deck_id, selected_deck_name,
+                updated_at)
+               VALUES (?, ?, ?, ?, ?, 'connected', 2, 'Papers', '2026-01-01')""",
+            (
+                user_id,
+                decks,
+                str(mirror_path),
+                encrypted.nonce,
+                encrypted.key_version,
+            ),
+        )
+        database.commit()
+
+
 def _add_highlight(client, document_id: str, target: str = "robust", sentence: str = "This is a robust result.") -> None:
     reader = client.get(f"/article/{document_id}")
     response = client.post(
@@ -210,8 +272,11 @@ def _read_rebuilt(tmp_path: Path, response, collection_name: str = "collection.a
     return sqlite3.connect(path)
 
 
-def test_rebuild_carries_schedule_from_old_deck(tmp_path: Path, monkeypatch) -> None:
+def test_rebuild_carries_schedule_from_selected_ankiweb_deck(tmp_path: Path, monkeypatch) -> None:
     install_fake_enrichment(monkeypatch)
+    monkeypatch.setenv(
+        "ANKI_CREDENTIAL_KEY", base64.urlsafe_b64encode(_KEY).decode()
+    )
     app = make_app(tmp_path)
     client = app.test_client()
     response = identify(client)
@@ -228,12 +293,11 @@ def test_rebuild_carries_schedule_from_old_deck(tmp_path: Path, monkeypatch) -> 
     client.post(f"/article/{document_id}/read", data={"csrf_token": csrf(response), "read": "1"})
     _add_highlight(client, document_id)
     site_id = _site_card_id(tmp_path)
+    _install_ankiweb_mirror(tmp_path, site_id)
 
-    old_deck = _old_deck_apkg(tmp_path, site_id)
     response = client.post(
         "/export/rebuild",
-        data={"csrf_token": csrf(response), "old_deck": (io.BytesIO(old_deck), "old.apkg")},
-        content_type="multipart/form-data",
+        data={"csrf_token": csrf(client.get("/settings")), "deck_id": "2"},
     )
     assert response.status_code == 200
     assert response.headers["Content-Disposition"].startswith('attachment; filename="anki-papers-rebuild-')
@@ -257,12 +321,46 @@ def test_rebuild_carries_schedule_from_old_deck(tmp_path: Path, monkeypatch) -> 
         for row in rows:
             assert f"anki_papers::{site_id}" in row[0]
         deck = json.loads(database.execute("SELECT decks FROM col").fetchone()[0])
-        assert _REBUILD_DECK_NAME_RE.match(deck["200"]["name"])
+        assert _REBUILD_DECK_NAME_RE.match(deck["1"]["name"])
         notes = database.execute("SELECT mid, flds FROM notes").fetchall()
-        assert all(mid == 100 for mid, _ in notes)
+        assert len({mid for mid, _ in notes}) == 1
         assert all("\x1f" in fields and fields.strip() for _, fields in notes)
     finally:
         database.close()
+
+
+def test_rebuild_rejects_deck_outside_account(tmp_path: Path, monkeypatch) -> None:
+    install_fake_enrichment(monkeypatch)
+    monkeypatch.setenv(
+        "ANKI_CREDENTIAL_KEY", base64.urlsafe_b64encode(_KEY).decode()
+    )
+    app = make_app(tmp_path)
+    client = app.test_client()
+    response = identify(client)
+
+    response = client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(response), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        document_id = database.execute("SELECT id FROM documents WHERE kind = 'pdf'").fetchone()[0]
+    client.post(f"/article/{document_id}/read", data={"csrf_token": csrf(response), "read": "1"})
+    _add_highlight(client, document_id)
+    site_id = _site_card_id(tmp_path)
+    _install_ankiweb_mirror(tmp_path, site_id)
+
+    settings_page = client.get("/settings")
+    rejected = client.post(
+        "/export/rebuild",
+        data={"csrf_token": csrf(settings_page), "deck_id": "999"},
+        follow_redirects=True,
+    )
+    assert rejected.status_code == 200
+    assert "Выбранной колоды нет в аккаунте AnkiWeb" in rejected.text
+    assert "Колода AnkiWeb для переноса прогресса" in settings_page.text
+    assert "old_deck" not in settings_page.text
 
 
 def test_rebuild_fresh_without_old_deck_is_deterministic(tmp_path: Path, monkeypatch) -> None:
@@ -468,14 +566,17 @@ def test_rebuild_apkg_imports_in_anki_with_schedule(tmp_path: Path, monkeypatch)
         "collection.anki2",
         _full_legacy_collection_bytes(tmp_path, site_id),
     )
-    response = client.post(
-        "/export/rebuild",
-        data={"csrf_token": csrf(response), "old_deck": (io.BytesIO(full_old.read_bytes()), "old.apkg")},
-        content_type="multipart/form-data",
-    )
-    assert response.status_code == 200
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        database.row_factory = sqlite3.Row
+        user_id = database.execute("SELECT id FROM users").fetchone()["id"]
+        content = rebuild_module.build_rebuilt_deck_apkg(
+            database,
+            user_id,
+            data_dir=tmp_path,
+            source_path=full_old,
+        )
     apkg = tmp_path / "rebuilt.apkg"
-    apkg.write_bytes(response.data)
+    apkg.write_bytes(content)
 
     destination = tmp_path / "imported.anki2"
     collection = Collection(str(destination))
@@ -822,16 +923,16 @@ def test_rebuild_accepts_modern_unicase_collection(tmp_path: Path, monkeypatch) 
     )
     collection.close()
 
-    response = client.post(
-        "/export/rebuild",
-        data={
-            "csrf_token": csrf(response),
-            "old_deck": (io.BytesIO(modern_apkg.read_bytes()), "old.apkg"),
-        },
-        content_type="multipart/form-data",
-    )
-    assert response.status_code == 200
-    with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        database.row_factory = sqlite3.Row
+        user_id = database.execute("SELECT id FROM users").fetchone()["id"]
+        content = rebuild_module.build_rebuilt_deck_apkg(
+            database,
+            user_id,
+            data_dir=tmp_path,
+            source_path=modern_apkg,
+        )
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
         assert "collection.anki21b" in archive.namelist()
         rebuilt_bytes = archive.read("collection.anki21b")
     # Unwrap the zstd collection so a plain sqlite3 reader can inspect it.

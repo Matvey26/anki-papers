@@ -112,9 +112,14 @@
       <h3>Собрать всё заново одним файлом</h3>
       <p>Все сохранённые слова пройдут текущий конвейер (кластеры, контексты, переводы), а результат будет упакован в свежий APKG. Существующие карточки не изменяются — просто импортируйте файл в Anki и решите, какую колоду оставить. LLM-вызовы повторно не оплачиваются: результаты кешируются.</p>
     </div>
-    <form class="settings-form rebuild-form" action="{{ url_for('export_rebuild_apkg') }}" method="post" enctype="multipart/form-data">
+    <form class="settings-form rebuild-form" action="{{ url_for('export_rebuild_apkg') }}" method="post">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <label>Старая колода (APKG), чтобы перенести прогресс обучения <span class="field-help">Если не указана, используется зеркало AnkiWeb, иначе прогресс не переносится</span><input type="file" name="old_deck" accept=".apkg"></label>
+      {% if decks %}
+        <label>Колода AnkiWeb для переноса прогресса обучения <span class="field-help">Расписание карточек возьмётся из выбранной колоды и её подколод. Свежее зеркало AnkiWeb подтянется автоматически.</span>
+        <select name="deck_id" required>{% for deck in decks %}<option value="{{ deck['id'] }}" {% if account['selected_deck_id'] == deck['id'] %}selected{% endif %}>{{ deck['name'] }}</option>{% endfor %}</select></label>
+      {% else %}
+        <p class="field-help">Подключите AnkiWeb, чтобы перенести прогресс обучения из колоды — иначе соберётся новая колода без расписания.</p>
+      {% endif %}
       <button class="primary">Собрать и скачать</button>
     </form>
   </div>
