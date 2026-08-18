@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import tempfile
 import time
+import unicodedata
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -26,7 +27,12 @@ from .extract import (
     find_article_contexts,
     find_variant_article_contexts,
 )
-from .models import ClusterAnalysis, ContextCandidate
+from .models import (
+    ClusterAnalysis,
+    ClusterCandidate,
+    ClusterExample,
+    ContextCandidate,
+)
 from .webapp import (
     CLUSTER_FUZZY_SCORE_CUTOFF,
     CONTEXT_APPROVAL_CANDIDATE_LIMIT,
@@ -54,7 +60,6 @@ LOGGER = logging.getLogger(__name__)
 REBUILD_REVISION = "v1"
 REBUILD_DECK_NAME = "Anki Papers (пересборка)"
 
-_SEED_SOURCES = {"user_pdf"}
 _COLLECTION_NAMES = ("collection.anki21b", "collection.anki21", "collection.anki2")
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 _TEMPLATE_JSON = Path(__file__).with_name("rebuild_template.json")
@@ -113,21 +118,28 @@ def _stable_note_id(deck_id: int, site_id: str, direction: str) -> int:
     return int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
 
 
-def _candidate_dicts(clusters: list[RebuildCluster]) -> list[dict[str, Any]]:
-    return [
-        {
-            "cluster_id": cluster.id,
-            "leader": cluster.leader,
-            "examples": [
-                {
-                    "highlight": str(item.get("target") or ""),
-                    "context": str(item.get("sentence") or ""),
-                }
-                for item in cluster.contexts[:MAX_CLUSTER_EXAMPLES]
-            ],
-        }
-        for cluster in clusters
-    ]
+def _cluster_candidate_models(clusters: list[RebuildCluster]) -> list[ClusterCandidate]:
+    candidates: list[ClusterCandidate] = []
+    for cluster in clusters:
+        if not cluster.leader:
+            continue
+        examples: list[ClusterExample] = []
+        for item in cluster.contexts[:MAX_CLUSTER_EXAMPLES]:
+            highlight = normalize_selected_text(str(item.get("target") or ""))
+            context = " ".join(str(item.get("sentence") or "").split())
+            if not highlight or not context:
+                continue
+            examples.append(ClusterExample(highlight=highlight, context=context))
+        if not examples:
+            continue
+        candidates.append(
+            ClusterCandidate(
+                cluster_id=cluster.id,
+                leader=cluster.leader,
+                examples=examples,
+            )
+        )
+    return candidates
 
 
 def _cluster_candidates(
@@ -175,9 +187,20 @@ def _collect_seeds(
     database: sqlite3.Connection,
     user_id: int,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
-    """Reuse analyses already stored on semantic cards, keyed by highlight id."""
+    """Reuse analyses already stored on semantic cards, keyed by highlight id.
+
+    Any context that names an existing highlight (whatever its source label,
+    including `user_pdf`, `reader` and `pdf_import`) is a seed, so highlights
+    that already went through the live pipeline never reach the model again.
+    """
     seeds: dict[str, dict[str, Any]] = {}
     seeds_old_cards: dict[str, str] = {}
+    highlight_ids = {
+        str(row[0])
+        for row in database.execute(
+            "SELECT id FROM highlights WHERE user_id = ?", (user_id,)
+        )
+    }
     rows = database.execute(
         """SELECT id, contexts_json FROM cards
            WHERE user_id = ? AND semantic_version = 1""",
@@ -193,10 +216,8 @@ def _collect_seeds(
         for context in contexts:
             if not isinstance(context, dict):
                 continue
-            if context.get("source") not in _SEED_SOURCES:
-                continue
             highlight_id = str(context.get("id") or "")
-            if not highlight_id or highlight_id in seeds:
+            if highlight_id not in highlight_ids or highlight_id in seeds:
                 continue
             seeds[highlight_id] = seed_analysis_from_context(context)
             seeds_old_cards[highlight_id] = str(row["id"])
@@ -430,7 +451,7 @@ def rebuild_semantic_deck(
                     target=entry.target,
                     normalized_target=normalized_highlight,
                     sentence=entry.sentence,
-                    candidates=_candidate_dicts(clusters),
+                    candidates=_cluster_candidate_models(clusters),
                     api_key=api_key,
                 )
                 analysis_data = cached.model_dump()
@@ -692,11 +713,31 @@ def _empty_collection(connection: sqlite3.Connection) -> None:
             continue
 
 
+def _connect_collection(path: Path) -> sqlite3.Connection:
+    """Open a collection file, registering the `unicase` collation.
+
+    Modern (Anki 2.1.50+) collections sort deck names and tags with the
+    `unicase` collation; without it plain sqlite3 refuses to read those
+    tables at all.
+    """
+    connection = sqlite3.connect(path)
+
+    def unicase(left: str, right: str) -> int:
+        normalized_left = unicodedata.normalize("NFC", left or "").casefold()
+        normalized_right = unicodedata.normalize("NFC", right or "").casefold()
+        return (normalized_left > normalized_right) - (
+            normalized_left < normalized_right
+        )
+
+    connection.create_collation("unicase", unicase)
+    return connection
+
+
 def _fallback_collection(temporary: Path) -> Path:
     """Build a minimal legacy Anki collection when no old deck is available."""
     payload = json.loads(_TEMPLATE_JSON.read_text(encoding="utf-8"))
     collection = temporary / "collection.anki2"
-    database = sqlite3.connect(collection)
+    database = _connect_collection(collection)
     try:
         database.executescript(
             """
@@ -824,7 +865,7 @@ def build_rebuilt_deck_apkg(
     with tempfile.TemporaryDirectory(prefix="anki-papers-rebuild-") as temporary_name:
         temporary = Path(temporary_name)
         collection_path, is_compressed = _open_old_collection(source_path, temporary)
-        connection = sqlite3.connect(collection_path)
+        connection = _connect_collection(collection_path)
         try:
             schedules = _extract_schedules(connection)
             deck_id = _rebuild_deck_id(connection)

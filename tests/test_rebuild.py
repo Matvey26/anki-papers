@@ -13,8 +13,9 @@ import pytest
 from test_apkg import write_apkg
 from test_webapp import csrf, identify, install_fake_enrichment, make_app, pdf_bytes
 
+import articles_to_anki.rebuild as rebuild_module
 import articles_to_anki.webapp as webapp_module
-from articles_to_anki.models import ClusterAnalysis
+from articles_to_anki.models import ClusterAnalysis, ClusterCandidate, RecallDistractors
 
 
 def _legacy_collection_bytes(
@@ -495,3 +496,261 @@ def test_rebuild_apkg_imports_in_anki_with_schedule(tmp_path: Path, monkeypatch)
         assert recall.due == 4444
     finally:
         collection.close()
+
+
+def test_cluster_candidate_models_builds_valid_objects() -> None:
+    clusters = [
+        rebuild_module.RebuildCluster(
+            id="c1",
+            target="robust",
+            leader="robust",
+            sentence="A robust result.",
+            part_of_speech="adjective",
+            sense_definition_en="definition",
+            translations=["надёжный"],
+            contexts=[
+                {"target": "Robust", "sentence": "  A robust result.  "},
+                {"target": "", "sentence": "No target here."},
+            ],
+            highlight_ids=["h1", "h2"],
+            old_card_ids=[],
+            source_page=1,
+            document_id="a",
+        ),
+        rebuild_module.RebuildCluster(
+            id="c2",
+            target="robust",
+            leader="",
+            sentence="Orphan cluster.",
+            part_of_speech="adjective",
+            sense_definition_en="",
+            translations=[],
+            contexts=[{"target": "robust", "sentence": "Orphan context."}],
+            highlight_ids=["h3"],
+            old_card_ids=[],
+            source_page=1,
+            document_id="b",
+        ),
+        rebuild_module.RebuildCluster(
+            id="c3",
+            target="robust",
+            leader="orphan",
+            sentence="Empty contexts.",
+            part_of_speech="adjective",
+            sense_definition_en="",
+            translations=[],
+            contexts=[{"target": "", "sentence": ""}],
+            highlight_ids=["h4"],
+            old_card_ids=[],
+            source_page=1,
+            document_id="c",
+        ),
+    ]
+    candidates = rebuild_module._cluster_candidate_models(clusters)
+    assert [candidate.cluster_id for candidate in candidates] == ["c1"]
+    candidate = candidates[0]
+    assert isinstance(candidate, ClusterCandidate)
+    assert candidate.leader == "robust"
+    assert [example.highlight for example in candidate.examples] == ["robust"]
+    assert candidate.examples[0].context == "A robust result."
+
+
+def test_collect_seeds_accepts_all_highlight_sources(tmp_path: Path) -> None:
+    database = sqlite3.connect(tmp_path / "seeds.sqlite")
+    try:
+        database.executescript(
+            """
+            CREATE TABLE highlights (id TEXT PRIMARY KEY, user_id INTEGER);
+            CREATE TABLE cards (
+                id TEXT PRIMARY KEY, user_id INTEGER, semantic_version INTEGER,
+                contexts_json TEXT
+            );
+            """
+        )
+        database.execute("INSERT INTO highlights VALUES ('h1', 1), ('h2', 1), ('other', 1)")
+        context = {
+            "id": "h1",
+            "source": "reader",
+            "target": "robust",
+            "sentence": "A robust result.",
+            "lemma": "robust",
+            "part_of_speech": "adjective",
+            "sense_definition_en": "definition",
+            "translations": ["надёжный"],
+            "replacement": "надёжный",
+            "substitutes_en": [],
+            "related_en": [],
+            "valid_substitutes_en": [],
+            "valid_related_en": [],
+        }
+        database.execute(
+            "INSERT INTO cards VALUES ('card1', 1, 1, ?)",
+            (
+                json.dumps(
+                    [
+                        context,
+                        {
+                            "id": "h2",
+                            "source": "pdf_import",
+                            "target": "result",
+                            "sentence": "A final result.",
+                            "lemma": "result",
+                            "part_of_speech": "noun",
+                            "sense_definition_en": "outcome",
+                            "translations": ["итог"],
+                            "replacement": "итог",
+                            "substitutes_en": [],
+                            "related_en": [],
+                            "valid_substitutes_en": [],
+                            "valid_related_en": [],
+                        },
+                        context,
+                    ]
+                ),
+            ),
+        )
+        database.execute("INSERT INTO cards VALUES ('card2', 1, 0, ?)", ("[]",))
+        database.row_factory = sqlite3.Row
+        seeds, seeds_old_cards = rebuild_module._collect_seeds(database, 1)
+    finally:
+        database.close()
+    assert set(seeds) == {"h1", "h2"}
+    assert seeds["h1"]["cluster_id"] == "new_cluster"
+    assert seeds["h1"]["leader"] == "robust"
+    assert seeds_old_cards == {"h1": "card1", "h2": "card1"}
+
+
+def test_cluster_analysis_cached_coerces_dict_candidates(tmp_path: Path, monkeypatch) -> None:
+    install_fake_enrichment(monkeypatch)
+    calls: dict[str, int] = {"count": 0}
+
+    def collecting_cluster(*args, **kwargs):
+        calls["count"] += 1
+        candidates = kwargs.get("candidates") if "candidates" in kwargs else args[3]
+        assert all(isinstance(candidate, ClusterCandidate) for candidate in candidates)
+        return ClusterAnalysis(
+            cluster_id=str(candidates[0].cluster_id),
+            leader=str(candidates[0].leader),
+            part_of_speech="adjective",
+            cluster_definition_en="definition",
+            translations_ru=["надёжный"],
+            replacement_ru="надёжный",
+            source_distractors=RecallDistractors(
+                substitutes_en=[],
+                related_en=[],
+                valid_substitutes_en=[],
+                valid_related_en=[],
+            ),
+        )
+
+    monkeypatch.setattr(webapp_module, "analyse_cluster_assignment", collecting_cluster)
+    kwargs = {
+        "cache_dir": tmp_path / "caches",
+        "user_id": 7,
+        "model": "model",
+        "target": "robust",
+        "normalized_target": "robust",
+        "sentence": "A robust result.",
+        "candidates": [
+            {"cluster_id": "c1", "leader": "robust", "examples": [
+                {"highlight": "robust", "context": "A robust result."}
+            ]}
+        ],
+        "api_key": "key",
+    }
+    first, first_cached = webapp_module.cluster_analysis_cached(**kwargs)
+    second, second_cached = webapp_module.cluster_analysis_cached(**kwargs)
+    assert first.cluster_id == "c1" and not first_cached
+    assert second.cluster_id == "c1" and second_cached
+    assert calls["count"] == 1
+
+
+def test_rebuild_accepts_modern_unicase_collection(tmp_path: Path, monkeypatch) -> None:
+    if os.environ.get("RUN_ANKI_SYNC_INTEGRATION") != "1":
+        pytest.skip("set RUN_ANKI_SYNC_INTEGRATION=1")
+    pytest.importorskip("anki")
+    from anki.collection import Collection
+    from anki.import_export_pb2 import ExportAnkiPackageOptions, ExportLimit
+
+    install_fake_enrichment(monkeypatch)
+    app = make_app(tmp_path)
+    client = app.test_client()
+    response = identify(client)
+
+    response = client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(response), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert "Статья загружена" in response.text
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        document_id = database.execute("SELECT id FROM documents WHERE kind = 'pdf'").fetchone()[0]
+    client.post(f"/article/{document_id}/read", data={"csrf_token": csrf(response), "read": "1"})
+    _add_highlight(client, document_id)
+    site_id = _site_card_id(tmp_path)
+
+    modern = tmp_path / "modern.anki2"
+    collection = Collection(str(modern))
+    note_type = collection.models.by_name("Basic")
+    for direction, (kind, queue, due, ivl, reps, lapses) in {
+        "meaning": (2, 2, 3333, 25, 6, 1),
+        "recall": (3, 1, 4444, 7, 3, 0),
+    }.items():
+        note = collection.new_note(note_type)
+        note["Front"] = f"old {direction}"
+        note["Back"] = "back"
+        note.tags = [f"anki_papers::{site_id}", "semantic::v1", f"card::{direction}"]
+        collection.add_note(note, collection.decks.id("Default"))
+        card = note.cards()[0]
+        card.type = kind
+        card.queue = queue
+        card.due = due
+        card.ivl = ivl
+        card.factor = 2500
+        card.reps = reps
+        card.lapses = lapses
+        collection.update_card(card)
+    modern_apkg = tmp_path / "modern-old.apkg"
+    collection.export_anki_package(
+        out_path=str(modern_apkg),
+        options=ExportAnkiPackageOptions(with_scheduling=True, legacy=False),
+        limit=ExportLimit(deck_id=1),
+    )
+    collection.close()
+
+    response = client.post(
+        "/export/rebuild",
+        data={
+            "csrf_token": csrf(response),
+            "old_deck": (io.BytesIO(modern_apkg.read_bytes()), "old.apkg"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
+        assert "collection.anki21b" in archive.namelist()
+        rebuilt_bytes = archive.read("collection.anki21b")
+    # Unwrap the zstd collection so a plain sqlite3 reader can inspect it.
+    zstandard = pytest.importorskip("zstandard")
+    modern_path = tmp_path / "rebuilt-modern.sqlite"
+    with io.BytesIO(rebuilt_bytes) as raw_stream, modern_path.open("wb") as output:
+        zstandard.ZstdDecompressor().copy_stream(raw_stream, output)
+    database = sqlite3.connect(modern_path)
+    try:
+        assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 2
+        rows = database.execute(
+            "SELECT n.tags, c.type, c.queue, c.due, c.ivl, c.factor, c.reps, c.lapses "
+            "FROM notes n JOIN cards c ON c.nid = n.id"
+        ).fetchall()
+        by_direction = {
+            "meaning" if "card::meaning" in row[0] else "recall": row
+            for row in rows
+        }
+        assert by_direction["meaning"][1:] == (2, 2, 3333, 25, 2500, 6, 1)
+        assert by_direction["recall"][1:] == (3, 1, 4444, 7, 2500, 3, 0)
+        assert database.execute(
+            "SELECT name FROM decks WHERE id = 1"
+        ).fetchone()[0] == "Anki Papers (пересборка)"
+    finally:
+        database.close()

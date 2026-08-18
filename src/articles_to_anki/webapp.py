@@ -2210,6 +2210,10 @@ def cluster_analysis_cached(
     deck rebuilds never pay for the same LLM call twice. Returns the analysis
     and whether it came from the cache.
     """
+    if any(isinstance(candidate, dict) for candidate in candidates):
+        candidates = [
+            ClusterCandidate.model_validate(candidate) for candidate in candidates
+        ]
     key_payload = json.dumps(
         {
             "model": model,
