@@ -31,18 +31,25 @@ jobs:
               printf '%s' "$DIAG_PASSWORD_B64" | base64 -d | sudo -S -p '' "$@"
             fi
           }
-          echo "=== units ==="
-          run_root systemctl list-units --all --no-pager | grep -i anki || true
-          echo "=== service files ==="
-          ls "$HOME/anki-papers/deploy/" 2>/dev/null || true
-          cat "$HOME/anki-papers/deploy/anki-papers-web.service" 2>/dev/null || true
-          echo "=== journal web ==="
-          run_root journalctl -u anki-papers-web -n 300 --no-pager 2>&1 | tail -250 || true
-          echo "=== app dir ==="
-          ls -la "$HOME/anki-papers/" | head -30
-          ls -la "$HOME/anki-papers/data/" 2>/dev/null | head -20
-          find "$HOME/anki-papers" -maxdepth 2 -name "*.log" -o -maxdepth 2 -name "nohup.out" 2>/dev/null | head
-          echo "=== tail app.log ==="
-          tail -200 "$HOME/anki-papers/app.log" 2>/dev/null || true
+          echo "=== rebuild failed traceback ==="
+          run_root journalctl -u anki-papers-web --since "2026-08-18 14:05" --no-pager 2>/dev/null | grep -A 25 "Deck rebuild failed" | head -35 || true
+          echo "=== database state ==="
+          cd "$HOME/anki-papers"
+          .venv/bin/python - <<'PY'
+          import json
+          import sqlite3
+          database = sqlite3.connect("data/app.sqlite3")
+          database.row_factory = sqlite3.Row
+          print("users:", [dict(r) for r in database.execute("SELECT id, username FROM users")])
+          print("highlights total/ready:", database.execute("SELECT COUNT(*), SUM(status = 'ready') FROM highlights").fetchone())
+          print("cards semantic_version=1:", database.execute("SELECT COUNT(*) FROM cards WHERE semantic_version = 1").fetchone()[0])
+          for row in database.execute("SELECT id, target, status FROM highlights LIMIT 8"):
+              print("hl:", dict(row))
+          for row in database.execute("SELECT id FROM cards WHERE semantic_version = 1 LIMIT 8"):
+              contexts = json.loads(row["contexts_json"] or "[]")
+              print("card:", row["id"], "ctx ids:", [c.get("id") for c in contexts if isinstance(c, dict)][:4],
+                    "sources:", [c.get("source") for c in contexts if isinstance(c, dict)][:4])
+          database.close()
+          PY
           unset DIAG_PASSWORD_B64
           REMOTE
