@@ -3247,6 +3247,7 @@ def run_rebuild_job(
             if selected_deck_id is not None and _has_ankiweb_mirror(database, user_id):
                 _mark_rebuild_job(database, job_id, uploaded_to="queued")
                 enqueue_sync_job(database, user_id, "rebuild_import", delay_seconds=0)
+                database.commit()
         else:
             _mark_rebuild_job(
                 database,
