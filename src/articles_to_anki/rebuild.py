@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -11,6 +12,7 @@ import tempfile
 import time
 import unicodedata
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -19,7 +21,7 @@ from typing import Any
 import zstandard
 from rapidfuzz import fuzz, process
 
-from .apkg import checksum, guid, plain_text
+from .apkg import checksum, plain_text
 from .enrich import DEFAULT_SEMANTIC_MODEL
 from .extract import (
     DocumentText,
@@ -78,6 +80,12 @@ _SCHEDULE_FIELDS = (
     "odid",
 )
 
+ProgressReporter: type = Callable[[int, str], None]
+
+# Fraction of the whole pipeline owned by rebuild_semantic_deck; the rest
+# belongs to packing the APKG inside build_rebuilt_deck_apkg.
+_DECK_REPLAY_END = 85
+
 
 @dataclass(slots=True)
 class HighlightEntry:
@@ -110,6 +118,22 @@ def _cluster_id(leader: str, sentence: str) -> str:
         f"{REBUILD_REVISION}\0{leader}\0{sentence}".encode()
     ).digest()
     return f"rebuild-{digest[:12].hex()}"
+
+
+def _rebuild_guid(front: str, deck_name: str) -> str:
+    """Per-rebuild note GUID.
+
+    Anki deduplicates imported notes by GUID, so notes whose GUIDs are derived
+    only from card content would be merged into the deck where a previous
+    rebuild already lives, silently emptying the fresh deck. Binding the GUID
+    to the build's deck name guarantees every rebuild imports as a set of new
+    notes inside its own deck, without ever touching old cards. GUIDs stay
+    stable within one package, so re-importing the same file stays idempotent.
+    """
+    digest = hashlib.sha256(
+        f"{REBUILD_REVISION}\0{deck_name}\0{front}".encode("utf-8")
+    ).digest()[:9]
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
 
 def _stable_note_id(deck_id: int, site_id: str, direction: str) -> int:
@@ -442,6 +466,7 @@ def rebuild_semantic_deck(
     user_id: int,
     *,
     data_dir: Path,
+    progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
     """Build a fresh semantic deck dataset from all highlights.
 
@@ -452,6 +477,9 @@ def rebuild_semantic_deck(
     cached by content so rebuilds are free after the first run. The stored
     cards table is never modified.
     """
+    if progress is None:
+        progress = lambda _percent, _stage: None
+    progress(2, "Собираю данные")
     seeds, seeds_old_cards = _collect_seeds(database, user_id)
     entries = _highlight_entries(database, user_id)
     clusters: list[RebuildCluster] = []
@@ -460,7 +488,12 @@ def rebuild_semantic_deck(
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     model = os.environ.get("OPENROUTER_SEMANTIC_MODEL", DEFAULT_SEMANTIC_MODEL)
 
-    for entry in entries:
+    entry_count = max(len(entries), 1)
+    for entry_index, entry in enumerate(entries):
+        progress(
+            3 + 47 * entry_index // entry_count,
+            f"Слова и кластеры · {entry_index + 1}/{len(entries)}",
+        )
         normalized_highlight = normalize_selected_text(entry.target)
         candidates = _cluster_candidates(clusters, normalized_highlight)
         analysis_data = seeds.get(entry.id)
@@ -555,7 +588,12 @@ def rebuild_semantic_deck(
 
     parsed_documents, indexes = _docs_and_indexes(database, user_id)
     old_mined = _old_mined_contexts(database, user_id)
-    for cluster in clusters:
+    cluster_count = max(len(clusters), 1)
+    for cluster_index, cluster in enumerate(clusters):
+        progress(
+            50 + 35 * cluster_index // cluster_count,
+            f"Контексты предложений · {cluster_index + 1}/{len(clusters)}",
+        )
         known_sentences = {
             " ".join(str(item.get("sentence") or "").casefold().split())
             for item in cluster.contexts
@@ -934,6 +972,7 @@ def build_rebuilt_deck_apkg(
     data_dir: Path,
     source_path: Path | None = None,
     selected_deck_id: int | None = None,
+    progress: ProgressReporter | None = None,
 ) -> bytes:
     """Rebuild all highlights into a fresh APKG with carried-over schedules.
 
@@ -944,7 +983,15 @@ def build_rebuilt_deck_apkg(
     learning progress survives; otherwise new cards start fresh. The stored
     data is never modified.
     """
-    replay = rebuild_semantic_deck(database, user_id, data_dir=data_dir)
+    if progress is None:
+        progress = lambda _percent, _stage: None
+    progress(1, "Начинаю сборку")
+    replay = rebuild_semantic_deck(
+        database,
+        user_id,
+        data_dir=data_dir,
+        progress=lambda percent, stage: progress(percent * _DECK_REPLAY_END // 100, stage),
+    )
     cards = replay["cards"]
     if not cards:
         raise RuntimeError("Нет сохранённых слов для пересобранной колоды")
@@ -956,6 +1003,7 @@ def build_rebuilt_deck_apkg(
             LOGGER.warning("Rebuild: skipping card %s without usable contexts", card["id"])
     if not rows:
         raise RuntimeError("Нет карточек для пересобранной колоды")
+    progress(88, "Собираю APKG")
 
     now_seconds = int(time.time())
     deck_name = _deck_name(datetime.fromtimestamp(now_seconds, tz=UTC))
@@ -977,7 +1025,9 @@ def build_rebuilt_deck_apkg(
             note_type_id = _rebuild_note_type_id(connection)
             _empty_collection(connection)
             next_due = 1
+            row_count = max(len(rows), 1)
             for index, row in enumerate(rows):
+                progress(90 + 8 * index // row_count, "Собираю APKG")
                 site_id, direction = _site_direction(row["Tags"])
                 note_id = _stable_note_id(deck_id, site_id, direction)
                 state = schedules.get((site_id, direction))
@@ -1006,7 +1056,7 @@ def build_rebuilt_deck_apkg(
                     "INSERT INTO notes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         note_id,
-                        guid(front),
+                        _rebuild_guid(front, deck_name),
                         note_type_id,
                         now_seconds,
                         -1,
@@ -1070,4 +1120,5 @@ def build_rebuilt_deck_apkg(
             for member in members:
                 info = zipfile.ZipInfo(member.name)
                 archive.writestr(info, member.read_bytes())
+    progress(100, "Готово")
     return stream.getvalue()

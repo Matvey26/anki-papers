@@ -11,6 +11,7 @@ import uuid
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from test_apkg import write_apkg
@@ -272,12 +273,38 @@ def _read_rebuilt(tmp_path: Path, response, collection_name: str = "collection.a
     return sqlite3.connect(path)
 
 
+def _start_rebuild(client, tmp_path: Path, **extra) -> None:
+    response = client.post(
+        "/export/rebuild",
+        data={"csrf_token": csrf(client.get("/settings")), **extra},
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/settings#rebuild"
+
+
+def _rebuild_download(client) -> tuple[dict, Any]:
+    status = client.get("/api/rebuild/status")
+    assert status.status_code == 200
+    payload = status.get_json()["rebuild_job"]
+    assert payload is not None
+    assert payload["state"] == "succeeded"
+    assert payload["progress"] == 100
+    assert payload["download_url"]
+    download = client.get(payload["download_url"])
+    assert download.status_code == 200
+    assert download.headers["Content-Disposition"].startswith(
+        "attachment; filename=anki-papers-rebuild-"
+    )
+    return payload, download
+
+
 def test_rebuild_carries_schedule_from_selected_ankiweb_deck(tmp_path: Path, monkeypatch) -> None:
     install_fake_enrichment(monkeypatch)
     monkeypatch.setenv(
         "ANKI_CREDENTIAL_KEY", base64.urlsafe_b64encode(_KEY).decode()
     )
-    app = make_app(tmp_path)
+    app = make_app(tmp_path, REBUILD_INLINE=True)
     client = app.test_client()
     response = identify(client)
 
@@ -295,14 +322,11 @@ def test_rebuild_carries_schedule_from_selected_ankiweb_deck(tmp_path: Path, mon
     site_id = _site_card_id(tmp_path)
     _install_ankiweb_mirror(tmp_path, site_id)
 
-    response = client.post(
-        "/export/rebuild",
-        data={"csrf_token": csrf(client.get("/settings")), "deck_id": "2"},
-    )
-    assert response.status_code == 200
-    assert response.headers["Content-Disposition"].startswith('attachment; filename="anki-papers-rebuild-')
+    _start_rebuild(client, tmp_path, deck_id="2")
+    payload, download = _rebuild_download(client)
+    assert payload["state"] == "succeeded"
 
-    database = _read_rebuilt(tmp_path, response)
+    database = _read_rebuilt(tmp_path, download)
     try:
         assert database.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 2
         assert database.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 2
@@ -370,7 +394,7 @@ def test_rebuild_fresh_without_old_deck_is_deterministic(tmp_path: Path, monkeyp
         "_deck_name",
         lambda value: "Anki Papers (пересборка) 2026-01-01 00:00",
     )
-    app = make_app(tmp_path)
+    app = make_app(tmp_path, REBUILD_INLINE=True)
     client = app.test_client()
     response = identify(client)
 
@@ -385,18 +409,10 @@ def test_rebuild_fresh_without_old_deck_is_deterministic(tmp_path: Path, monkeyp
     client.post(f"/article/{document_id}/read", data={"csrf_token": csrf(response), "read": "1"})
     _add_highlight(client, document_id)
 
-    first = client.post(
-        "/export/rebuild",
-        data={"csrf_token": csrf(client.get("/settings"))},
-        content_type="multipart/form-data",
-    )
-    assert first.status_code == 200
-    second = client.post(
-        "/export/rebuild",
-        data={"csrf_token": csrf(client.get("/settings"))},
-        content_type="multipart/form-data",
-    )
-    assert second.status_code == 200
+    _start_rebuild(client, tmp_path)
+    _payload, first = _rebuild_download(client)
+    _start_rebuild(client, tmp_path)
+    _payload, second = _rebuild_download(client)
     assert first.data == second.data
 
     database = _read_rebuilt(tmp_path, first)
@@ -423,7 +439,7 @@ def test_rebuild_reuses_llm_cache_after_card_removal(tmp_path: Path, monkeypatch
         return original(*args, **kwargs)
 
     monkeypatch.setattr(webapp_module, "analyse_cluster_assignment", counting_cluster)
-    app = make_app(tmp_path)
+    app = make_app(tmp_path, REBUILD_INLINE=True)
     client = app.test_client()
     response = identify(client)
 
@@ -449,15 +465,15 @@ def test_rebuild_reuses_llm_cache_after_card_removal(tmp_path: Path, monkeypatch
         data={"csrf_token": csrf(client.get("/settings"))},
         content_type="multipart/form-data",
     )
-    assert response.status_code == 200
+    assert response.status_code == 302
     assert len(calls) == 1
 
-    response = client.post(
+    second_response = client.post(
         "/export/rebuild",
         data={"csrf_token": csrf(client.get("/settings"))},
         content_type="multipart/form-data",
     )
-    assert response.status_code == 200
+    assert second_response.status_code == 302
     assert len(calls) == 1
 
 
@@ -608,6 +624,130 @@ def test_rebuild_apkg_imports_in_anki_with_schedule(tmp_path: Path, monkeypatch)
         assert recall.due == 4444
     finally:
         collection.close()
+
+
+def test_rebuild_second_deck_imports_beside_old_one(tmp_path: Path, monkeypatch) -> None:
+    """A fresh rebuild must import as a new deck without merging into old cards.
+
+    Note GUIDs are the import dedup key in Anki: content-only GUIDs make a
+    second rebuild update existing notes in place, silently leaving the fresh
+    deck empty. GUIDs scoped to the rebuild's deck name keep every rebuild a
+    self-contained deck, and the schedules of already-imported cards stay
+    untouched.
+    """
+    if os.environ.get("RUN_ANKI_SYNC_INTEGRATION") != "1":
+        pytest.skip("set RUN_ANKI_SYNC_INTEGRATION=1")
+    pytest.importorskip("anki")
+    from anki.collection import Collection
+    from anki.import_export_pb2 import (
+        ImportAnkiPackageOptions,
+        ImportAnkiPackageRequest,
+    )
+
+    install_fake_enrichment(monkeypatch)
+    app = make_app(tmp_path)
+    client = app.test_client()
+    response = identify(client)
+
+    response = client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(response), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert "Статья загружена" in response.text
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        document_id = database.execute("SELECT id FROM documents WHERE kind = 'pdf'").fetchone()[0]
+    client.post(f"/article/{document_id}/read", data={"csrf_token": csrf(response), "read": "1"})
+    _add_highlight(client, document_id)
+    site_id = _site_card_id(tmp_path)
+
+    full_old = tmp_path / "full-old.apkg"
+    write_apkg(
+        full_old,
+        "collection.anki2",
+        _full_legacy_collection_bytes(tmp_path, site_id),
+    )
+
+    def build_deck(deck_name: str) -> Path:
+        monkeypatch.setattr(
+            rebuild_module, "_deck_name", lambda _value: deck_name
+        )
+        with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+            database.row_factory = sqlite3.Row
+            user_id = database.execute("SELECT id FROM users").fetchone()["id"]
+            content = rebuild_module.build_rebuilt_deck_apkg(
+                database,
+                user_id,
+                data_dir=tmp_path,
+                source_path=full_old,
+            )
+        path = tmp_path / f"{deck_name[-5:]}.apkg"
+        path.write_bytes(content)
+        return path
+
+    first = build_deck("Anki Papers (пересборка) 2026-01-01 10:00")
+    second = build_deck("Anki Papers (пересборка) 2026-01-01 11:00")
+
+    destination = tmp_path / "imported-twice.anki2"
+    collection = Collection(str(destination))
+    try:
+        for package in (first, second):
+            collection.import_anki_package(
+                ImportAnkiPackageRequest(
+                    package_path=str(package.resolve()),
+                    options=ImportAnkiPackageOptions(
+                        merge_notetypes=True,
+                        with_scheduling=True,
+                        with_deck_configs=False,
+                    ),
+                )
+            )
+        deck_names = sorted(
+            str(deck.name)
+            for deck in collection.decks.all_names_and_ids()
+            if "пересборка" in deck.name
+        )
+        assert deck_names == [
+            "Anki Papers (пересборка) 2026-01-01 10:00",
+            "Anki Papers (пересборка) 2026-01-01 11:00",
+        ]
+        deck_ids = {
+            str(deck.name): deck.id
+            for deck in collection.decks.all_names_and_ids()
+            if "пересборка" in deck.name
+        }
+        cards = [collection.get_card(card_id) for card_id in collection.find_cards("")]
+        assert len(cards) == 4
+        for card in cards:
+            deck = collection.decks.get(card.did)
+            assert _REBUILD_DECK_NAME_RE.match(deck["name"])
+        by_deck = {
+            deck_ids["Anki Papers (пересборка) 2026-01-01 10:00"]: set(),
+            deck_ids["Anki Papers (пересборка) 2026-01-01 11:00"]: set(),
+        }
+        for card in cards:
+            by_deck[card.did].add((card.type, card.ivl, card.reps))
+        assert by_deck[deck_ids["Anki Papers (пересборка) 2026-01-01 10:00"]] == {
+            (2, 25, 6),
+            (3, 7, 3),
+        }
+        assert by_deck[deck_ids["Anki Papers (пересборка) 2026-01-01 11:00"]] == {
+            (2, 25, 6),
+            (3, 7, 3),
+        }
+    finally:
+        collection.close()
+
+
+def test_rebuild_guid_is_scoped_to_deck_name() -> None:
+    front = '<div class="anki-papers-semantic" data-key="card-1">front</div>'
+    first = rebuild_module._rebuild_guid(front, "Anki Papers (пересборка) 2026-01-01 10:00")
+    second = rebuild_module._rebuild_guid(front, "Anki Papers (пересборка) 2026-01-01 11:00")
+    replay = rebuild_module._rebuild_guid(front, "Anki Papers (пересборка) 2026-01-01 10:00")
+    assert len(first) <= 12
+    assert first != second
+    assert first == replay
 
 
 def test_cluster_candidate_models_builds_valid_objects() -> None:
@@ -772,7 +912,7 @@ def test_rebuild_merges_clusters_with_colliding_ids(tmp_path: Path, monkeypatch)
         )
 
     monkeypatch.setattr(webapp_module, "analyse_cluster_assignment", constant_leader)
-    app = make_app(tmp_path)
+    app = make_app(tmp_path, REBUILD_INLINE=True)
     client = app.test_client()
     response = identify(client)
 
@@ -810,18 +950,102 @@ def test_rebuild_merges_clusters_with_colliding_ids(tmp_path: Path, monkeypatch)
             )
         database.commit()
 
-    response = client.post(
-        "/export/rebuild",
-        data={"csrf_token": csrf(client.get("/settings"))},
-        content_type="multipart/form-data",
-    )
-    assert response.status_code == 200
-    database = _read_rebuilt(tmp_path, response)
+    _start_rebuild(client, tmp_path)
+    _payload, download = _rebuild_download(client)
+    database = _read_rebuilt(tmp_path, download)
     try:
         note_ids = [row[0] for row in database.execute("SELECT id FROM notes")]
         assert len(note_ids) == len(set(note_ids)) == 2
     finally:
         database.close()
+
+
+def test_settings_shows_running_rebuild_job_panel(tmp_path: Path, monkeypatch) -> None:
+    install_fake_enrichment(monkeypatch)
+    app = make_app(tmp_path)
+    client = app.test_client()
+    identify(client)
+    timestamp = datetime.now(UTC).isoformat()
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        user_id = database.execute("SELECT id FROM users").fetchone()[0]
+        database.execute(
+            """INSERT INTO rebuild_jobs
+               (id, user_id, state, deck_id, progress, stage, error, result_path,
+                created_at, started_at, finished_at, updated_at)
+               VALUES ('job-1', ?, 'running', NULL, 35, 'Контексты предложений', '',
+                       NULL, ?, ?, NULL, ?)""",
+            (user_id, timestamp, timestamp, timestamp),
+        )
+        database.commit()
+
+    page = client.get("/settings")
+    assert page.status_code == 200
+    assert 'data-rebuild-job' in page.text
+    assert 'data-job-id="job-1"' in page.text
+    assert 'data-state="running"' in page.text
+    assert 'data-progress="35"' in page.text
+    assert 'src="{{ url_for(' not in page.text
+    assert "rebuild-status.js" in page.text
+    assert "disabled" in page.text
+
+    status = client.get("/api/rebuild/status")
+    payload = status.get_json()["rebuild_job"]
+    assert payload["state"] == "running"
+    assert payload["progress"] == 35
+    assert payload["stage"] == "Контексты предложений"
+    assert payload["download_url"] is None
+
+
+def test_rebuild_job_runs_in_background_and_survives_page_reload(
+    tmp_path: Path, monkeypatch
+) -> None:
+    install_fake_enrichment(monkeypatch)
+    monkeypatch.setattr(
+        rebuild_module,
+        "_deck_name",
+        lambda value: "Anki Papers (пересборка) 2026-01-01 00:00",
+    )
+    app = make_app(tmp_path)
+    client = app.test_client()
+    response = identify(client)
+
+    response = client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(response), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        document_id = database.execute("SELECT id FROM documents WHERE kind = 'pdf'").fetchone()[0]
+    client.post(f"/article/{document_id}/read", data={"csrf_token": csrf(response), "read": "1"})
+    _add_highlight(client, document_id)
+
+    _start_rebuild(client, tmp_path)
+
+    deadline = time.monotonic() + 30
+    payload: dict | None = None
+    while time.monotonic() < deadline:
+        status = client.get("/api/rebuild/status")
+        payload = status.get_json()["rebuild_job"]
+        assert payload is not None
+        state = payload["state"]
+        assert state in {"queued", "running", "succeeded"}
+        if state == "succeeded":
+            break
+        time.sleep(0.1)
+    assert payload is not None and payload["state"] == "succeeded"
+    assert payload["progress"] == 100
+    assert 0 <= payload["progress"] <= 100
+
+    reloaded = client.get("/settings")
+    assert "data-state=\"succeeded\"" in reloaded.text
+    assert 'data-download-url="' in reloaded.text
+
+    download = client.get(payload["download_url"])
+    assert download.status_code == 200
+    assert download.data.startswith(b"PK")
+    with zipfile.ZipFile(io.BytesIO(download.data)) as archive:
+        assert len(archive.namelist()) >= 2
 
 
 def test_cluster_analysis_cached_coerces_dict_candidates(tmp_path: Path, monkeypatch) -> None:
