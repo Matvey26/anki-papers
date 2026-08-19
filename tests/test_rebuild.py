@@ -353,7 +353,11 @@ def test_rebuild_carries_schedule_from_selected_ankiweb_deck(tmp_path: Path, mon
         for row in rows:
             assert f"anki_papers::{site_id}" in row[0]
         deck = json.loads(database.execute("SELECT decks FROM col").fetchone()[0])
-        assert _REBUILD_DECK_NAME_RE.match(deck["1"]["name"])
+        assert any(
+            _REBUILD_DECK_NAME_RE.match(saved["name"]) is not None
+            and int(key) != 1
+            for key, saved in deck.items()
+        )
         notes = database.execute("SELECT mid, flds FROM notes").fetchall()
         assert len({mid for mid, _ in notes}) == 1
         assert all("\x1f" in fields and fields.strip() for _, fields in notes)
@@ -756,6 +760,136 @@ def test_rebuild_guid_is_scoped_to_deck_name() -> None:
     assert len(first) <= 12
     assert first != second
     assert first == replay
+
+
+def test_avoid_default_deck_id_moves_single_legacy_deck(tmp_path: Path) -> None:
+    """Deck id 1 is skipped by Anki's apkg importer when scheduling is not
+    included; the rebuild deck must be re-id'd off the default id."""
+    database = sqlite3.connect(tmp_path / "legacy.sqlite")
+    database.executescript(
+        "CREATE TABLE col (id INTEGER PRIMARY KEY, decks TEXT NOT NULL)"
+    )
+    decks = {
+        "1": {"name": "По умолчанию", "id": 1, "conf": 1, "mod": 0, "usn": 0},
+        "5": {"name": "Papers", "id": 5, "conf": 1, "mod": 0, "usn": 0},
+    }
+    database.execute("INSERT INTO col VALUES (1, ?)", (json.dumps(decks),))
+    rebuilt = rebuild_module._avoid_default_deck_id(database, 1)
+    assert rebuilt == 6
+    stored = json.loads(database.execute("SELECT decks FROM col").fetchone()[0])
+    assert set(stored) == {"6", "5"}
+    assert stored["6"]["name"] == "По умолчанию"
+    assert stored["6"]["id"] == 6
+
+
+def test_rebuild_apkg_imports_in_anki_without_scheduling(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A rebuild imported WITHOUT scheduling (the desktop default) must still
+    create its own deck: Anki's importer drops deck id 1 from packages when
+    scheduling is not included, silently dumping cards into Default."""
+    if os.environ.get("RUN_ANKI_SYNC_INTEGRATION") != "1":
+        pytest.skip("set RUN_ANKI_SYNC_INTEGRATION=1")
+    pytest.importorskip("anki")
+    from anki.collection import Collection
+    from anki.import_export_pb2 import (
+        ImportAnkiPackageOptions,
+        ImportAnkiPackageRequest,
+    )
+
+    install_fake_enrichment(monkeypatch)
+    app = make_app(tmp_path)
+    client = app.test_client()
+    response = identify(client)
+
+    response = client.post(
+        "/upload/pdf",
+        data={"csrf_token": csrf(response), "file": (pdf_bytes(), "paper.pdf")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert "Статья загружена" in response.text
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        document_id = database.execute(
+            "SELECT id FROM documents WHERE kind = 'pdf'"
+        ).fetchone()[0]
+    client.post(
+        f"/article/{document_id}/read",
+        data={"csrf_token": csrf(response), "read": "1"},
+    )
+    _add_highlight(client, document_id)
+    site_id = _site_card_id(tmp_path)
+
+    full_old = tmp_path / "full-old.apkg"
+    write_apkg(
+        full_old,
+        "collection.anki2",
+        _full_legacy_collection_bytes(tmp_path, site_id),
+    )
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        database.row_factory = sqlite3.Row
+        user_id = database.execute("SELECT id FROM users").fetchone()["id"]
+        content = rebuild_module.build_rebuilt_deck_apkg(
+            database,
+            user_id,
+            data_dir=tmp_path,
+            source_path=full_old,
+        )
+    apkg = tmp_path / "rebuilt.apkg"
+    apkg.write_bytes(content)
+
+    destination = tmp_path / "imported.anki2"
+    collection = Collection(str(destination))
+    try:
+        collection.import_anki_package(
+            ImportAnkiPackageRequest(
+                package_path=str(apkg.resolve()),
+                options=ImportAnkiPackageOptions(
+                    merge_notetypes=True,
+                    with_scheduling=False,
+                    with_deck_configs=False,
+                ),
+            )
+        )
+        rebuilt_named = [
+            deck
+            for deck in collection.decks.all_names_and_ids()
+            if _REBUILD_DECK_NAME_RE.match(deck.name)
+        ]
+        assert rebuilt_named, "rebuild deck was not created"
+        assert len(rebuilt_named) == 1
+        deck_id = rebuilt_named[0].id
+        cards = [collection.get_card(card_id) for card_id in collection.find_cards("")]
+        assert len(cards) == 2
+        assert all(card.did == deck_id for card in cards)
+    finally:
+        collection.close()
+
+
+def test_avoid_default_deck_id_relocates_modern_deck_row(tmp_path: Path) -> None:
+    database = sqlite3.connect(tmp_path / "modern.sqlite")
+    database.executescript(
+        "CREATE TABLE decks (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+    )
+    database.executescript(
+        "INSERT INTO decks (id, name) VALUES (1, 'По умолчанию'), (5, 'Papers')"
+    )
+    rebuilt = rebuild_module._avoid_default_deck_id(database, 1)
+    assert rebuilt == 6
+    rows = dict(database.execute("SELECT id, name FROM decks").fetchall())
+    assert rows == {6: "По умолчанию", 5: "Papers"}
+
+
+def test_avoid_default_deck_id_keeps_non_default(tmp_path: Path) -> None:
+    database = sqlite3.connect(tmp_path / "other.sqlite")
+    database.executescript(
+        "CREATE TABLE decks (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+    )
+    database.execute("INSERT INTO decks (id, name) VALUES (5, 'Papers')")
+    assert rebuild_module._avoid_default_deck_id(database, 5) == 5
+    assert dict(database.execute("SELECT id, name FROM decks").fetchall()) == {
+        5: "Papers"
+    }
 
 
 def test_cluster_candidate_models_builds_valid_objects() -> None:
@@ -1185,8 +1319,13 @@ def test_rebuild_accepts_modern_unicase_collection(tmp_path: Path, monkeypatch) 
         }
         assert by_direction["meaning"][1:] == (2, 2, 3333, 25, 2500, 6, 1)
         assert by_direction["recall"][1:] == (3, 1, 4444, 7, 2500, 3, 0)
-        assert _REBUILD_DECK_NAME_RE.match(
-            database.execute("SELECT name FROM decks WHERE id = 1").fetchone()[0]
-        )
+        rebuilt_deck = database.execute(
+            "SELECT id, name FROM decks ORDER BY id LIMIT 1"
+        ).fetchone()
+        assert _REBUILD_DECK_NAME_RE.match(rebuilt_deck[1])
+        # The built deck must not reuse Anki's default id (1): the apkg
+        # importer drops deck id 1 when scheduling is not included, silently
+        # dumping the cards into the target collection's default deck.
+        assert rebuilt_deck[0] != 1
     finally:
         database.close()

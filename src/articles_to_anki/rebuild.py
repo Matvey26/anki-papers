@@ -775,6 +775,37 @@ def _rebuild_deck_id(connection: sqlite3.Connection) -> int:
         raise RuntimeError("Rebuild source contains no decks")
 
 
+def _avoid_default_deck_id(connection: sqlite3.Connection, deck_id: int) -> int:
+    """Rebuild decks must not reuse Anki's default deck id (1).
+
+    The Anki apkg importer skips deck id 1 when scheduling is not included
+    (the desktop default), so cards would silently land in the target
+    collection's default deck instead of a fresh build deck.
+    """
+    if deck_id != 1:
+        return deck_id
+    try:
+        row = connection.execute("SELECT decks FROM col LIMIT 1").fetchone()
+        decks = json.loads(row[0]) if row else None
+    except (sqlite3.OperationalError, TypeError, ValueError, json.JSONDecodeError):
+        decks = None
+    if decks is not None:
+        other = [int(key) for key in decks if int(key) != 1]
+        replacement = max(other) + 1 if other else 2
+        moved = decks.pop("1")
+        moved["id"] = replacement
+        decks[str(replacement)] = moved
+        connection.execute(
+            "UPDATE col SET decks = ?",
+            (json.dumps(decks, ensure_ascii=False),),
+        )
+        return replacement
+    row = connection.execute("SELECT MAX(id) FROM decks").fetchone()
+    replacement = max(int(row[0]) + 1 if row and row[0] else 0, 2)
+    connection.execute("UPDATE decks SET id = ? WHERE id = 1", (replacement,))
+    return replacement
+
+
 def _deck_name(value: datetime) -> str:
     """Deck name for one rebuild, labelled with its minute of generation.
 
@@ -1020,7 +1051,9 @@ def build_rebuilt_deck_apkg(
                     else None
                 ),
             )
-            deck_id = _rebuild_deck_id(connection)
+            deck_id = _avoid_default_deck_id(
+                connection, _rebuild_deck_id(connection)
+            )
             _rename_deck(connection, deck_id, deck_name)
             note_type_id = _rebuild_note_type_id(connection)
             _empty_collection(connection)
