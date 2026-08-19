@@ -131,6 +131,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         MAX_CONTENT_LENGTH=85 * 1024 * 1024,
         AUTO_PROCESS_UPLOADS=True,
         PROCESS_DOCUMENTS_INLINE=False,
+        REBUILD_INLINE=False,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=True,
@@ -157,6 +158,12 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     )
     app.extensions["deleted_document_paths"] = {}
     app.extensions["highlight_resume_done"] = False
+    app.extensions["rebuild_executor"] = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="deck-rebuild",
+    )
+    app.extensions["rebuild_jobs"] = set()
+    app.extensions["rebuild_jobs_lock"] = threading.Lock()
 
     app.teardown_appcontext(close_database)
     @app.context_processor
@@ -227,6 +234,27 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         ).fetchall()
         for row in rows:
             enqueue_document_processing(app, row["id"], row["user_id"])
+
+    @app.before_request
+    def resume_interrupted_rebuild_jobs() -> None:
+        live_jobs: set[str] = app.extensions["rebuild_jobs"]
+        with app.extensions["rebuild_jobs_lock"]:
+            stale_running_since = (
+                datetime.now(UTC) - timedelta(minutes=5)
+            ).isoformat()
+            rows = get_database().execute(
+                """SELECT id, user_id, state, updated_at FROM rebuild_jobs
+                   WHERE state = 'queued'
+                      OR (state = 'running' AND updated_at < ?)""",
+                (stale_running_since,),
+            ).fetchall()
+            resumable = [
+                (str(row["id"]), int(row["user_id"]))
+                for row in rows
+                if str(row["id"]) not in live_jobs
+            ]
+        for job_id, user_id in resumable:
+            enqueue_rebuild_job(app, get_database(), user_id, job_id=job_id)
 
     @app.after_request
     def add_security_headers(response: Response) -> Response:
@@ -463,6 +491,11 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             "SELECT COUNT(*) FROM cards WHERE user_id = ? AND anki_synced_at IS NULL",
             (session["user_id"],),
         ).fetchone()[0]
+        rebuild_job = database.execute(
+            """SELECT * FROM rebuild_jobs
+               WHERE user_id = ? ORDER BY created_at DESC LIMIT 1""",
+            (session["user_id"],),
+        ).fetchone()
         allowed = ankiweb_enabled_for_user(current_app, session["username"])
         return render_template(
             "settings.html",
@@ -475,6 +508,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             decks=json.loads(account["available_decks_json"]) if account else [],
             ankiweb_allowed=allowed,
             credentials_configured=bool(current_app.config["ANKI_CREDENTIAL_KEYS"]),
+            rebuild_job=rebuild_job,
         )
 
     @app.post("/settings/password")
@@ -1074,8 +1108,6 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @login_required
     def export_rebuild_apkg() -> Response:
         require_csrf()
-        from .rebuild import build_rebuilt_deck_apkg
-
         database = get_database()
         user_id = session["user_id"]
         account = database.execute(
@@ -1095,45 +1127,67 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                     "error",
                 )
                 return redirect(url_for("settings"))
-        with tempfile.TemporaryDirectory(prefix="anki-papers-rebuild-") as temporary_name:
-            temporary = Path(temporary_name)
-            source_path: Path | None = None
-            if selected_deck_id is not None:
-                mirror = decrypt_mirror_collection(database, user_id)
-                if mirror is None:
-                    flash(
-                        "Свежее зеркало AnkiWeb недоступно: синхронизируйтесь "
-                        "и повторите сборку.",
-                        "error",
-                    )
-                    return redirect(url_for("settings"))
-                mirror_path = temporary / "mirror-collection.anki2"
-                mirror_path.write_bytes(mirror)
-                source_path = mirror_path
-            try:
-                content = build_rebuilt_deck_apkg(
-                    database,
-                    user_id,
-                    data_dir=Path(app.config["DATA_DIR"]),
-                    source_path=source_path,
-                    selected_deck_id=selected_deck_id,
-                )
-            except Exception:
-                app.logger.exception("Deck rebuild failed")
-                flash(
-                    "Не удалось пересобрать колоду. Синхронизируйтесь заново "
-                    "и попробуйте ещё раз.",
-                    "error",
-                )
-                return redirect(url_for("settings"))
-        return Response(
-            content,
+        active = database.execute(
+            """SELECT id FROM rebuild_jobs
+               WHERE user_id = ? AND state IN ('queued', 'running') LIMIT 1""",
+            (user_id,),
+        ).fetchone()
+        if active is not None:
+            flash(
+                "Пересборка уже идёт. Её можно оставить: файл появится на "
+                "этой странице, когда сборка закончится.",
+                "error",
+            )
+            return redirect(url_for("settings"))
+        try:
+            enqueue_rebuild_job(
+                app,
+                database,
+                user_id,
+                selected_deck_id=selected_deck_id,
+            )
+        except sqlite3.IntegrityError:
+            database.rollback()
+            flash(
+                "Пересборка уже идёт. Её можно оставить: файл появится на "
+                "этой странице, когда сборка закончится.",
+                "error",
+            )
+            return redirect(url_for("settings"))
+        database.commit()
+        flash(
+            "Сборка колоды запущена. Можно закрыть страницу — готовый файл "
+            "появится здесь.",
+            "success",
+        )
+        return redirect(url_for("settings") + "#rebuild")
+
+    @app.get("/api/rebuild/status")
+    @login_required
+    def rebuild_status() -> Response:
+        row = get_database().execute(
+            """SELECT * FROM rebuild_jobs
+               WHERE user_id = ? ORDER BY created_at DESC LIMIT 1""",
+            (session["user_id"],),
+        ).fetchone()
+        response = jsonify(rebuild_job=_rebuild_job_payload(row))
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/export/rebuild/download/<job_id>")
+    @login_required
+    def download_rebuilt_apkg(job_id: str) -> Response:
+        row = get_database().execute(
+            "SELECT * FROM rebuild_jobs WHERE id = ? AND user_id = ?",
+            (job_id, session["user_id"]),
+        ).fetchone()
+        if row is None or row["state"] != "succeeded" or not row["result_path"]:
+            abort(404)
+        return send_file(
+            row["result_path"],
             mimetype="application/octet-stream",
-            headers={
-                "Content-Disposition": (
-                    f'attachment; filename="anki-papers-rebuild-{datetime.now(UTC).date()}.apkg"'
-                )
-            },
+            as_attachment=True,
+            download_name=f"anki-papers-rebuild-{datetime.now(UTC).date()}.apkg",
         )
 
     def save_document(upload: Any, kind: str) -> str:
@@ -1531,6 +1585,25 @@ def init_database(app: Flask) -> None:
                 ON sync_jobs(user_id) WHERE state = 'queued';
             CREATE INDEX IF NOT EXISTS idx_sync_jobs_ready
                 ON sync_jobs(state, run_after, created_at);
+            CREATE TABLE IF NOT EXISTS rebuild_jobs (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                state TEXT NOT NULL DEFAULT 'queued'
+                    CHECK(state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+                deck_id INTEGER,
+                progress INTEGER NOT NULL DEFAULT 0,
+                stage TEXT NOT NULL DEFAULT '',
+                error TEXT,
+                result_path TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_rebuild_jobs_one_active_user
+                ON rebuild_jobs(user_id) WHERE state IN ('queued', 'running');
+            CREATE INDEX IF NOT EXISTS idx_rebuild_jobs_user
+                ON rebuild_jobs(user_id, created_at);
             CREATE TABLE IF NOT EXISTS worker_heartbeat (
                 worker_name TEXT PRIMARY KEY,
                 updated_at TEXT NOT NULL
@@ -3001,6 +3074,259 @@ def enqueue_document_processing(app: Flask, document_id: str, user_id: int) -> N
     else:
         executor: ThreadPoolExecutor = app.extensions["highlight_executor"]
         executor.submit(run)
+
+
+def enqueue_rebuild_job(
+    app: Flask,
+    database: sqlite3.Connection,
+    user_id: int,
+    *,
+    selected_deck_id: int | None = None,
+    job_id: str | None = None,
+) -> str:
+    """Create (or resume) a rebuild job row and start it in the background.
+
+    The job row lives in the shared SQLite database, so progress survives
+    page reloads and closed browsers; the finished APKG is written to
+    DATA_DIR/rebuilds. Jobs left behind by a server restart are picked up
+    again by resume_interrupted_rebuild_jobs — rebuilds are deterministic
+    and LLM results are cached, so replaying them is cheap.
+    """
+    if job_id is None:
+        job_id = str(uuid.uuid4())
+        timestamp = now()
+        database.execute(
+            """INSERT INTO rebuild_jobs
+               (id, user_id, state, deck_id, progress, stage,
+                created_at, started_at, updated_at)
+               VALUES (?, ?, 'queued', ?, 0, '', ?, NULL, ?)""",
+            (job_id, user_id, selected_deck_id, timestamp, timestamp),
+        )
+    else:
+        timestamp = now()
+        row = database.execute(
+            """SELECT deck_id FROM rebuild_jobs
+               WHERE id = ? AND user_id = ?""",
+            (job_id, user_id),
+        ).fetchone()
+        if row is None:
+            return job_id
+        selected_deck_id = row["deck_id"]
+        database.execute(
+            """UPDATE rebuild_jobs
+               SET state = 'queued', progress = 0, stage = '', error = NULL,
+                   started_at = NULL, finished_at = NULL, updated_at = ?
+               WHERE id = ?""",
+            (timestamp, job_id),
+        )
+    prune_rebuild_jobs(database, user_id)
+    live_jobs: set[str] = app.extensions["rebuild_jobs"]
+    with app.extensions["rebuild_jobs_lock"]:
+        if job_id in live_jobs:
+            return job_id
+        live_jobs.add(job_id)
+    executor: ThreadPoolExecutor = app.extensions["rebuild_executor"]
+    if app.config["REBUILD_INLINE"]:
+        run_rebuild_job(
+            app,
+            job_id,
+            user_id,
+            selected_deck_id,
+            database=database,
+        )
+    else:
+        executor.submit(
+            run_rebuild_job,
+            app,
+            job_id,
+            user_id,
+            selected_deck_id,
+        )
+    return job_id
+
+
+def run_rebuild_job(
+    app: Flask,
+    job_id: str,
+    user_id: int,
+    selected_deck_id: int | None,
+    database: sqlite3.Connection | None = None,
+) -> None:
+    """Execute one rebuild job and persist its outcome in rebuild_jobs."""
+    close_database = database is None
+    if database is None:
+        database = sqlite3.connect(app.config["DATABASE"], timeout=30)
+        database.row_factory = sqlite3.Row
+        database.execute("PRAGMA foreign_keys = ON")
+    result: Path | None = None
+    error: str | None = None
+    try:
+        _mark_rebuild_job(
+            database,
+            job_id,
+            state="running",
+            progress=5,
+            stage="Начинаю сборку",
+            started_at=now(),
+        )
+        from .rebuild import build_rebuilt_deck_apkg
+
+        with tempfile.TemporaryDirectory(
+            prefix="anki-papers-rebuild-"
+        ) as temporary_name:
+            temporary = Path(temporary_name)
+            source_path: Path | None = None
+            if selected_deck_id is not None:
+                mirror = decrypt_mirror_collection(database, user_id)
+                if mirror is None:
+                    raise RuntimeError(
+                        "Свежее зеркало AnkiWeb недоступно: синхронизируйтесь "
+                        "и повторите сборку."
+                    )
+                mirror_path = temporary / "mirror-collection.anki2"
+                mirror_path.write_bytes(mirror)
+                source_path = mirror_path
+            content = build_rebuilt_deck_apkg(
+                database,
+                user_id,
+                data_dir=Path(app.config["DATA_DIR"]),
+                source_path=source_path,
+                selected_deck_id=selected_deck_id,
+                progress=lambda percent, stage: _mark_rebuild_job(
+                    database,
+                    job_id,
+                    progress=percent,
+                    stage=stage,
+                ),
+            )
+        result_dir = Path(app.config["DATA_DIR"]) / "rebuilds" / str(user_id)
+        result_dir.mkdir(parents=True, exist_ok=True)
+        result = result_dir / f"{job_id}.apkg"
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{job_id}-",
+                suffix=".apkg",
+                dir=result_dir,
+                delete=False,
+            ) as temporary_handle:
+                temporary_path = Path(temporary_handle.name)
+                temporary_handle.write(content)
+            os.replace(temporary_path, result)
+        except Exception:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise
+    except Exception:
+        app.logger.exception("Deck rebuild job %s failed", job_id)
+        error = (
+            "Не удалось пересобрать колоду. Синхронизируйтесь заново "
+            "и попробуйте ещё раз."
+        )
+    finally:
+        if error is None:
+            _mark_rebuild_job(
+                database,
+                job_id,
+                state="succeeded",
+                progress=100,
+                stage="Готово",
+                finished_at=now(),
+                result_path=str(result) if result else None,
+            )
+        else:
+            _mark_rebuild_job(
+                database,
+                job_id,
+                state="failed",
+                error=error,
+                finished_at=now(),
+            )
+            if result is not None:
+                result.unlink(missing_ok=True)
+        if close_database:
+            database.close()
+        with app.extensions["rebuild_jobs_lock"]:
+            app.extensions["rebuild_jobs"].discard(job_id)
+
+
+def _mark_rebuild_job(
+    database: sqlite3.Connection,
+    job_id: str,
+    *,
+    state: str | None = None,
+    progress: int | None = None,
+    stage: str | None = None,
+    error: str | None = None,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    result_path: str | None = None,
+) -> None:
+    updates: list[str] = []
+    values: list[Any] = []
+    for column, value in (
+        ("state", state),
+        ("progress", progress),
+        ("stage", stage),
+        ("error", error),
+        ("started_at", started_at),
+        ("finished_at", finished_at),
+        ("result_path", result_path),
+    ):
+        if value is not None:
+            updates.append(f"{column} = ?")
+            values.append(value)
+    values.extend((now(), job_id))
+    updates.append("updated_at = ?")
+    database.execute(
+        f"UPDATE rebuild_jobs SET {', '.join(updates)} WHERE id = ?",
+        values,
+    )
+    database.commit()
+
+
+def prune_rebuild_jobs(database: sqlite3.Connection, user_id: int) -> None:
+    """Drop old finished rebuilds (rows and files), keeping the latest three."""
+    rows = database.execute(
+        """SELECT id, result_path FROM rebuild_jobs
+           WHERE user_id = ?
+           ORDER BY created_at DESC LIMIT -1 OFFSET 3""",
+        (user_id,),
+    ).fetchall()
+    for row in rows:
+        result_path = row["result_path"]
+        if result_path:
+            try:
+                Path(result_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        database.execute(
+            "DELETE FROM rebuild_jobs WHERE id = ? AND user_id = ?",
+            (row["id"], user_id),
+        )
+    database.commit()
+
+
+def _rebuild_job_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    state = str(row["state"])
+    result_path = row["result_path"]
+    return {
+        "id": str(row["id"]),
+        "state": state,
+        "progress": int(row["progress"] or 0),
+        "stage": str(row["stage"] or ""),
+        "error": row["error"],
+        "created_at": row["created_at"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "download_url": (
+            url_for("download_rebuilt_apkg", job_id=str(row["id"]))
+            if state == "succeeded" and result_path
+            else None
+        ),
+    }
 
 
 def process_document_highlights(app: Flask, document_id: str, user_id: int) -> None:

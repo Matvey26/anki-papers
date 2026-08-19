@@ -105,23 +105,35 @@
   {% endif %}
 </section>
 
-<section class="settings-section">
+<section class="settings-section" id="rebuild">
   <div class="section-heading"><div><span class="eyebrow">Колода</span><h2>Пересобрать колоду</h2></div></div>
   <div class="setup-card">
     <div>
       <h3>Собрать всё заново одним файлом</h3>
       <p>Все сохранённые слова пройдут текущий конвейер (кластеры, контексты, переводы), а результат будет упакован в свежий APKG. Существующие карточки не изменяются — просто импортируйте файл в Anki и решите, какую колоду оставить. LLM-вызовы повторно не оплачиваются: результаты кешируются.</p>
     </div>
-    <form class="settings-form rebuild-form" action="{{ url_for('export_rebuild_apkg') }}" method="post">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      {% if decks %}
-        <label>Колода AnkiWeb для переноса прогресса обучения <span class="field-help">Расписание карточек возьмётся из выбранной колоды и её подколод. Свежее зеркало AnkiWeb подтянется автоматически.</span>
-        <select name="deck_id" required>{% for deck in decks %}<option value="{{ deck['id'] }}" {% if account['selected_deck_id'] == deck['id'] %}selected{% endif %}>{{ deck['name'] }}</option>{% endfor %}</select></label>
-      {% else %}
-        <p class="field-help">Подключите AnkiWeb, чтобы перенести прогресс обучения из колоды — иначе соберётся новая колода без расписания.</p>
+    <div>
+      {% if rebuild_job %}
+      <div class="rebuild-job-panel" data-rebuild-job
+           data-status-url="{{ url_for('rebuild_status') }}"
+           data-job-id="{{ rebuild_job['id'] }}"
+           data-state="{{ rebuild_job['state'] }}"
+           data-progress="{{ rebuild_job['progress'] }}"
+           data-stage="{{ rebuild_job['stage'] }}"
+           data-error="{{ rebuild_job['error'] or '' }}"
+           data-download-url="{% if rebuild_job['state'] == 'succeeded' and rebuild_job['result_path'] %}{{ url_for('download_rebuilt_apkg', job_id=rebuild_job['id']) }}{% endif %}"></div>
       {% endif %}
-      <button class="primary">Собрать и скачать</button>
-    </form>
+      <form class="settings-form rebuild-form" data-rebuild-form action="{{ url_for('export_rebuild_apkg') }}" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        {% if decks %}
+          <label>Колода AnkiWeb для переноса прогресса обучения <span class="field-help">Расписание карточек возьмётся из выбранной колоды и её подколод. Свежее зеркало AnkiWeb подтянется автоматически.</span>
+          <select name="deck_id" required>{% for deck in decks %}<option value="{{ deck['id'] }}" {% if account['selected_deck_id'] == deck['id'] %}selected{% endif %}>{{ deck['name'] }}</option>{% endfor %}</select></label>
+        {% else %}
+          <p class="field-help">Подключите AnkiWeb, чтобы перенести прогресс обучения из колоды — иначе соберётся новая колода без расписания.</p>
+        {% endif %}
+        <button class="primary" {% if rebuild_job and rebuild_job['state'] in ('queued', 'running') %}disabled{% endif %}>Собрать и скачать</button>
+      </form>
+    </div>
   </div>
 </section>
 
@@ -140,4 +152,7 @@
     </div>
   </details>
 </section>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='rebuild-status.js') }}"></script>
 {% endblock %}

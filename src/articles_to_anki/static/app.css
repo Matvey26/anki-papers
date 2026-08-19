@@ -237,6 +237,14 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .sync-event-failed .event-state { background: #f9e5e2; color: var(--danger); }
 .sync-event-running .event-state, .sync-event-queued .event-state { background: #e8edff; color: var(--accent); }
 
+.rebuild-job-panel { margin-bottom: 14px; padding: 14px 16px; display: grid; gap: 2px; border: 1px solid #cbd6fb; border-radius: 10px; background: linear-gradient(135deg, #f7f9ff, #fff 48%); }
+.rebuild-job-panel p { margin: 0; color: var(--text); }
+.rebuild-job-panel p .field-help { display: block; }
+.rebuild-job-panel .sync-progress-label { margin-top: 9px; }
+.rebuild-job-panel .sync-progress-track { margin-top: 5px; background-color: #dde2f2; }
+.rebuild-job-panel a.primary { width: fit-content; margin-top: 10px; }
+.rebuild-job-panel .sync-error-detail { margin-top: 4px; }
+
 @media (max-width: 700px) {
   .sync-overview { padding: 17px; align-items: stretch; flex-direction: column; gap: 18px; }
   .sync-overview-action .primary, .sync-overview-action .secondary { width: 100%; }
