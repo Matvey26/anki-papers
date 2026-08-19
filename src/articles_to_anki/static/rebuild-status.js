@@ -48,11 +48,18 @@ function renderRebuildJob(job) {
     const extra = document.createElement("span");
     extra.textContent = " Скачайте его и импортируйте в Anki.";
     done.append(extra);
+    rebuildPanel.append(done);
+    if (job.deck_name) {
+      const hint = document.createElement("p");
+      hint.className = "field-help";
+      hint.textContent = `В Anki появится НОВАЯ колода «${job.deck_name}» рядом со старыми — она не вольётся в «По умолчанию».`;
+      rebuildPanel.append(hint);
+    }
     const link = document.createElement("a");
     link.className = "primary";
     link.href = job.download_url;
     link.textContent = "Скачать APKG";
-    rebuildPanel.append(done, link);
+    rebuildPanel.append(link);
   } else if (job.state === "failed") {
     const error = document.createElement("p");
     error.className = "sync-error-detail";
@@ -71,6 +78,7 @@ if (rebuildPanel) {
     stage: rebuildPanel.dataset.stage,
     error: rebuildPanel.dataset.error || null,
     download_url: rebuildPanel.dataset.downloadUrl || null,
+    deck_name: rebuildPanel.dataset.deckName || null,
   };
   renderRebuildJob(initial);
   if (initial.state === "queued" || initial.state === "running") {

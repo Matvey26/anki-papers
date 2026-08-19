@@ -296,6 +296,14 @@ def _rebuild_download(client) -> tuple[dict, Any]:
     assert download.headers["Content-Disposition"].startswith(
         "attachment; filename=anki-papers-rebuild-"
     )
+    import re
+
+    stamp = re.search(
+        r"filename=anki-papers-rebuild-(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})\.apkg",
+        download.headers["Content-Disposition"],
+    )
+    assert stamp, "download filename must carry the build timestamp"
+    assert payload["created_at"].startswith(stamp.group(1)[:10] + "T")
     return payload, download
 
 

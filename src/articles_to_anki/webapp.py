@@ -509,6 +509,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             ankiweb_allowed=allowed,
             credentials_configured=bool(current_app.config["ANKI_CREDENTIAL_KEYS"]),
             rebuild_job=rebuild_job,
+            rebuild_deck_name=_rebuild_deck_name_hint(
+                rebuild_job["created_at"] if rebuild_job else None
+            ),
         )
 
     @app.post("/settings/password")
@@ -1187,7 +1190,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             row["result_path"],
             mimetype="application/octet-stream",
             as_attachment=True,
-            download_name=f"anki-papers-rebuild-{datetime.now(UTC).date()}.apkg",
+            download_name=f"anki-papers-rebuild-{_rebuild_file_stamp(row['created_at'])}.apkg",
         )
 
     def save_document(upload: Any, kind: str) -> str:
@@ -3326,7 +3329,33 @@ def _rebuild_job_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
             if state == "succeeded" and result_path
             else None
         ),
+        "deck_name": _rebuild_deck_name_hint(row["created_at"]),
     }
+
+
+def _rebuild_deck_name_hint(created_at: str | None) -> str | None:
+    """Deck name the job is stamped with, derived from its start time."""
+    if not created_at:
+        return None
+    try:
+        started = datetime.fromisoformat(created_at).astimezone(UTC)
+    except ValueError:
+        return None
+    from .rebuild import _deck_name
+
+    return _deck_name(started.replace(second=0, microsecond=0))
+
+
+def _rebuild_file_stamp(value: str | None) -> str:
+    """Unique per-build suffix for the downloaded APKG filename."""
+    if value:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            pass
+        else:
+            return parsed.astimezone(UTC).strftime("%Y-%m-%d-%H-%M-%S")
+    return datetime.now(UTC).strftime("%Y-%m-%d-%H-%M-%S")
 
 
 def process_document_highlights(app: Flask, document_id: str, user_id: int) -> None:
