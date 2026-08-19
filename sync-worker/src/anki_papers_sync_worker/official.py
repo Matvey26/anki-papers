@@ -146,6 +146,65 @@ class OfficialAnkiAdapter:
         finally:
             self._safe_close(collection)
 
+    def import_rebuild(
+        self,
+        collection_path: Path,
+        apkg_path: Path,
+        hkey: str,
+    ) -> AdapterResult:
+        """Import a freshly rebuilt deck package and push it to AnkiWeb.
+
+        The mirror collection is brought up to date, the APKG is imported (its
+        GUIDs and schedules deduplicate on re-import), and the result is
+        uploaded back. Rebuilt notes are tagged `rebuild`, so the regular
+        reconcile never touches them again.
+        """
+        collection = None
+        try:
+            from anki.collection import Collection
+            from anki.import_export_pb2 import (
+                ImportAnkiPackageOptions,
+                ImportAnkiPackageRequest,
+            )
+            from anki.sync import SyncAuth
+
+            collection = Collection(str(collection_path))
+            auth = SyncAuth(hkey=hkey, endpoint=self.endpoint)
+            self._normal_or_download(collection, auth)
+            for _ in range(3):
+                collection.import_anki_package(
+                    ImportAnkiPackageRequest(
+                        package_path=str(apkg_path),
+                        options=ImportAnkiPackageOptions(
+                            merge_notetypes=True,
+                            with_scheduling=True,
+                            with_deck_configs=False,
+                        ),
+                    )
+                )
+                downloaded = self._normal_or_download(collection, auth)
+                if not downloaded:
+                    break
+            else:
+                collection.close()
+                raise RetryableSyncError("repeated_full_sync")
+            status = collection.sync_status(auth)
+            if status.required != status.NO_CHANGES:
+                collection.close()
+                raise RetryableSyncError("remote_changed_during_sync")
+            decks = [
+                {"id": int(deck.id), "name": str(deck.name)}
+                for deck in collection.decks.all_names_and_ids(include_filtered=False)
+            ]
+            collection.close()
+            return AdapterResult(hkey=hkey, decks=decks, links=[])
+        except (AuthenticationError, PermanentSyncError, RetryableSyncError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - classify backend errors without logging secrets
+            self._raise_classified(exc)
+        finally:
+            self._safe_close(collection)
+
     def _normal_or_download(self, collection: Any, auth: Any) -> bool:
         output = collection.sync_collection(auth, sync_media=False)
         self._apply_new_endpoint(auth, output)
@@ -240,8 +299,8 @@ class OfficialAnkiAdapter:
     ) -> Any | None:
         stable_tag = f"anki_papers::{card['id']}"
         searches = [
-            f'tag:"{stable_tag}" tag:"direction::{direction}"',
-            f'tag:"{stable_tag}" tag:"card::{direction}"',
+            f'tag:"{stable_tag}" tag:"direction::{direction}" -tag:"rebuild"',
+            f'tag:"{stable_tag}" tag:"card::{direction}" -tag:"rebuild"',
         ]
         for query in searches:
             ids = collection.find_notes(query)
@@ -249,7 +308,8 @@ class OfficialAnkiAdapter:
                 if int(note_id) not in used_note_ids:
                     return collection.get_note(note_id)
         legacy_ids = collection.find_notes(
-            f'tag:"card::{direction}" OR tag:"direction::{direction}"'
+            f'(tag:"card::{direction}" OR tag:"direction::{direction}") '
+            f'-tag:"rebuild"'
         )
         for note_id in legacy_ids:
             if int(note_id) in used_note_ids:

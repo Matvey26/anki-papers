@@ -109,8 +109,8 @@
   <div class="section-heading"><div><span class="eyebrow">Колода</span><h2>Пересобрать колоду</h2></div></div>
   <div class="setup-card">
     <div>
-      <h3>Собрать всё заново одним файлом</h3>
-      <p>Все сохранённые слова пройдут текущий конвейер (кластеры, контексты, переводы), а результат будет упакован в свежий APKG. Существующие карточки не изменяются — просто импортируйте файл в Anki и решите, какую колоду оставить. LLM-вызовы повторно не оплачиваются: результаты кешируются.</p>
+      <h3>{% if ankiweb_connected %}Собрать всё заново и отправить в AnkiWeb{% else %}Собрать всё заново одним файлом{% endif %}</h3>
+      <p>Все сохранённые слова пройдут текущий конвейер (кластеры, контексты, переводы), а результат будет упакован в свежий APKG. Существующие карточки не изменяются —{% if ankiweb_connected %} собранная колода автоматически появится в AnkiWeb, останется только синхронизировать Anki Desktop{% else %} просто импортируйте файл в Anki и решите, какую колоду оставить{% endif %}. LLM-вызовы повторно не оплачиваются: результаты кешируются.</p>
     </div>
     <div>
       {% if rebuild_job %}
@@ -121,6 +121,7 @@
            data-progress="{{ rebuild_job['progress'] }}"
            data-stage="{{ rebuild_job['stage'] }}"
            data-error="{{ rebuild_job['error'] or '' }}"
+           data-auto-upload="{% if ankiweb_connected %}1{% endif %}"
            data-download-url="{% if rebuild_job['state'] == 'succeeded' and rebuild_job['result_path'] %}{{ url_for('download_rebuilt_apkg', job_id=rebuild_job['id']) }}{% endif %}"
            {% if rebuild_deck_name %}data-deck-name="{{ rebuild_deck_name }}"{% endif %}></div>
       {% endif %}
@@ -132,7 +133,7 @@
         {% else %}
           <p class="field-help">Подключите AnkiWeb, чтобы перенести прогресс обучения из колоды — иначе соберётся новая колода без расписания.</p>
         {% endif %}
-        <button class="primary" {% if rebuild_job and rebuild_job['state'] in ('queued', 'running') %}disabled{% endif %}>Собрать и скачать</button>
+        <button class="primary" {% if rebuild_job and rebuild_job['state'] in ('queued', 'running') %}disabled{% endif %}>{% if ankiweb_connected %}Собрать и отправить в AnkiWeb{% else %}Собрать и скачать{% endif %}</button>
       </form>
     </div>
   </div>

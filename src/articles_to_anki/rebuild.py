@@ -1084,7 +1084,7 @@ def build_rebuilt_deck_apkg(
                 front = row["Front"]
                 back = row["Back"]
                 fields = front + "\x1f" + back
-                tags = " " + " ".join(row["Tags"].split()) + " "
+                tags = " rebuild " + " ".join(row["Tags"].split()) + " "
                 connection.execute(
                     "INSERT INTO notes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (

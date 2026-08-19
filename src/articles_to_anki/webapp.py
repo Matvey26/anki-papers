@@ -512,6 +512,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             rebuild_deck_name=_rebuild_deck_name_hint(
                 rebuild_job["created_at"] if rebuild_job else None
             ),
+            ankiweb_connected=bool(account and account["mirror_path"]),
         )
 
     @app.post("/settings/password")
@@ -1598,6 +1599,7 @@ def init_database(app: Flask) -> None:
                 stage TEXT NOT NULL DEFAULT '',
                 error TEXT,
                 result_path TEXT,
+                uploaded_to TEXT,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
                 finished_at TEXT,
@@ -1616,6 +1618,11 @@ def init_database(app: Flask) -> None:
         document_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(documents)")
         }
+        rebuild_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(rebuild_jobs)")
+        }
+        if "uploaded_to" not in rebuild_columns:
+            connection.execute("ALTER TABLE rebuild_jobs ADD COLUMN uploaded_to TEXT")
         if "read_at" not in document_columns:
             connection.execute("ALTER TABLE documents ADD COLUMN read_at TEXT")
         document_migrations = {
@@ -3237,6 +3244,9 @@ def run_rebuild_job(
                 finished_at=now(),
                 result_path=str(result) if result else None,
             )
+            if selected_deck_id is not None and _has_ankiweb_mirror(database, user_id):
+                _mark_rebuild_job(database, job_id, uploaded_to="queued")
+                enqueue_sync_job(database, user_id, "rebuild_import", delay_seconds=0)
         else:
             _mark_rebuild_job(
                 database,
@@ -3253,6 +3263,14 @@ def run_rebuild_job(
             app.extensions["rebuild_jobs"].discard(job_id)
 
 
+def _has_ankiweb_mirror(database: sqlite3.Connection, user_id: int) -> bool:
+    row = database.execute(
+        "SELECT 1 FROM anki_accounts WHERE user_id = ? AND mirror_path IS NOT NULL",
+        (user_id,),
+    ).fetchone()
+    return row is not None
+
+
 def _mark_rebuild_job(
     database: sqlite3.Connection,
     job_id: str,
@@ -3264,6 +3282,7 @@ def _mark_rebuild_job(
     started_at: str | None = None,
     finished_at: str | None = None,
     result_path: str | None = None,
+    uploaded_to: str | None = None,
 ) -> None:
     updates: list[str] = []
     values: list[Any] = []
@@ -3275,6 +3294,7 @@ def _mark_rebuild_job(
         ("started_at", started_at),
         ("finished_at", finished_at),
         ("result_path", result_path),
+        ("uploaded_to", uploaded_to),
     ):
         if value is not None:
             updates.append(f"{column} = ?")
@@ -3324,6 +3344,7 @@ def _rebuild_job_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
         "created_at": row["created_at"],
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
+        "auto_upload": bool(row["uploaded_to"]),
         "download_url": (
             url_for("download_rebuilt_apkg", job_id=str(row["id"]))
             if state == "succeeded" and result_path

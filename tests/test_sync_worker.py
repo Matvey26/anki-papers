@@ -29,6 +29,7 @@ class FakeAdapter:
     def __init__(self) -> None:
         self.connect_calls = 0
         self.sync_calls = 0
+        self.import_rebuild_calls = 0
 
     def connect(self, path, username, password, cards, known_links=None):
         self.connect_calls += 1
@@ -64,6 +65,21 @@ class FakeAdapter:
             decks=[{"id": 42, "name": "Papers"}],
             links=links,
             added=len(links),
+        )
+
+    def import_rebuild(self, path, apkg_path, hkey):
+        self.import_rebuild_calls += 1
+        assert path.read_bytes() == b"incrementally synced collection"
+        assert apkg_path.is_file()
+        assert "rebuilds" in apkg_path.parts
+        path.write_bytes(b"rebuild pushed collection")
+        return AdapterResult(
+            hkey=hkey,
+            decks=[
+                {"id": 42, "name": "Papers"},
+                {"id": 99, "name": "Anki Papers (пересборка) 2026-01-01 00:00"},
+            ],
+            links=[],
         )
 
     def login(self, path, username, password):
@@ -254,6 +270,73 @@ def test_configuration_failure_records_safe_actionable_reason(tmp_path: Path) ->
         "Тип карточек «Anki Papers» изменён вручную и несовместим.",
     )
     assert job == ("failed", "configuration:managed_notetype_invalid")
+
+
+def test_rebuild_import_job_pushes_latest_rebuild_and_marks_uploaded(
+    tmp_path: Path,
+) -> None:
+    _app, client, _key_text, _dashboard = make_connected_web_state(tmp_path)
+    insert_card(tmp_path / "app.sqlite3")
+    adapter = FakeAdapter()
+    worker = SyncWorker(
+        tmp_path / "app.sqlite3", tmp_path, keys={1: KEY}, adapter=adapter
+    )
+    worker.startup_cleanup()
+    assert worker.run_once()
+    settings = client.get("/settings")
+    selected = client.post(
+        "/settings/anki/deck",
+        data={"csrf_token": csrf(settings), "deck_id": "42"},
+        follow_redirects=True,
+    )
+    assert "Карточки синхронизируются" in selected.text
+    assert worker.run_once()
+    assert adapter.sync_calls == 1
+
+    rebuild_dir = tmp_path / "rebuilds" / "1"
+    rebuild_dir.mkdir(parents=True)
+    (rebuild_dir / "job-1.apkg").write_bytes(b"rebuilt package bytes")
+    timestamp = "2026-01-01T00:00:00+00:00"
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        user_id = database.execute("SELECT id FROM users").fetchone()[0]
+        database.execute(
+            """INSERT INTO rebuild_jobs
+               (id, user_id, state, deck_id, progress, stage, error, result_path,
+                created_at, started_at, finished_at, updated_at)
+               VALUES ('job-1', ?, 'succeeded', 42, 100, 'Готово', NULL, ?, ?, ?, ?, ?)""",
+            (user_id, str(rebuild_dir / "job-1.apkg"), timestamp, timestamp, timestamp, timestamp),
+        )
+        database.execute(
+            """INSERT INTO sync_jobs
+               (id, user_id, reason, state, attempts, run_after, created_at, updated_at)
+               VALUES ('job-rb', ?, 'rebuild_import', 'queued', 0, ?, ?, ?)""",
+            (user_id, timestamp, timestamp, timestamp),
+        )
+        database.commit()
+
+    assert worker.run_once()
+    assert adapter.import_rebuild_calls == 1
+
+    with sqlite3.connect(tmp_path / "app.sqlite3") as database:
+        job = database.execute(
+            "SELECT state FROM sync_jobs WHERE id = 'job-rb'"
+        ).fetchone()
+        uploaded = database.execute(
+            "SELECT uploaded_to FROM rebuild_jobs WHERE id = 'job-1'"
+        ).fetchone()[0]
+        account = database.execute(
+            "SELECT state, last_error, last_success_at, mirror_path FROM anki_accounts"
+        ).fetchone()
+        decks = database.execute(
+            "SELECT available_decks_json FROM anki_accounts"
+        ).fetchone()[0]
+    assert job == ("succeeded",)
+    assert uploaded is not None
+    assert account[0] == "connected"
+    assert account[1] is None
+    assert account[2] is not None
+    assert b"rebuild pushed collection" not in Path(account[3]).read_bytes()
+    assert '"name": "Anki Papers (пересборка) 2026-01-01 00:00"' in decks
 
 
 def test_official_adapter_has_no_full_upload_path() -> None:

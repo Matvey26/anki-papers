@@ -43,10 +43,14 @@ function renderRebuildJob(job) {
   if (job.state === "succeeded" && job.download_url) {
     const done = document.createElement("p");
     const strong = document.createElement("strong");
-    strong.textContent = "Готово — файл собран из всех сохранённых слов.";
+    strong.textContent = job.auto_upload
+      ? "Готово — колода собрана и отправлена в AnkiWeb."
+      : "Готово — файл собран из всех сохранённых слов.";
     done.append(strong);
     const extra = document.createElement("span");
-    extra.textContent = " Скачайте его и импортируйте в Anki.";
+    extra.textContent = job.auto_upload
+      ? " Синхронизируйтесь в Anki Desktop, чтобы увидеть новую колоду."
+      : " Скачайте его и импортируйте в Anki.";
     done.append(extra);
     rebuildPanel.append(done);
     if (job.deck_name) {
@@ -79,6 +83,7 @@ if (rebuildPanel) {
     error: rebuildPanel.dataset.error || null,
     download_url: rebuildPanel.dataset.downloadUrl || null,
     deck_name: rebuildPanel.dataset.deckName || null,
+    auto_upload: rebuildPanel.dataset.autoUpload === "1",
   };
   renderRebuildJob(initial);
   if (initial.state === "queued" || initial.state === "running") {

@@ -176,6 +176,11 @@ class SyncWorker:
                 return
             self._restore_mirror(account, user_id, collection_path)
             shutil.copy2(collection_path, temporary / "collection.backup.anki2")
+            if job["reason"] == "rebuild_import":
+                self._import_rebuild_job(
+                    database, job, credentials, account, user_id, collection_path
+                )
+                return
             if not account["selected_deck_id"]:
                 raise PermanentSyncError("deck_not_selected")
             database.execute(
@@ -236,6 +241,72 @@ class SyncWorker:
             self._finish_success(database, job)
         finally:
             shutil.rmtree(temporary, ignore_errors=True)
+
+    def _import_rebuild_job(
+        self,
+        database: sqlite3.Connection,
+        job: sqlite3.Row,
+        credentials: sqlite3.Row,
+        account: sqlite3.Row,
+        user_id: int,
+        collection_path: Path,
+    ) -> None:
+        """Push the latest successful rebuild into the AnkiWeb mirror."""
+        rebuild = database.execute(
+            """SELECT id, result_path FROM rebuild_jobs
+               WHERE user_id = ? AND state = 'succeeded'
+               ORDER BY created_at DESC LIMIT 1""",
+            (user_id,),
+        ).fetchone()
+        if rebuild is None or not rebuild["result_path"]:
+            self._cancel_job(database, job)
+            return
+        apkg_path = Path(rebuild["result_path"]).resolve()
+        if Path(self.data_dir / "rebuilds").resolve() not in apkg_path.parents:
+            self._cancel_job(database, job)
+            return
+        database.execute(
+            "UPDATE anki_accounts SET state = 'syncing', last_error = NULL, updated_at = ? WHERE user_id = ?",
+            (now(), user_id),
+        )
+        database.commit()
+        hkey = self._decrypt_hkey(credentials)
+        refreshed_hkey = None
+        try:
+            result = self.adapter.import_rebuild(collection_path, apkg_path, hkey)
+        except AuthenticationError:
+            username, password = self._decrypt_login(credentials)
+            refreshed_hkey = self.adapter.login(collection_path, username, password)
+            result = self.adapter.import_rebuild(collection_path, apkg_path, refreshed_hkey)
+        database.execute("BEGIN IMMEDIATE")
+        if not self._connection_exists(database, user_id, credentials["updated_at"]):
+            self._cancel_job(database, job)
+            return
+        if refreshed_hkey is not None:
+            self._store_credentials(
+                database, user_id, username, password, refreshed_hkey
+            )
+        mirror = self._store_mirror(user_id, collection_path)
+        timestamp = now()
+        database.execute(
+            """UPDATE anki_accounts SET state = 'connected', available_decks_json = ?,
+               mirror_path = ?, mirror_nonce = ?, mirror_key_version = ?,
+               last_success_at = ?, last_error = NULL, last_added_count = 0, updated_at = ?
+               WHERE user_id = ?""",
+            (
+                json.dumps(result.decks, ensure_ascii=False), str(mirror[0]), mirror[1], mirror[2],
+                timestamp, timestamp, user_id,
+            ),
+        )
+        database.execute(
+            "UPDATE user_credentials SET state = 'active', auth_failures = 0, updated_at = ? WHERE user_id = ?",
+            (timestamp, user_id),
+        )
+        database.execute(
+            "UPDATE rebuild_jobs SET uploaded_to = ?, updated_at = ? WHERE id = ?",
+            (timestamp, timestamp, rebuild["id"]),
+        )
+        self._finish_success(database, job)
 
     def _decrypt_login(self, row: sqlite3.Row) -> tuple[str, str]:
         user_id = int(row["user_id"])

@@ -11,6 +11,7 @@ JOB_REASONS = {
     "initial_sync": "Первая синхронизация",
     "manual": "Ручная синхронизация",
     "card_saved": "Новые карточки",
+    "rebuild_import": "Пересборка в AnkiWeb",
 }
 
 JOB_STATES = {
@@ -117,16 +118,25 @@ def build_sync_status(
             )
         else:
             connecting = reason == "connect" or account_state == "connecting"
+            rebuilding = reason == "rebuild_import"
             status.update(
                 tone="progress",
-                title="Подключаем AnkiWeb" if connecting else "Синхронизация идёт",
+                title="Подключаем AnkiWeb" if connecting else (
+                    "Отправляем пересборку" if rebuilding else "Синхронизация идёт"
+                ),
                 message=(
                     "Проверяем вход и скачиваем коллекцию AnkiWeb."
                     if connecting
-                    else "Сверяем сохранённые слова и обновляем целевую колоду."
+                    else (
+                        "Собранная колода импортируется в AnkiWeb и заливается обратно."
+                        if rebuilding
+                        else "Сверяем сохранённые слова и обновляем целевую колоду."
+                    )
                 ),
-                stage="Загрузка коллекции" if connecting else "Сверка карточек",
-                progress=40 if connecting else 82,
+                stage="Загрузка коллекции" if connecting else (
+                    "Импорт колоды" if rebuilding else "Сверка карточек"
+                ),
+                progress=40 if connecting else (85 if rebuilding else 82),
                 active=True,
             )
         return status
