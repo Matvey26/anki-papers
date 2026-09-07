@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 license = {text = "AGPL-3.0-or-later"}
 dependencies = [
   "anki==26.5",
-  "cryptography>=45,<47",
+  "cryptography>=45,<51",
 ]
 
 [project.optional-dependencies]
