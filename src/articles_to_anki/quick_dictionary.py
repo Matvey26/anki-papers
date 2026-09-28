@@ -8,7 +8,6 @@ import struct
 from collections import defaultdict
 from pathlib import Path
 
-
 _LEMMATIZER = None
 
 

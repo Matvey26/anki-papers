@@ -31,6 +31,7 @@ dev = [
 
 [project.scripts]
 articles-to-anki = "articles_to_anki.cli:main"
+anki-papers-backup = "articles_to_anki.backups.runner:main"
 anki-papers-admin = "articles_to_anki.admin:main"
 anki-papers-web = "articles_to_anki.webapp:main"
 

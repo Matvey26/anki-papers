@@ -1,0 +1,14 @@
+[Unit]
+Description=Anki Papers daily data backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=__APP_DIR__/.env
+ExecStart=__APP_DIR__/.venv/bin/anki-papers-backup --data-dir __APP_DIR__/data --config-file __APP_DIR__/.env --pause-writers
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=1h

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import json
 import re
@@ -340,9 +341,20 @@ def test_rebuild_import_job_pushes_latest_rebuild_and_marks_uploaded(
 
 
 def test_official_adapter_has_no_full_upload_path() -> None:
-    source = (Path(__file__).parents[1] / "sync-worker/src/anki_papers_sync_worker/official.py").read_text()
-    assert "upload=True" not in source
-    assert "upload=False" in source
+    worker_source = Path(__file__).parents[1] / "sync-worker/src/anki_papers_sync_worker"
+    downloads = []
+    for path in worker_source.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            assert node.func.attr != "full_upload"
+            if node.func.attr == "full_upload_or_download":
+                uploads = [kw.value for kw in node.keywords if kw.arg == "upload"]
+                assert len(uploads) == 1
+                assert isinstance(uploads[0], ast.Constant) and uploads[0].value is False
+                downloads.append(node)
+    assert downloads
+
 
 
 def test_mit_web_package_does_not_link_to_agpl_anki_package() -> None:
@@ -351,4 +363,23 @@ def test_mit_web_package_does_not_link_to_agpl_anki_package() -> None:
         source = path.read_text()
         assert "from anki " not in source
         assert "from anki." not in source
-        assert "import anki" not in source
+        assert not any(
+            isinstance(node, ast.Import) and any(
+                alias.name == "anki" or alias.name.startswith("anki.")
+                for alias in node.names
+            ) for node in ast.walk(ast.parse(source))
+        )
+
+
+def test_idle_worker_closes_database_connection(tmp_path, monkeypatch):
+    import pytest
+
+    make_connected_web_state(tmp_path)
+    worker = SyncWorker(tmp_path / "app.sqlite3", tmp_path, keys={1: KEY}, adapter=FakeAdapter())
+    connection = worker.connect_database()
+    connection.execute("DELETE FROM sync_jobs")
+    connection.commit()
+    monkeypatch.setattr(worker, "connect_database", lambda: connection)
+    assert worker.run_once() is False
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connection.execute("SELECT 1")

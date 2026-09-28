@@ -11,13 +11,13 @@ from pathlib import Path
 from typing import Any
 
 import articles_to_anki.enrich as enrich_module
+from articles_to_anki.cards.text import make_target_context
 from articles_to_anki.enrich import (
     build_openrouter_payload,
     enrich_targets,
     load_env_file,
 )
 from articles_to_anki.models import EnrichmentRequestItem
-from articles_to_anki.webapp import make_target_context
 
 OLD_MODELS = {
     "DeepSeek V4 Flash 0731": "deepseek/deepseek-v4-flash-0731",

@@ -10,7 +10,6 @@ import zipfile
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-
 URL = (
     "https://download.freedict.org/dictionaries/eng-rus/2025.11.23/"
     "freedict-eng-rus-2025.11.23.stardict.tar.xz"
