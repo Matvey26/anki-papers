@@ -70,7 +70,7 @@ jobs:
             printf 'APP_SECRET=%s\n' "$APP_SECRET"
             printf 'ANKI_CREDENTIAL_KEY=%s\n' "$ANKI_CREDENTIAL_KEY"
             printf 'ANKIWEB_ALLOWED_USERS=%s\n' "$ANKIWEB_ALLOWED_USERS"
-            printf 'ANKI_PAPERS_BACKUP_BACKEND=dummy\n'
+            printf 'ANKI_PAPERS_BACKUP_BACKEND=yandex_disk\n'
           } | sshpass -e ssh "$SERVER_USER@$SERVER_IP" \
             'umask 077; cat > "$HOME/anki-papers/.env"'
       - name: Back up, install, and restart services

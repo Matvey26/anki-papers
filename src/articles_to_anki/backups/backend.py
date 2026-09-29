@@ -50,8 +50,12 @@ class DummyBackupBackend(BackupBackend):
         pass
 
 
-def create_backend(name: str) -> BackupBackend:
+def create_backend(name: str, *, data_dir: Path = Path("data")) -> BackupBackend:
     """Add future providers here; unknown configuration must fail loudly."""
     if name == "dummy":
         return DummyBackupBackend()
+    if name == "yandex_disk":
+        from .yandex_disk import YandexDiskBackupBackend
+
+        return YandexDiskBackupBackend(data_dir / "oauth" / "yandex.json")
     raise ValueError(f"Unknown backup backend: {name}")

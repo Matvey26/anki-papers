@@ -276,16 +276,25 @@ articles-to-anki article.pdf --min-coverage 0.50 --max-vertical-spill 0.35 --deb
 `anki-papers-backup.timer` запускается ежедневно в **03:00 UTC** с разбросом
 до 15 минут. `Persistent=true` запускает пропущенную задачу после включения сервера.
 
-Сейчас `ANKI_PAPERS_BACKUP_BACKEND=dummy`: задача возвращает
-`{"status": "skipped", "reason": "backend_disabled"}`. Dummy не читает данные,
-не создаёт архивы, не останавливает сервисы и никуда ничего не отправляет.
-**Внешней резервной копии пока нет.**
+В продакшене `ANKI_PAPERS_BACKUP_BACKEND=yandex_disk`: архивы загружаются
+в `app:/backups` — папку приложения «Anki Papers Backups» на Яндекс Диске.
+Перед публикацией проверяются размер и SHA-256, затем временный объект
+переименовывается в завершённый архив. Незавершённые загрузки не попадают
+в список бэкапов. Старые архивы автоматически не удаляются.
 
-Будущий провайдер реализует `BackupBackend` из `backups/backend.py`:
-`upload(archive, name)`, `download(name, destination)`, `list_backups()`,
-`delete(name)`. Зарегистрировать его в `create_backend`, добавить настройки
-доступа и выбрать через `ANKI_PAPERS_BACKUP_BACKEND`. Для Yandex Disk
-меняется только реализация хранилища и её конфигурация.
+`Dummy` остаётся доступен через `ANKI_PAPERS_BACKUP_BACKEND=dummy`:
+он ничего не читает, не создаёт и не отправляет, возвращая статус `skipped`.
+Провайдеры реализуют `BackupBackend`: `upload`, `download`, `list_backups`,
+`delete`. Удаление в Yandex Disk перемещает архив в корзину.
+
+Проверка последнего бэкапа скачивает его во временный приватный каталог,
+сверяет SHA-256 архива и всех файлов manifest, проверяет целостность SQLite.
+Рабочие данные при проверке не изменяются:
+
+```bash
+.venv/bin/python -m articles_to_anki.backups.verify --data-dir data
+# Для конкретной копии добавить --name anki-papers-<timestamp>-<id>.tar.gz
+```
 
 При включённом провайдере ежедневная задача от root на время снимка
 останавливает только работавшие web/worker, затем запускает их обратно,
@@ -349,10 +358,9 @@ journalctl -u anki-papers-yandex-token.service
 sudo systemctl start anki-papers-yandex-token.service
 ```
 
-Будущий backend получает актуальный токен через
+Yandex Disk backend получает актуальный токен через
 `backups.yandex_auth.access_token(path)`, который также проверяет срок перед
-использованием. Настройка OAuth не включает загрузку архивов: пока выбран
-`Dummy`, внешних резервных копий нет.
+использованием. Для загрузки архивов должен быть выбран `yandex_disk`.
 
 Документация: [YaDisk](https://yadisk.readthedocs.io/en/latest/api_reference/sync_api.html),
 [обновление токена Яндекса](https://yandex.ru/dev/id/doc/ru/tokens/refresh-client).

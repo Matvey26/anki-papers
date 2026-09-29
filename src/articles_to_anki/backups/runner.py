@@ -41,7 +41,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--pause-writers", action="store_true", help="Stop systemd writers only while taking the snapshot (requires root).")
     args = parser.parse_args(argv)
     try:
-        result = run_backup(args.data_dir, create_backend(args.backend), config_file=args.config_file, pause_writers=args.pause_writers)
+        result = run_backup(args.data_dir, create_backend(args.backend, data_dir=args.data_dir), config_file=args.config_file, pause_writers=args.pause_writers)
     except Exception as exc:
         # Provider errors may contain tokens, URLs, or credentials.
         LOGGER.error("Backup failed (%s)", type(exc).__name__)
