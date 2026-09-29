@@ -63,20 +63,22 @@ for unit in anki-papers-web anki-papers-sync-worker; do
     "deploy/$unit.service" > "$rendered"
   run_root install -m 0644 "$rendered" "/etc/systemd/system/$unit.service"
 done
-sed -e "s|__APP_DIR__|$app_dir|g" deploy/anki-papers-backup.service > "$app_dir/.anki-papers-backup.service"
-run_root install -m 0644 "$app_dir/.anki-papers-backup.service" /etc/systemd/system/anki-papers-backup.service
+for unit in anki-papers-backup anki-papers-yandex-token; do
+  sed -e "s|__APP_DIR__|$app_dir|g" "deploy/$unit.service" > "$app_dir/.$unit.service"
+  run_root install -m 0644 "$app_dir/.$unit.service" "/etc/systemd/system/$unit.service"
+  run_root install -m 0644 "deploy/$unit.timer" "/etc/systemd/system/$unit.timer"
+done
 run_root install -d -o caddy -g caddy -m 0750 /var/log/caddy
 run_root install -m 0644 deploy/Caddyfile /etc/caddy/Caddyfile
 run_root systemctl disable --now anki-papers.service 2>/dev/null || true
-run_root install -m 0644 deploy/anki-papers-backup.timer /etc/systemd/system/anki-papers-backup.timer
 run_root systemctl daemon-reload
 run_root systemctl enable anki-papers-web.service anki-papers-sync-worker.service caddy.service
-run_root systemctl enable --now anki-papers-backup.timer
+run_root systemctl enable --now anki-papers-backup.timer anki-papers-yandex-token.timer
 run_root systemctl restart anki-papers-web.service anki-papers-sync-worker.service caddy.service
 run_root systemctl is-active --quiet anki-papers-web.service
 run_root systemctl is-active --quiet anki-papers-sync-worker.service
 run_root systemctl is-active --quiet caddy.service
-run_root systemctl is-active --quiet anki-papers-backup.timer
+run_root systemctl is-active --quiet anki-papers-backup.timer anki-papers-yandex-token.timer
 unset DEPLOY_PASSWORD_B64
 
 .venv/bin/python - <<'PY'

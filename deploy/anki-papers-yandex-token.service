@@ -1,0 +1,13 @@
+[Unit]
+Description=Renew Anki Papers Yandex Disk OAuth token when due
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__APP_DIR__
+ExecStart=__APP_DIR__/.venv/bin/anki-papers-yandex-auth --state-file __APP_DIR__/data/oauth/yandex.json refresh
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=2min

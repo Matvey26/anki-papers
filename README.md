@@ -311,3 +311,48 @@ sudo systemctl start anki-papers-backup.service
 восстановить `data/` по исходному пути из manifest и `runtime.env` как `.env`
 с правами `0600`, затем запустить сервисы. Архив содержит секреты, поэтому
 распаковывать его следует в приватном каталоге.
+
+### Яндекс Диск: токены и автоматическое продление
+
+Используется `yadisk[sync-defaults]`. OAuth-клиент запрашивает только
+`cloud_api:disk.app_folder` — папку приложения. Первый вход требует согласия
+владельца аккаунта; последующие продления идут через `refresh_token`.
+
+Локальная настройка (Client ID и Client Secret передать через переменные
+`YANDEX_DISK_CLIENT_ID`, `YANDEX_DISK_CLIENT_SECRET`):
+
+```bash
+anki-papers-yandex-auth begin
+# Открыть выведенную ссылку, разрешить доступ и получить код Яндекса.
+anki-papers-yandex-auth complete  # ввод кода скрыт
+anki-papers-yandex-auth status
+```
+
+Временный PKCE verifier лежит в `.oauth/pending.json`, итоговые реквизиты —
+в `.oauth/yandex.json`. Каталог исключён из Git. Файлы имеют права `0600`,
+запись атомарная, продление защищено межпроцессной блокировкой.
+Не передавайте коды и токены аргументами команд или через логи.
+
+На сервере реквизиты хранятся отдельно от перезаписываемого при деплое `.env`:
+`data/oauth/yandex.json`. Переносить файл нужно по SSH с правами `0600` и
+каталогом `0700`. Он включается в снимок данных. Таймер
+`anki-papers-yandex-token.timer` проверяет срок ежедневно в 02:30–02:35 UTC.
+Продление происходит раз в 90 дней или раньше, если срок жизни короче;
+каждый новый refresh token сохраняется вместе с access token. При сетевой
+ошибке прежний файл остаётся целым, systemd-задача завершается с ошибкой и
+следующий запуск повторяет попытку. Без файла задача безопасно пропускается.
+После отзыва доступа или истечения refresh token нужен повторный вход.
+
+```bash
+systemctl list-timers anki-papers-yandex-token.timer
+journalctl -u anki-papers-yandex-token.service
+sudo systemctl start anki-papers-yandex-token.service
+```
+
+Будущий backend получает актуальный токен через
+`backups.yandex_auth.access_token(path)`, который также проверяет срок перед
+использованием. Настройка OAuth не включает загрузку архивов: пока выбран
+`Dummy`, внешних резервных копий нет.
+
+Документация: [YaDisk](https://yadisk.readthedocs.io/en/latest/api_reference/sync_api.html),
+[обновление токена Яндекса](https://yandex.ru/dev/id/doc/ru/tokens/refresh-client).

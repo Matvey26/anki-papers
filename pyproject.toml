@@ -21,6 +21,7 @@ dependencies = [
   "pypdfium2>=4.30,<5",
   "RapidFuzz>=3.14,<4",
   "waitress>=3,<4",
+  "yadisk[sync-defaults]>=3.4,<4",
   "zstandard>=0.23,<1",
 ]
 
@@ -31,6 +32,7 @@ dev = [
 
 [project.scripts]
 articles-to-anki = "articles_to_anki.cli:main"
+anki-papers-yandex-auth = "articles_to_anki.backups.oauth_cli:main"
 anki-papers-backup = "articles_to_anki.backups.runner:main"
 anki-papers-admin = "articles_to_anki.admin:main"
 anki-papers-web = "articles_to_anki.webapp:main"

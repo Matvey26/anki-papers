@@ -14,3 +14,4 @@ data/
 app.pid
 app.log
 .deploy.env
+.oauth/
